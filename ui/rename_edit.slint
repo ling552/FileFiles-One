@@ -46,21 +46,22 @@ export component RenameEdit inherits Rectangle {
     background: root.editing ? Theme.edit-bg : transparent;
     clip: true;
     // 网格编辑框允许按普通名称区宽度换行；列表保持单行并沿用固定行高。
-    height: root.multiline ? max(32px, edit.preferred-height + 4px) : edit.preferred-height + 4px;
+    height: root.multiline ? max(32px, edit.preferred-height) : edit.preferred-height;
     drop-shadow-blur: root.editing ? 6px : 0px;
     drop-shadow-color: root.editing ? Theme.selection-shadow : transparent;
     drop-shadow-offset-y: root.editing ? 1px : 0px;
 
     edit := TextInput {
-        x: 3px;
-        y: 2px;
+        x: 0px;
+        y: 0px;
         // stretch 仅用于兼容旧调用；编辑文本始终受名称区宽度约束，避免长名横向铺成一行。
-        width: root.width - 6px;
-        height: root.height - 4px;
+        width: root.width;
+        height: root.height;
         text: root.text;
         font-size: root.font-size;
         color: root.editing ? Theme.edit-text : Theme.text;
         single-line: !root.multiline;
+        horizontal-alignment: center;
         vertical-alignment: root.multiline ? top : center;
         wrap: root.multiline ? word-wrap : no-wrap;
         changed has-focus => { AppState.input-active = self.has-focus; }

@@ -60,8 +60,8 @@ export global Theme {
     out property <brush> primary-soft: accent.with-alpha(0.12);
     out property <brush> primary-hover: accent.with-alpha(0.09);
     // ── 文件选择与行内编辑 ──
-    // 选中态使用半透明柔化而非实心色：长名称覆盖邻行时仍保有层次，也不会显得生硬。
-    out property <brush> selection-bg: dark ? accent.with-alpha(0.30) : accent.with-alpha(0.16);
+    // 选中态使用高不透明度实色：确保完全遮挡背后文字与图标，避免透字。
+    out property <brush> selection-bg: dark ? accent.with-alpha(0.92) : accent.with-alpha(0.88);
     out property <brush> selection-border: accent.with-alpha(dark ? 0.72 : 0.52);
     out property <color> selection-shadow: dark ? #00000052 : #163b662e;
     out property <length> selection-shadow-blur: 12px;
