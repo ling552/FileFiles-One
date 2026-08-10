@@ -1,20 +1,33 @@
-//! 重命名输入框：延迟聚焦的 LineEdit 封装
+//! 重命名输入框：延迟聚焦的 TextInput 封装
 //!
-//! 背景：直接在 LineEdit 的 init 回调里调用 self.focus() 会在条目树构建阶段
+//! 用底层 TextInput 取代标准 LineEdit：LineEdit 自带白色背景、清除按钮、蓝色下划线，
+//! 均不符合行内重命名的视觉要求。TextInput 无任何装饰，完全由调用方控制外观。
+//! 参照 toolbar.slint 的 path-input / search-edit 用法。
+//!
+//! 背景：直接在 TextInput 的 init 回调里调用 self.focus() 会在条目树构建阶段
 //! 触发 accesskit 无障碍适配器的重入借用，导致
 //! "RefCell already borrowed" panic（winitwindowadapter.rs:1584）。
-//! 解决：用 1ms 的 Timer 把 focus()/select-all() 推迟到本帧构建完成之后再执行。
+//! 解决：用 1ms 的 Timer 把 focus()/set-selection-offsets() 推迟到本帧构建完成之后再执行。
 //!
-//! 由于 LineEdit 不允许有子元素（无 @children），这里用 Rectangle 包裹
-//! LineEdit 与 Timer，对外暴露 text/font-size 与 cancel/commit。
+//! 由于 TextInput 不允许有子元素（无 @children），这里用 Rectangle 包裹
+//! TextInput 与 Timer，对外暴露 text/font-size 与 cancel/commit。
 //! 新增 text-changed 回调，用于在点击编辑框外部区域时提交当前文本。
 
-import { LineEdit } from "std-widgets.slint";
+import { Theme } from "theme.slint";
 import { AppState } from "globals.slint";
 
 export component RenameEdit inherits Rectangle {
     in property <string> text;
     in property <length> font-size: 13px;
+    // true 时按文本宽度自适应撑开（用于网格卡片长名覆盖场景）；
+    // false 时 TextInput 填满父宽度（列表场景，父已给出固定宽度）。
+    in property <bool> stretch: false;
+    // true 时网格重命名按名称区宽度换行；列表仍保持单行。
+    in property <bool> multiline: false;
+    // 当前是否处于编辑状态（由调用方传入 AppState.editing-index == i 之类）。
+    // 网格覆盖层用 visible toggle 复用同一实例，armed 不会因重建而重置；
+    // 通过监听 editing 由 false→true 重新装填 Timer，确保再次进入仍能聚焦/选主名。
+    in property <bool> editing: false;
     // 取消编辑（按 Escape 时回调，由父组件清理 editing-index）
     callback cancel();
     // 提交新名称
@@ -24,17 +37,36 @@ export component RenameEdit inherits Rectangle {
 
     // 计时器装填标记：true 时 Timer 运行，触发一次后置 false
     property <bool> armed: true;
+    // 进入编辑（false→true）时重置 armed，保证 Timer 每次进入都触发一次聚焦/选主名
+    changed editing => { if (root.editing) { root.armed = true; } }
 
-    // 高度跟随内部输入框首选高度，使其在布局中表现与原 LineEdit 一致
-    height: edit.preferred-height;
+    border-radius: 3px;
+    border-width: root.editing ? 1px : 0px;
+    border-color: root.editing ? Theme.selection-border : transparent;
+    background: root.editing ? Theme.edit-bg : transparent;
+    clip: true;
+    // 网格编辑框允许按普通名称区宽度换行；列表保持单行并沿用固定行高。
+    height: root.multiline ? max(32px, edit.preferred-height + 4px) : edit.preferred-height + 4px;
+    drop-shadow-blur: root.editing ? 6px : 0px;
+    drop-shadow-color: root.editing ? Theme.selection-shadow : transparent;
+    drop-shadow-offset-y: root.editing ? 1px : 0px;
 
-    edit := LineEdit {
-        width: 100%;
+    edit := TextInput {
+        x: 3px;
+        y: 2px;
+        // stretch 仅用于兼容旧调用；编辑文本始终受名称区宽度约束，避免长名横向铺成一行。
+        width: root.width - 6px;
+        height: root.height - 4px;
         text: root.text;
         font-size: root.font-size;
+        color: root.editing ? Theme.edit-text : Theme.text;
+        single-line: !root.multiline;
+        vertical-alignment: root.multiline ? top : center;
+        wrap: root.multiline ? word-wrap : no-wrap;
         changed has-focus => { AppState.input-active = self.has-focus; }
-        // 文本变化时通知父组件，以便点击外部区域时能提交当前编辑内容
-        edited(t) => { root.text-changed(t); }
+        // 文本变化时通知父组件，以便点击外部区域时能提交当前编辑内容。
+        // TextInput 的 edited 无参数，读 self.text 取最新值。
+        edited => { root.text-changed(self.text); }
         key-pressed(ev) => {
             if (ev.text == Key.Escape) {
                 root.cancel();
@@ -42,8 +74,8 @@ export component RenameEdit inherits Rectangle {
             }
             return reject;
         }
-        accepted(t) => {
-            root.commit(t);
+        accepted => {
+            root.commit(self.text);
         }
     }
 
@@ -53,7 +85,8 @@ export component RenameEdit inherits Rectangle {
         triggered => {
             root.armed = false;
             edit.focus();
-            edit.select-all();
+            // 只选主名不含扩展名（rename-name-len 为字节偏移，由 Rust 端 name-select-len 算出）
+            edit.set-selection-offsets(0, AppState.rename-name-len);
         }
     }
 }

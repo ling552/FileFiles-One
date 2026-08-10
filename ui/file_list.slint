@@ -383,9 +383,12 @@ export component FileList inherits Rectangle {
                 for entry[idx] in AppState.entries: row := Rectangle {
                     height: root.scaled-row-h;
                     background: entry.selected
-                        ? Theme.primary
-                        : (ov.hover-idx == idx ? #0078d414
+                        ? Theme.selection-bg
+                        : (ov.hover-idx == idx ? Theme.primary-hover
                             : (mod(idx, 2) == 1 ? Theme.row-stripe : transparent));
+                    drop-shadow-blur: entry.selected ? Theme.selection-shadow-blur : 0px;
+                    drop-shadow-color: entry.selected ? Theme.selection-shadow : transparent;
+                    drop-shadow-offset-y: entry.selected ? 1px : 0px;
 
                     // 名称列（自适应宽度，始终居首）。图标 y 显式垂直居中，
                     // 文字左缘固定在 name-indent（图标宽 + 间距），与表头「名称」缩进逐像素对齐
@@ -415,7 +418,7 @@ export component FileList inherits Rectangle {
                             visible: entry.tag-important || entry.tag-archive || entry.tag-done;
                             background: entry.tag-important ? #d13438 : (entry.tag-archive ? #ff8c00 : #107c10);
                             border-width: 1.5px;
-                            border-color: entry.selected ? Theme.primary : white;
+                            border-color: entry.selected ? Theme.selection-bg : white;
                         }
                         // Git 状态徽章：图标右上角（M 橙 / ? 灰 / A 绿 / ! 红）
                         if entry.git-status != "": Rectangle {
@@ -425,7 +428,7 @@ export component FileList inherits Rectangle {
                             x: root.icon-box - 7px;
                             y: (parent.height - root.icon-box) / 2 - 2px;
                             border-width: 1.5px;
-                            border-color: entry.selected ? Theme.primary : white;
+                            border-color: entry.selected ? Theme.selection-bg : white;
                             background: entry.git-status == "?" ? #8a99aa
                                 : entry.git-status == "!" ? #d13438
                                 : entry.git-status == "A" ? #107c10
@@ -445,7 +448,7 @@ export component FileList inherits Rectangle {
                             height: 100%;
                             text: entry.name;
                             font-size: Theme.fs-small;
-                            color: entry.selected ? #ffffff : Theme.text;
+                            color: entry.selected ? Theme.text : Theme.text;
                             vertical-alignment: center;
                             overflow: elide;
                         }
@@ -453,7 +456,10 @@ export component FileList inherits Rectangle {
                             x: root.name-indent;
                             width: parent.width - root.name-indent;
                             y: (parent.height - self.height) / 2;
+                            multiline: false;   // 列表模式保持单行
+                            editing: AppState.editing-index == idx;
                             text: entry.name;
+                            font-size: Theme.fs-small;
                             // 文本变化时保存到全局，方便点击外部区域时提交
                             text-changed(t) => { AppState.rename-text = t; }
                             // 按 Escape 退出重命名（不保存）
@@ -476,7 +482,7 @@ export component FileList inherits Rectangle {
                             // 驱动器/便携设备没有有意义的修改日期，留空
                             text: (entry.icon-class == "drive" || entry.icon-class == "device") ? "" : entry.modified;
                             font-size: Theme.fs-small;
-                            color: entry.selected ? #ffffff : Theme.muted;
+                            color: entry.selected ? Theme.text : Theme.muted;
                             vertical-alignment: center;
                             horizontal-alignment: left;
                             overflow: elide;
@@ -493,7 +499,7 @@ export component FileList inherits Rectangle {
                             width: 100%;
                             text: entry.kind;
                             font-size: Theme.fs-small;
-                            color: entry.selected ? #ffffff : Theme.muted;
+                            color: entry.selected ? Theme.text : Theme.muted;
                             vertical-alignment: center;
                             horizontal-alignment: left;
                             overflow: elide;
@@ -511,7 +517,7 @@ export component FileList inherits Rectangle {
                             // 驱动器在"大小"列显示总容量；其余目录留空、文件显示大小
                             text: entry.icon-class == "drive" ? entry.size : (entry.is-dir ? "" : entry.size);
                             font-size: Theme.fs-small;
-                            color: entry.selected ? #ffffff : Theme.muted;
+                            color: entry.selected ? Theme.text : Theme.muted;
                             vertical-alignment: center;
                             horizontal-alignment: right;
                         }

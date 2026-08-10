@@ -1420,10 +1420,12 @@ fn start_next_job(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 skipped: 0,
                 error: "任务执行异常（内部错误）".into(),
                 cancelled: false,
+                completed_paths: Vec::new(),
             },
         };
 
         // 完成：回主线程触发 task-finished（在那里访问 core 重载目录、串联下一项）
+        let completed_paths = result.completed_paths.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = w_done.upgrade() {
                 let skip_note = if result.skipped > 0 {
@@ -1460,7 +1462,16 @@ fn start_next_job(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     }
                 }
                 ui.global::<AppState>()
-                    .invoke_task_finished(result.ok, msg.into());
+                    .invoke_task_finished_with_paths(
+                        result.ok,
+                        msg.into(),
+                        completed_paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().to_string().into())
+                            .collect::<Vec<slint::SharedString>>()
+                            .as_slice()
+                            .into(),
+                    );
             }
         });
     });
@@ -1579,6 +1590,54 @@ fn select_created_and_edit(ui: &MainWindow, c: &Rc<RefCell<AppCore>>, right: boo
     } else {
         ui_bridge::refresh_selection(ui, &c.borrow());
         ui.invoke_set_editing(i as i32);
+    }
+}
+
+/// 通用选中结果辅助函数：刷新目录后按路径选中操作完成的项目(不进入重命名)
+fn select_completed_paths(ui: &MainWindow, c: &Rc<RefCell<AppCore>>, right: bool, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let norm = |s: &str| -> String {
+        let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+        s.trim_end_matches(['/', '\\']).to_string()
+    };
+    let targets: Vec<String> = paths.iter().map(|p| norm(&p.to_string_lossy())).collect();
+    let indices: Vec<usize> = {
+        let core = c.borrow();
+        let tab = core.pane(right);
+        tab.filtered
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &ei)| {
+                let entry_path = norm(&tab.entries[ei].path);
+                if targets.iter().any(|t| entry_path.eq_ignore_ascii_case(t)) {
+                    Some(pos)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    if indices.is_empty() {
+        return;
+    }
+    {
+        let mut core = c.borrow_mut();
+        let tab = core.pane_mut(right);
+        tab.selected.fill(false);
+        for &i in &indices {
+            if i < tab.selected.len() {
+                tab.selected[i] = true;
+            }
+        }
+    }
+    if right {
+        ui_bridge::refresh_right_selection(ui, &c.borrow());
+        ui_bridge::update_selection_pane(ui, &c.borrow(), true);
+    } else {
+        ui_bridge::refresh_selection(ui, &c.borrow());
+        ui_bridge::update_selection_pane(ui, &c.borrow(), false);
     }
 }
 
@@ -1945,10 +2004,12 @@ fn bind_right_pane(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     let c = core.clone();
     state.on_r_box_select(move |r0, r1, c0, c1, cols, additive| {
         if let Some(ui) = w.upgrade() {
-            {
+            let changed = {
                 let mut core = c.borrow_mut();
                 let t = &mut core.right_pane;
                 let n = t.selected.len() as i32;
+                let old_selection = t.selected.clone();
+
                 if !additive {
                     for s in t.selected.iter_mut() {
                         *s = false;
@@ -1969,10 +2030,17 @@ fn bind_right_pane(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     }
                     r += 1;
                 }
+
+                // 检测选择是否真正变化
+                t.selected != old_selection
+            };
+
+            // 仅在选择真正变化时刷新 UI
+            if changed {
+                ui.global::<AppState>().set_active_pane("right".into());
+                ui_bridge::refresh_right_selection(&ui, &c.borrow());
+                ui_bridge::update_selection_pane(&ui, &c.borrow(), true);
             }
-            ui.global::<AppState>().set_active_pane("right".into());
-            ui_bridge::refresh_right_selection(&ui, &c.borrow());
-            ui_bridge::update_selection_pane(&ui, &c.borrow(), true);
         }
     });
 
@@ -2458,10 +2526,12 @@ fn bind_selection(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     let c = core.clone();
     state.on_box_select(move |r0, r1, c0, c1, cols, additive| {
         if let Some(ui) = w.upgrade() {
-            {
+            let changed = {
                 let mut core = c.borrow_mut();
                 let tab = core.active_tab_mut();
                 let n = tab.selected.len() as i32;
+                let old_selection = tab.selected.clone();
+
                 if !additive {
                     for s in tab.selected.iter_mut() {
                         *s = false;
@@ -2482,12 +2552,19 @@ fn bind_selection(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     }
                     r += 1;
                 }
+
+                // 检测选择是否真正变化
+                tab.selected != old_selection
+            };
+
+            // 仅在选择真正变化时刷新 UI
+            if changed {
+                let state = ui.global::<AppState>();
+                if state.get_dual_pane() {
+                    state.set_active_pane("left".into());
+                }
+                ui_bridge::refresh_selection(&ui, &c.borrow());
             }
-            let state = ui.global::<AppState>();
-            if state.get_dual_pane() {
-                state.set_active_pane("left".into());
-            }
-            ui_bridge::refresh_selection(&ui, &c.borrow());
         }
     });
 
@@ -2783,16 +2860,42 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         core.task_queue.clear();
     });
 
+    // 任务完成内部回调：存储完成路径并触发外部 task-finished
+    let w2 = ui.as_weak();
+    let c2 = core.clone();
+    state.on_task_finished_with_paths(move |ok, msg, paths| {
+        if let Some(ui) = w2.upgrade() {
+            // 存储完成路径到 pending_select，供 task-finished 刷新后定位
+            let path_list: Vec<PathBuf> = paths
+                .iter()
+                .map(|s| PathBuf::from(s.as_str()))
+                .collect();
+            c2.borrow_mut().pending_select = path_list;
+            // 触发外部 task-finished 回调
+            ui.global::<AppState>().invoke_task_finished(ok, msg);
+        }
+    });
+
     // 任务完成（工作线程经事件循环回调）：刷新目录、串联下一项或收起卡片
     let w = ui.as_weak();
     let c = core.clone();
     state.on_task_finished(move |_ok, msg| {
         if let Some(ui) = w.upgrade() {
             c.borrow_mut().task_control = None;
+            let right_pane = ui.global::<AppState>().get_dual_pane()
+                && ui.global::<AppState>().get_active_pane().as_str() == "right";
             load_current(&ui, &c);
             // 双面板时右侧面板也可能是任务的源或目标，一并刷新
             if ui.global::<AppState>().get_dual_pane() {
                 load_right(&ui, &c);
+            }
+            // 刷新完成后，选中 pending_select 中的路径
+            let paths = {
+                let mut core = c.borrow_mut();
+                std::mem::take(&mut core.pending_select)
+            };
+            if !paths.is_empty() {
+                select_completed_paths(&ui, &c, right_pane, &paths);
             }
             let st = ui.global::<AppState>();
             st.set_status_text(msg);
@@ -3089,6 +3192,18 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             c.borrow_mut().undo_stack.push(action);
             load_current(&ui, &c);
             ui.global::<AppState>().set_status_text(msg.into());
+        }
+    });
+
+    // 计算重命名时应选中的主名长度（字节偏移）。
+    // set-editing / set-editing-right 在 Slint 侧调用 name-select-len(name)，由此闭包实现。
+    // 系统资源管理器语义：file.txt→选 file；.gitignore→全选；无扩展名→全选。
+    state.on_name_select_len(move |name: slint::SharedString| {
+        let s = name.as_str();
+        match s.rfind('.') {
+            Some(0) => s.len() as i32,  // 点开头：隐藏文件，全选
+            Some(p) => p as i32,        // 常规：选主名不含扩展名
+            None => s.len() as i32,     // 无扩展名：全选
         }
     });
 

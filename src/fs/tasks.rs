@@ -153,6 +153,8 @@ pub struct TaskResult {
     pub skipped: i32,
     pub error: String,
     pub cancelled: bool,
+    /// 成功完成的目标路径列表（用于完成后自动选中）
+    pub completed_paths: Vec<PathBuf>,
 }
 
 /// 在工作线程中执行任务。
@@ -206,9 +208,16 @@ pub fn run(
 
     let mut ok = 0;
     let mut error = String::new();
+    let mut completed_paths = Vec::new();
     for src in &job.srcs {
         if ctrl.is_cancelled() {
-            return runner.result_with(ok, error, true);
+            return TaskResult {
+                ok,
+                skipped: runner.skipped,
+                error,
+                cancelled: true,
+                completed_paths,
+            };
         }
         let file_name = match src.file_name() {
             Some(n) => n,
@@ -232,10 +241,19 @@ pub fn run(
             runner.copy_one(src, &dest)
         };
         match res {
-            Ok(true) => ok += 1,
+            Ok(true) => {
+                ok += 1;
+                completed_paths.push(dest.clone());
+            }
             Ok(false) => {
                 // 被取消
-                return runner.result_with(ok, error, true);
+                return TaskResult {
+                    ok,
+                    skipped: runner.skipped,
+                    error,
+                    cancelled: true,
+                    completed_paths,
+                };
             }
             Err(e) => {
                 error = e.to_string();
@@ -243,7 +261,13 @@ pub fn run(
         }
     }
 
-    runner.result_with(ok, error, false)
+    TaskResult {
+        ok,
+        skipped: runner.skipped,
+        error,
+        cancelled: false,
+        completed_paths,
+    }
 }
 
 /// 构造冲突询问信息（名称、操作、源与目标的大小/日期对比）
@@ -546,6 +570,7 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
             skipped: self.skipped,
             error,
             cancelled,
+            completed_paths: Vec::new(),
         }
     }
 
@@ -556,6 +581,7 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
             skipped: self.skipped,
             error,
             cancelled,
+            completed_paths: Vec::new(),
         }
     }
 
@@ -666,10 +692,31 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
     /// 解压任务主流程：逐归档解压到 job.dst，逐条目上报进度、响应暂停/取消、
     /// 目标同名文件走冲突询问。
     fn run_extract(&mut self, job: &Job) -> TaskResult {
+        let mut completed_paths = Vec::new();
         for archive in &job.srcs {
             if self.ctrl.is_cancelled() {
-                return self.result(true, String::new());
+                return TaskResult {
+                    ok: 0,
+                    skipped: self.skipped,
+                    error: String::new(),
+                    cancelled: true,
+                    completed_paths,
+                };
             }
+            // 记录解压前目标目录中已存在的条目，用于区分解压新增的条目
+            let before: std::collections::HashSet<_> = if job.dst.exists() {
+                std::fs::read_dir(&job.dst)
+                    .ok()
+                    .map(|rd| {
+                        rd.filter_map(Result::ok)
+                            .map(|e| e.path())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashSet::new()
+            };
+
             let res = match is_archive(archive) {
                 Some(ArchiveFormat::Zip) => self.extract_zip(archive, &job.dst),
                 Some(ArchiveFormat::SevenZ) => self.extract_7z(archive, &job.dst),
@@ -681,13 +728,45 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
                 )),
             };
             match res {
-                Ok(true) => {}
-                Ok(false) => return self.result(true, String::new()),
-                Err(e) => return self.result(false, format!("解压失败：{}", e)),
+                Ok(true) => {
+                    // 收集解压后新增的顶层条目
+                    if let Ok(rd) = std::fs::read_dir(&job.dst) {
+                        for entry in rd.filter_map(Result::ok) {
+                            let p = entry.path();
+                            if !before.contains(&p) {
+                                completed_paths.push(p);
+                            }
+                        }
+                    }
+                }
+                Ok(false) => {
+                    return TaskResult {
+                        ok: 0,
+                        skipped: self.skipped,
+                        error: String::new(),
+                        cancelled: true,
+                        completed_paths,
+                    };
+                }
+                Err(e) => {
+                    return TaskResult {
+                        ok: 0,
+                        skipped: self.skipped,
+                        error: format!("解压失败：{}", e),
+                        cancelled: false,
+                        completed_paths,
+                    };
+                }
             }
         }
         self.emit("完成", true);
-        self.result(false, String::new())
+        TaskResult {
+            ok: self.done_files as i32,
+            skipped: self.skipped,
+            error: String::new(),
+            cancelled: false,
+            completed_paths,
+        }
     }
 
     /// 逐条目解压 ZIP：enclosed_name 防路径穿越，文件级分块写入并上报进度。
@@ -938,7 +1017,13 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
         match res {
             Ok(true) => {
                 self.emit("完成", true);
-                self.result(false, String::new())
+                TaskResult {
+                    ok: self.done_files as i32,
+                    skipped: 0,
+                    error: String::new(),
+                    cancelled: false,
+                    completed_paths: vec![job.dst.clone()],
+                }
             }
             Ok(false) => {
                 let _ = fs::remove_file(&job.dst);
@@ -1318,6 +1403,7 @@ fn run_mtp(
                 skipped: 0,
                 error: String::new(),
                 cancelled: true,
+                completed_paths: Vec::new(),
             };
         }
         if is_device(src) {
@@ -1345,6 +1431,7 @@ fn run_mtp(
                 skipped,
                 error,
                 cancelled: true,
+                completed_paths: Vec::new(),
             };
         }
         let src_s = src.to_string_lossy().to_string();
@@ -1402,6 +1489,7 @@ fn run_mtp(
                     skipped,
                     error,
                     cancelled: true,
+                    completed_paths: Vec::new(),
                 }
             }
             Err(e) => error = e,
@@ -1415,6 +1503,7 @@ fn run_mtp(
         skipped,
         error,
         cancelled: false,
+        completed_paths: Vec::new(),
     }
 }
 

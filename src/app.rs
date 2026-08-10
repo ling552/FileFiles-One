@@ -186,6 +186,8 @@ pub struct AppCore {
     pub undo_stack: Vec<UndoAction>,
     /// 重做栈：被撤销的操作（Ctrl+Shift+Z 弹栈重放正向）
     pub redo_stack: Vec<UndoAction>,
+    /// 待自动选中的完成路径（任务完成后存储，刷新目录后定位选中）
+    pub pending_select: Vec<std::path::PathBuf>,
 }
 
 impl AppCore {
@@ -206,6 +208,7 @@ impl AppCore {
             conflict_bridge: std::sync::Arc::new(crate::fs::tasks::ConflictBridge::new()),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            pending_select: Vec::new(),
         }
     }
 

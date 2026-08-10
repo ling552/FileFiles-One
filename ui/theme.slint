@@ -59,6 +59,18 @@ export global Theme {
     out property <brush> primary-weak: dark ? accent.with-alpha(0.30) : accent.with-alpha(0.18);
     out property <brush> primary-soft: accent.with-alpha(0.12);
     out property <brush> primary-hover: accent.with-alpha(0.09);
+    // ── 文件选择与行内编辑 ──
+    // 选中态使用半透明柔化而非实心色：长名称覆盖邻行时仍保有层次，也不会显得生硬。
+    out property <brush> selection-bg: dark ? accent.with-alpha(0.30) : accent.with-alpha(0.16);
+    out property <brush> selection-border: accent.with-alpha(dark ? 0.72 : 0.52);
+    out property <color> selection-shadow: dark ? #00000052 : #163b662e;
+    out property <length> selection-shadow-blur: 12px;
+    // 重命名框采用强调色反色，明确区分「已选中」与「正在编辑」。
+    // 橙色/黄色主题色亮度较高，使用黑色文字确保对比度达标（WCAG AA）
+    out property <brush> edit-bg: accent;
+    out property <brush> edit-text: (accent-key == "orange" || accent-key == "yellow") ? #1a1a1a : #ffffff;
+    out property <brush> edit-selection-bg: dark ? #ffffff42 : #ffffff54;
+    out property <brush> edit-selection-text: (accent-key == "orange" || accent-key == "yellow") ? #1a1a1a : #ffffff;
     // ── 语义色 ──
     out property <brush> danger: #d13438;
     out property <brush> success: #107c10;

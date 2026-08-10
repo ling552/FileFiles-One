@@ -65,12 +65,15 @@ export component FileGrid inherits Rectangle {
                         property <length> extra-name-h: 0px;
                         border-radius: Theme.radius-card;
                         border-width: 1px;
-                        border-color: card.entry.selected ? Theme.primary.with-alpha(0.45) : transparent;
+                        border-color: card.entry.selected ? Theme.selection-border : transparent;
                         background: card.entry.selected
-                            ? Theme.primary.with-alpha(0.15)
-                            : (ov.hover-idx == cell.idx ? Theme.primary.with-alpha(0.07) : transparent);
-                        // 选中状态由顶层完整卡片绘制，确保长名称始终在下一行项目之上。
-                        visible: !card.entry.selected || AppState.editing-index == cell.idx;
+                            ? Theme.selection-bg
+                            : (ov.hover-idx == cell.idx ? Theme.primary-hover : transparent);
+                        // 选中状态（含编辑中）由顶层完整卡片绘制，确保长名称始终在下一行项目之上。
+                        visible: !card.entry.selected;
+                        drop-shadow-blur: card.entry.selected ? Theme.selection-shadow-blur : 0px;
+                        drop-shadow-color: card.entry.selected ? Theme.selection-shadow : transparent;
+                        drop-shadow-offset-y: card.entry.selected ? 2px : 0px;
                         // 卡片固定贴住单元格上边缘。
                         x: 0px;
                         y: 0px;
@@ -114,21 +117,8 @@ export component FileGrid inherits Rectangle {
                                 overflow: clip;
                             }
                         }
-                        if AppState.editing-index == cell.idx: rename := RenameEdit {
-                            x: 8px;
-                            y: root.icon-top + root.icon-box + root.name-gap;
-                            width: parent.width - 16px;
-                            text: card.entry.name;
-                            font-size: Theme.fs-small;
-                            // 文本变化时保存到全局
-                            text-changed(t) => { AppState.rename-text = t; }
-                            // 按 Escape 退出重命名
-                            cancel => { AppState.editing-index = -1; }
-                            commit(t) => {
-                                AppState.rename-entry(cell.idx, t);
-                                AppState.editing-index = -1;
-                            }
-                        }
+                        // 重命名输入框不再在基础卡内渲染：长名会被卡片 clip 截断。
+                        // 改由顶层覆盖层（下方 for entry[i] editing-card）按文本宽度伸长绘制。
                         Text {
                             x: 8px;
                             y: root.icon-top + root.icon-box + root.name-gap + root.name-h + card.extra-name-h;
@@ -200,7 +190,7 @@ export component FileGrid inherits Rectangle {
     // 选中项目作为完整不透明卡片绘制在列表上层：长名称覆盖下一行，
     // 不会再被下一行图标盖住，也不会透出零碎的底层内容。
     for entry[i] in AppState.entries: selected-card := Rectangle {
-        property <bool> visible-card: entry.selected && AppState.editing-index != i;
+        property <bool> visible-card: entry.selected;
         property <int> grid-row: floor(i / root.cols);
         property <int> grid-col: mod(i, root.cols);
         property <length> content-y: (self.grid-row == 0 ? 12px : self.grid-row * root.row-h) + list.viewport-y;
@@ -210,10 +200,13 @@ export component FileGrid inherits Rectangle {
         width: root.cell-w;
         border-radius: Theme.radius-card;
         border-width: 1px;
-        border-color: Theme.primary.with-alpha(0.45);
+        border-color: Theme.selection-border;
         // 选中卡片须为实色，才能彻底遮住下方行的图标与文字。
-        background: Theme.primary.with-alpha(Theme.dark ? 0.32 : 0.16);
+        background: Theme.selection-bg;
         clip: true;
+        drop-shadow-blur: Theme.selection-shadow-blur;
+        drop-shadow-color: Theme.selection-shadow;
+        drop-shadow-offset-y: 2px;
 
         FileIcon {
             x: (parent.width - root.icon-box) / 2;
@@ -225,6 +218,7 @@ export component FileGrid inherits Rectangle {
             box: root.icon-box;
         }
         selected-name-text := Text {
+            visible: AppState.editing-index != i;
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap;
             width: parent.width - 16px;
@@ -266,15 +260,15 @@ export component FileGrid inherits Rectangle {
                 spacing: 3px;
                 if entry.tag-important: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
-                    background: #d13438; border-width: 2px; border-color: Theme.primary.with-alpha(Theme.dark ? 0.32 : 0.16);
+                    background: #d13438; border-width: 2px; border-color: Theme.selection-bg;
                 }
                 if entry.tag-archive: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
-                    background: #ff8c00; border-width: 2px; border-color: Theme.primary.with-alpha(Theme.dark ? 0.32 : 0.16);
+                    background: #ff8c00; border-width: 2px; border-color: Theme.selection-bg;
                 }
                 if entry.tag-done: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
-                    background: #107c10; border-width: 2px; border-color: Theme.primary.with-alpha(Theme.dark ? 0.32 : 0.16);
+                    background: #107c10; border-width: 2px; border-color: Theme.selection-bg;
                 }
             }
         }
@@ -285,7 +279,7 @@ export component FileGrid inherits Rectangle {
             y: root.icon-top + root.icon-box - 15px;
             border-radius: 5px;
             border-width: 2px;
-            border-color: Theme.primary.with-alpha(Theme.dark ? 0.32 : 0.16);
+            border-color: Theme.selection-bg;
             background: entry.git-status == "?" ? #8a99aa
                 : entry.git-status == "!" ? #d13438
                 : entry.git-status == "A" ? #107c10
@@ -297,6 +291,39 @@ export component FileGrid inherits Rectangle {
                 font-weight: 800;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+            }
+        }
+    }
+
+    // 重命名覆盖层：editing-index 命中时，在对应卡片名区位置绘制可伸长的输入框。
+    // 独立于 ListView 虚拟化与卡片 clip，文件名按文本实际宽度向右展开（覆盖下一行），
+    // 长名完整可见；超出可视区由 FileGrid 的 clip 裁剪。
+    // 绘制顺序在 selected-card 之后、InputOverlay 之前：选中卡片盖住底下各行，
+    // 编辑覆盖层再盖住选中卡片上的名称文本。
+    for entry[i] in AppState.entries: editing-card := Rectangle {
+        visible: AppState.editing-index == i;
+        property <int> grid-row: floor(i / root.cols);
+        property <int> grid-col: mod(i, root.cols);
+        property <length> content-y: (self.grid-row == 0 ? 12px : self.grid-row * root.row-h) + list.viewport-y;
+        x: 12px + self.grid-col * root.pitch;
+        y: self.content-y + root.icon-top + root.icon-box + root.name-gap;
+        height: rename.height;
+        // 由 RenameEdit 文本首选宽度撑开；最小不小于卡片名区宽度。FileGrid clip 兜底右边界。
+        width: max(root.cell-w - 16px, rename.preferred-width + 16px);
+        rename := RenameEdit {
+            x: 8px;
+            width: parent.width - 16px;
+            multiline: true;   // 网格模式允许按名称区宽度换行
+            editing: AppState.editing-index == i;   // 监听进入编辑，重置 armed
+            text: entry.name;
+            font-size: Theme.fs-small;
+            // 文本变化时保存到全局（供点击外部区域时提交）
+            text-changed(t) => { AppState.rename-text = t; }
+            // 按 Escape 退出重命名
+            cancel => { AppState.editing-index = -1; }
+            commit(t) => {
+                AppState.rename-entry(i, t);
+                AppState.editing-index = -1;
             }
         }
     }

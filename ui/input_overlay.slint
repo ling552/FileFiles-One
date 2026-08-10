@@ -83,22 +83,37 @@ export component InputOverlay inherits TouchArea {
         if (root.pane == "left") { AppState.open-entry(idx); }
         else { AppState.r-open-entry(idx); }
     }
+    // 框选的上一次矩形状态（用于检测是否真正变化）
+    property <length> last-box-x0: 0px;
+    property <length> last-box-y0: 0px;
+    property <length> last-box-x1: 0px;
+    property <length> last-box-y1: 0px;
+
     // 实时应用框选（矩形子区 → 行/列范围）
     function apply-box() {
-        if (root.pane == "left") {
-            AppState.box-select(
-                max(0, root.row-of(min(root.box-y0, root.box-y1))),
-                root.row-of(max(root.box-y0, root.box-y1)),
-                root.mode == "grid" ? max(0, root.col-of(min(root.box-x0, root.box-x1))) : 0,
-                root.mode == "grid" ? min(root.cols - 1, root.col-of(max(root.box-x0, root.box-x1))) : 0,
-                root.cols, root.press-ctrl);
-        } else {
-            AppState.r-box-select(
-                max(0, root.row-of(min(root.box-y0, root.box-y1))),
-                root.row-of(max(root.box-y0, root.box-y1)),
-                root.mode == "grid" ? max(0, root.col-of(min(root.box-x0, root.box-x1))) : 0,
-                root.mode == "grid" ? min(root.cols - 1, root.col-of(max(root.box-x0, root.box-x1))) : 0,
-                root.cols, root.press-ctrl);
+        // 仅当矩形范围真正变化时才调用 Rust 回调，减少拖动过程中的频繁刷新
+        if (root.box-x0 != root.last-box-x0 || root.box-y0 != root.last-box-y0
+            || root.box-x1 != root.last-box-x1 || root.box-y1 != root.last-box-y1) {
+            root.last-box-x0 = root.box-x0;
+            root.last-box-y0 = root.box-y0;
+            root.last-box-x1 = root.box-x1;
+            root.last-box-y1 = root.box-y1;
+
+            if (root.pane == "left") {
+                AppState.box-select(
+                    max(0, root.row-of(min(root.box-y0, root.box-y1))),
+                    root.row-of(max(root.box-y0, root.box-y1)),
+                    root.mode == "grid" ? max(0, root.col-of(min(root.box-x0, root.box-x1))) : 0,
+                    root.mode == "grid" ? min(root.cols - 1, root.col-of(max(root.box-x0, root.box-x1))) : 0,
+                    root.cols, root.press-ctrl);
+            } else {
+                AppState.r-box-select(
+                    max(0, root.row-of(min(root.box-y0, root.box-y1))),
+                    root.row-of(max(root.box-y0, root.box-y1)),
+                    root.mode == "grid" ? max(0, root.col-of(min(root.box-x0, root.box-x1))) : 0,
+                    root.mode == "grid" ? min(root.cols - 1, root.col-of(max(root.box-x0, root.box-x1))) : 0,
+                    root.cols, root.press-ctrl);
+            }
         }
     }
 
@@ -167,6 +182,11 @@ export component InputOverlay inherits TouchArea {
         if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
             // 新的按下取消任何挂起的「单击重命名」：点击别处或换项后不应再进入重命名
             AppState.cancel-click-rename();
+            // 新的按下重置框选状态缓存
+            root.last-box-x0 = 0px;
+            root.last-box-y0 = 0px;
+            root.last-box-x1 = 0px;
+            root.last-box-y1 = 0px;
             // 重命名进行中：先提交当前编辑再处理新的点击，避免丢失编辑内容
             if (AppState.editing-index >= 0) {
                 let t = AppState.rename-text;

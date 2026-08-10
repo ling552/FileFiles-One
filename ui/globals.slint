@@ -278,6 +278,14 @@ export global AppState {
     in-out property <string> rename-text;
     // 右面板重命名输入框中的文本
     in-out property <string> r-rename-text;
+    // 进入重命名时应选中的主名长度（按字节偏移；不含扩展名）。
+    // ponytail: 左右面板共用一个属性——同一时刻仅一个编辑框活动，无冲突；
+    // 若未来需并发编辑再按面板拆分。由 name-select-len 计算、Rust 实现覆盖。
+    in-out property <int> rename-name-len: 0;
+    // 计算文件名主名长度（字节偏移）：最后一个 '.' 之前；无 '.' 或 '.' 在首位（如 .gitignore）则全选。
+    // 用 callback（带返回值）而非 function：Slint function 无法被 Rust 端实现覆盖，
+    // 而 callback 由 Rust 用 on_name_select_len 注册实现（与 compute-hash 同）。
+    callback name-select-len(string) -> int;
     callback new-folder();
     callback new-file();
     // 撤销最近一次可逆操作（重命名 / 新建 / 移动 / 删除），Ctrl+Z 触发
@@ -540,8 +548,10 @@ export global AppState {
     callback task-pause();
     // 取消当前任务
     callback task-cancel();
-    // 任务完成（由 Rust 工作线程经事件循环回调）：参数为成功数量、错误信息
+    // 任务完成（由 Rust 工作线程经事件循环回调）：参数为成功数量、状态消息、完成路径列表
     callback task-finished(int, string);
+    // 内部使用：任务完成并携带完成路径（由 Rust 完成闭包调用，触发 task-finished 并存储路径）
+    callback task-finished-with-paths(int, string, [string]);
 
     // ════════ 目录实时监听：当前目录内容被外部程序改动时自动刷新 ════════
     // 由 Rust 的文件监听线程经事件循环触发（非 UI 直接调用）。

@@ -21,10 +21,10 @@ import { ActionBar } from "action_bar.slint";
 
 export { AppState, Theme }
 
-// 窗口控制按钮（最小化 / 最大化 / 关闭），贴右上角、全高、Windows 11 风格
+// 窗口控制按钮（最小化 / 最大化 / 关闭），贴右上角、全高、Windows 11 风格。
+// 不挂 tooltip：原生窗口按钮本来就无悬停提示，自绘也不需要。
 component WinCtrlBtn inherits Rectangle {
     in property <string> glyph;
-    in property <string> tooltip;
     in property <bool> danger: false;
     callback clicked;
     width: 46px;
@@ -36,20 +36,6 @@ component WinCtrlBtn inherits Rectangle {
         color: (danger && touch.has-hover) ? #ffffff : Theme.text;
         horizontal-alignment: center;
         vertical-alignment: center;
-    }
-    if touch.has-hover && root.tooltip != "": Rectangle {
-        y: parent.height + 4px;
-        width: tip.preferred-width + 14px;
-        height: 24px;
-        border-radius: 6px;
-        background: Theme.surface;
-        border-width: 1px;
-        border-color: Theme.border;
-        drop-shadow-blur: 10px;
-        drop-shadow-color: Theme.dark ? #00000055 : #00000033;
-        drop-shadow-offset-y: 2px;
-        z: 100;
-        tip := Text { text: root.tooltip; color: Theme.text; font-size: Theme.fs-tiny; horizontal-alignment: center; vertical-alignment: center; }
     }
     touch := TouchArea {
         clicked => { root.clicked(); }
@@ -340,15 +326,15 @@ export component MainWindow inherits Window {
                     if !AppState.ql-video-fullscreen: HorizontalLayout {
                         spacing: 0px;
                         WinCtrlBtn {
-                            glyph: "\u{E921}"; tooltip: "最小化";   // 最小化
+                            glyph: "\u{E921}";   // 最小化
                             clicked => { root.minimize-window(); }
                         }
                         WinCtrlBtn {
-                            glyph: root.window-maximized ? "\u{E923}" : "\u{E922}"; tooltip: root.window-maximized ? "还原窗口" : "最大化窗口";   // 还原 / 最大化
+                            glyph: root.window-maximized ? "\u{E923}" : "\u{E922}";   // 还原 / 最大化
                             clicked => { root.toggle-maximize(); }
                         }
                         WinCtrlBtn {
-                            glyph: "\u{E8BB}"; tooltip: "关闭窗口";   // 关闭
+                            glyph: "\u{E8BB}";   // 关闭
                             danger: true;
                             clicked => { root.close-window(); }
                         }
@@ -682,12 +668,15 @@ export component MainWindow inherits Window {
         AppState.editing-index = idx;
         if (idx >= 0 && idx < AppState.entries.length) {
             AppState.rename-text = AppState.entries[idx].name;
+            // name 只 move 一次（设 rename-text）；这里读 property 副本算主名长度，避免二次 move
+            AppState.rename-name-len = AppState.name-select-len(AppState.rename-text);
         }
     }
     public function set-editing-right(idx: int) {
         AppState.r-editing-index = idx;
         if (idx >= 0 && idx < AppState.r-entries.length) {
             AppState.r-rename-text = AppState.r-entries[idx].name;
+            AppState.rename-name-len = AppState.name-select-len(AppState.r-rename-text);
         }
     }
     public function clear-editing() {
