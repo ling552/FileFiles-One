@@ -375,12 +375,6 @@ component NewButton inherits Rectangle {
             color: Theme.text;
             vertical-alignment: center;
         }
-        if touch.has-hover && root.tooltip != "": Text {
-            text: root.tooltip;
-            font-size: Theme.fs-tiny;
-            color: Theme.muted;
-            y: root.height + 4px;
-        }
         Text {
             text: "\u{E70D}";   // 向下箭头
             font-family: "Segoe MDL2 Assets";
@@ -388,6 +382,20 @@ component NewButton inherits Rectangle {
             color: Theme.muted;
             vertical-alignment: center;
         }
+    }
+    if touch.has-hover && root.tooltip != "": Rectangle {
+        y: root.height + 4px;
+        width: tip.preferred-width + 14px;
+        height: 24px;
+        border-radius: 6px;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 10px;
+        drop-shadow-color: Theme.dark ? #00000055 : #00000033;
+        drop-shadow-offset-y: 2px;
+        z: 100;
+        tip := Text { text: root.tooltip; color: Theme.text; font-size: Theme.fs-tiny; horizontal-alignment: center; vertical-alignment: center; }
     }
     touch := TouchArea {
         mouse-cursor: pointer;

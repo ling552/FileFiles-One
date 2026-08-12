@@ -12,6 +12,11 @@
 //! 由于 TextInput 不允许有子元素（无 @children），这里用 Rectangle 包裹
 //! TextInput 与 Timer，对外暴露 text/font-size 与 cancel/commit。
 //! 新增 text-changed 回调，用于在点击编辑框外部区域时提交当前文本。
+//!
+//! 调用约定：所有调用方一律用 `if editing-index == i: RenameEdit { ... }` 条件实例化，
+//! 组件存在即处于编辑态。因此本组件不再有「非编辑外观」分支——早先用 visible 复用同一
+//! 实例时，退出编辑会多渲染一帧透明底 + 普通文字色的样子，叠在选中卡片的强调色底上
+//! 表现为名称被洗白的中间态。条件实例化让编辑框销毁与正常名称显现落在同一帧。
 
 import { Theme } from "theme.slint";
 import { AppState } from "globals.slint";
@@ -19,15 +24,8 @@ import { AppState } from "globals.slint";
 export component RenameEdit inherits Rectangle {
     in property <string> text;
     in property <length> font-size: 13px;
-    // true 时按文本宽度自适应撑开（用于网格卡片长名覆盖场景）；
-    // false 时 TextInput 填满父宽度（列表场景，父已给出固定宽度）。
-    in property <bool> stretch: false;
     // true 时网格重命名按名称区宽度换行；列表仍保持单行。
     in property <bool> multiline: false;
-    // 当前是否处于编辑状态（由调用方传入 AppState.editing-index == i 之类）。
-    // 网格覆盖层用 visible toggle 复用同一实例，armed 不会因重建而重置；
-    // 通过监听 editing 由 false→true 重新装填 Timer，确保再次进入仍能聚焦/选主名。
-    in property <bool> editing: false;
     // 取消编辑（按 Escape 时回调，由父组件清理 editing-index）
     callback cancel();
     // 提交新名称
@@ -35,31 +33,30 @@ export component RenameEdit inherits Rectangle {
     // 文本变化时通知父组件（用于保存当前键入内容，点击外部区域时提交）
     callback text-changed(string);
 
-    // 计时器装填标记：true 时 Timer 运行，触发一次后置 false
+    // 计时器装填标记：实例创建时为 true，Timer 触发一次后置 false。
+    // 条件实例化下每次进入编辑都是新实例，无需再监听状态变化重新装填。
     property <bool> armed: true;
-    // 进入编辑（false→true）时重置 armed，保证 Timer 每次进入都触发一次聚焦/选主名
-    changed editing => { if (root.editing) { root.armed = true; } }
 
     border-radius: 3px;
-    border-width: root.editing ? 1px : 0px;
-    border-color: root.editing ? Theme.selection-border : transparent;
-    background: root.editing ? Theme.edit-bg : transparent;
+    border-width: 1px;
+    border-color: Theme.selection-border;
+    background: Theme.edit-bg;
     clip: true;
     // 网格编辑框允许按普通名称区宽度换行；列表保持单行并沿用固定行高。
     height: root.multiline ? max(32px, edit.preferred-height) : edit.preferred-height;
-    drop-shadow-blur: root.editing ? 6px : 0px;
-    drop-shadow-color: root.editing ? Theme.selection-shadow : transparent;
-    drop-shadow-offset-y: root.editing ? 1px : 0px;
+    drop-shadow-blur: 6px;
+    drop-shadow-color: Theme.selection-shadow;
+    drop-shadow-offset-y: 1px;
 
     edit := TextInput {
         x: 0px;
         y: 0px;
-        // stretch 仅用于兼容旧调用；编辑文本始终受名称区宽度约束，避免长名横向铺成一行。
+        // 编辑文本始终受名称区宽度约束，避免长名横向铺成一行。
         width: root.width;
         height: root.height;
         text: root.text;
         font-size: root.font-size;
-        color: root.editing ? Theme.edit-text : Theme.text;
+        color: Theme.edit-text;
         single-line: !root.multiline;
         horizontal-alignment: center;
         vertical-alignment: root.multiline ? top : center;

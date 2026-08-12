@@ -210,15 +210,15 @@ export component Toolbar inherits Rectangle {
                     }
                     edited => { AppState.do-search(self.text); }
                     // 搜索框聚焦时会吞掉空格/Esc，全局快捷键到不了 FocusScope。
-                    // 在此显式处理：预览打开时空格/Esc 关闭、其余按键吞掉避免改写搜索词；
-                    // 有选中项时空格触发 Quick Look（而非往搜索词里输入空格）。
+                    // 在此显式处理：有选中项时空格切换独立预览窗口（而非往搜索词里
+                    // 输入空格）；Esc 仍用于清空搜索，预览窗口自身也能用 Esc 关闭。
                     key-pressed(ev) => {
-                        if (AppState.quicklook-open) {
-                            if (ev.text == " " || ev.text == Key.Escape) { AppState.close-quicklook(); }
-                            return accept;
-                        }
                         if (ev.text == " " && AppState.sel-count > 0) {
-                            AppState.open-quicklook();
+                            if (AppState.quicklook-open) {
+                                AppState.close-quicklook();
+                            } else {
+                                AppState.open-quicklook();
+                            }
                             return accept;
                         }
                         if (ev.text == Key.Escape) {

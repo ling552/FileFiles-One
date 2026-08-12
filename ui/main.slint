@@ -7,7 +7,6 @@ import { FileList } from "file_list.slint";
 import { ThisPcView } from "this_pc_view.slint";
 import { DetailsPane } from "details_pane.slint";
 import { PropertiesDialog } from "properties_dialog.slint";
-import { QuickLook } from "quick_look.slint";
 import { CommandPalette } from "command_palette.slint";
 import { DualPane } from "dual_pane.slint";
 import { ProgressCard } from "progress_card.slint";
@@ -20,6 +19,9 @@ import { VSplitter } from "splitter.slint";
 import { ActionBar } from "action_bar.slint";
 
 export { AppState, Theme }
+// 独立预览窗口：与主窗口同一编译单元导出，Rust 侧经 include_modules! 取得
+// PreviewWindow / PreviewState / ArchiveNode 三个类型。
+export { PreviewWindow, PreviewState, ArchiveNode } from "preview_window.slint";
 
 // 窗口控制按钮（最小化 / 最大化 / 关闭），贴右上角、全高、Windows 11 风格。
 // 不挂 tooltip：原生窗口按钮本来就无悬停提示，自绘也不需要。
@@ -89,24 +91,23 @@ export component MainWindow inherits Window {
         focus-on-click: false;
         // 全局快捷键
         key-pressed(ev) => {
-            // Quick Look 已打开：空格 / Esc 关闭，吞掉其它按键避免误触
-            if (AppState.quicklook-open) {
-                if (ev.text == Key.Escape && AppState.ql-video-fullscreen) {
-                    AppState.ql-toggle-video-fullscreen();
-                    return accept;
-                }
-                if (ev.text == " " || ev.text == Key.Escape) {
-                    AppState.close-quicklook();
-                    return accept;
-                }
-                return accept;
-            }
-            // 空格键 Quick Look 预览：仅在非重命名编辑（任一面板）、非命令面板时触发
+            // 空格键 Quick Look 预览：预览已是独立窗口，主窗口不再吞其它按键。
+            // 已打开时空格再按即关闭（与 macOS 快速查看手感一致）。
             if (ev.text == " " && AppState.editing-index == -1 && AppState.r-editing-index == -1
                 && !AppState.command-palette-open) {
                 // 确保键盘焦点在全局作用域，避免编辑框销毁后焦点丢失导致无法触发
                 key-scope.focus();
-                AppState.open-quicklook();
+                if (AppState.quicklook-open) {
+                    AppState.close-quicklook();
+                } else {
+                    AppState.open-quicklook();
+                }
+                return accept;
+            }
+            // Esc：预览窗口开着就关掉它（焦点回到主窗口时也能关）
+            if (ev.text == Key.Escape && AppState.quicklook-open
+                && !AppState.command-palette-open) {
+                AppState.close-quicklook();
                 return accept;
             }
 
@@ -321,9 +322,9 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    // 视频全屏时隐藏应用自绘标题栏按钮；退出全屏后恢复。
-                    // 这样即使系统在切换全屏的一帧内短暂重建非客户区，也不会出现两组按钮。
-                    if !AppState.ql-video-fullscreen: HorizontalLayout {
+                    // 窗口控制按钮。视频全屏现在作用于独立预览窗口，
+                    // 与主窗口标题栏无关，故不再随预览状态隐藏。
+                    HorizontalLayout {
                         spacing: 0px;
                         WinCtrlBtn {
                             glyph: "\u{E921}";   // 最小化
@@ -551,12 +552,19 @@ export component MainWindow inherits Window {
 
     // 空白点击层：点击任何非输入区域时把焦点交还给全局快捷键作用域。
     // 输入控件位于其上层，正常点击输入框不会触发这里。
+    //
+    // 本层声明在主体内容之后，启用时位于最上层并吞掉该次点击（下层 InputOverlay
+    // 收不到）。行内重命名期间 TextInput 获得焦点 → input-active=true → 本层启用，
+    // 于是「点击别处退出重命名」的第一次点击只做失焦、不提交，编辑框失焦但仍在
+    // 显示，表现为需要再点一次才回到正常显示的中间态。故此处必须同样提交并退出
+    // 编辑（与 InputOverlay 共用 commit-pending-rename），使任意一次点击都一步到位。
     blur-touch := TouchArea {
         width: 100%;
         height: 100%;
         enabled: AppState.input-active;
         pointer-event(ev) => {
             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                AppState.commit-pending-rename();
                 AppState.input-blur-token = AppState.input-blur-token + 1;
                 key-scope.focus();
             }
@@ -564,12 +572,26 @@ export component MainWindow inherits Window {
     }
 
     // 重命名编辑完成后归还焦点到全局快捷键作用域，确保空格键预览等快捷键可用
-    // 通过监听 editing-index 和 r-editing-index 属性变化来触发
+    // 通过监听 editing-index 和 r-editing-index 属性变化来触发。
+    //
+    // 同时必须清 input-active：RenameEdit 是条件实例化的，退出编辑时实例直接销毁，
+    // 其 `changed has-focus` 不会再回调，input-active 会残留为 true，使上方的
+    // blur-touch 持续启用并吞掉之后落在窗口任意位置的第一次点击。
     focus-watcher := Rectangle {
         property <int> ei: AppState.editing-index;
-        changed ei => { if (self.ei < 0) { key-scope.focus(); } }
+        changed ei => {
+            if (self.ei < 0) {
+                AppState.input-active = false;
+                key-scope.focus();
+            }
+        }
         property <int> rei: AppState.r-editing-index;
-        changed rei => { if (self.rei < 0) { key-scope.focus(); } }
+        changed rei => {
+            if (self.rei < 0) {
+                AppState.input-active = false;
+                key-scope.focus();
+            }
+        }
     }
 
     // 浮层：属性对话框
@@ -581,11 +603,8 @@ export component MainWindow inherits Window {
         changed open => { if (!self.open) { key-scope.focus(); } }
     }
 
-    // 浮层：空格键 Quick Look 预览
-    QuickLook {
-        width: 100%;
-        height: 100%;
-    }
+    // 空格键 Quick Look 预览已改为独立窗口（preview_window.slint），
+    // 主窗口不再叠加预览浮层。
 
     // 浮层：命令面板
     cmd-palette := CommandPalette {

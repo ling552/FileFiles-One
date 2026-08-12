@@ -1,0 +1,510 @@
+// 独立预览窗口（空格 Quick Look）：与主窗口分离的真实操作系统窗口。
+//
+// 为什么独立成窗口：预览不再遮挡文件列表，可与主窗口并排比对，也能自由缩放；
+// 视频（Media Foundation）与网页（WebView2）原生子窗口改挂到本窗口，
+// 由 Rust 侧按本窗口客户区（扣除头部/底部）计算矩形对齐。
+//
+// 注意：Slint 的 global 是「每根组件实例一份」，本窗口无法共享主窗口的 AppState，
+// 故单独定义 PreviewState，由 Rust 在打开时把内容与主题一并推送过来。
+
+import { Theme } from "theme.slint";
+import { FileIcon } from "file_icon.slint";
+import { ScrollView } from "std-widgets.slint";
+
+// 归档树的单个可见节点（压缩包预览用）
+export struct ArchiveNode {
+    name: string,          // 仅本级名称
+    full-path: string,     // 归档内完整路径（展开状态的稳定键）
+    size: string,          // 已格式化的大小文本
+    is-dir: bool,
+    level: int,            // 缩进层级，根级 0
+    expanded: bool,        // 目录是否展开
+    has-children: bool,    // 目录是否含子项（决定是否画箭头）
+}
+
+// 加载动画：环形进度圈匀速旋转 + 圆弧长度呼吸，色调取主题强调色。
+// 不用 std-widgets 的 Spinner：它的描边固定为 Fluent 蓝，无法跟随本程序主题色。
+component LoadingRing inherits Path {
+    in property <length> ring-size: 34px;
+    in property <brush> ring-stroke: Theme.primary;
+    width: root.ring-size;
+    height: root.ring-size;
+    viewbox-width: 100;
+    viewbox-height: 100;
+    stroke: root.ring-stroke;
+    stroke-width: 8px;
+
+    // 起点绕圈：3s 一周
+    private property <float> spin: mod(animation-tick(), 3s) / 3s;
+    // 弧长呼吸：1.5s 一个来回，保持 0.2..1 之间可见
+    private property <float> arc: min(0.9999, max(0.2, abs(sin(360deg * animation-tick() / 1.5s))));
+    private property <float> r: 42;
+    private property <float> cx: 50;
+    private property <float> cy: 50;
+
+    MoveTo {
+        x: cx - r * sin(-(spin - 0.001) * 360deg);
+        y: cy - r * cos(-(spin - 0.001) * 360deg);
+    }
+    LineTo {
+        x: cx - r * sin(-spin * 360deg);
+        y: cy - r * cos(-spin * 360deg);
+    }
+    ArcTo {
+        radius-x: r;
+        radius-y: r;
+        x: cx - r * sin(-(spin + arc) * 360deg);
+        y: cy - r * cos(-(spin + arc) * 360deg);
+        sweep: true;
+        large-arc: arc > 0.5;
+    }
+}
+
+// 加载占位：旋转环 + 说明文字，居中于内容区
+component LoadingOverlay inherits Rectangle {
+    in property <string> label;
+    in property <bool> on-dark: false;
+    VerticalLayout {
+        alignment: center;
+        spacing: 14px;
+        HorizontalLayout {
+            alignment: center;
+            LoadingRing {
+                ring-stroke: root.on-dark ? #ffffffcc : Theme.primary;
+            }
+        }
+        Text {
+            width: 100%;
+            text: root.label;
+            font-size: Theme.fs-body;
+            color: root.on-dark ? #9aa7b5 : Theme.muted;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+export global PreviewState {
+    // 内容类型：0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频 / 5 归档树
+    in-out property <int> kind;
+    // 内容仍在后台加载（图片解码 / 视频媒体源解析）：显示加载动画。
+    // 窗口尺寸在显示前已按内容真实尺寸算好，加载完成只换内容不改窗口。
+    in-out property <bool> loading: false;
+    in-out property <string> name;
+    in-out property <string> subtitle;
+    in-out property <image> preview-image;
+    in-out property <bool> has-image;
+    in-out property <int> img-w: 0;
+    in-out property <int> img-h: 0;
+    // 文本预览的四层等宽叠加（正文 + 关键字/字符串/注释染色层）
+    in-out property <string> text-content;
+    in-out property <string> code-kw;
+    in-out property <string> code-str;
+    in-out property <string> code-cmt;
+    in-out property <string> info;
+    in-out property <string> icon-class;
+    in-out property <image> thumb;
+    in-out property <bool> has-thumb: false;
+    // Markdown/HTML/PHP 的「渲染 ↔ 源码」双视图
+    in-out property <bool> can-render: false;
+    in-out property <bool> web-mode: false;
+    callback set-web-mode(bool);
+    // 切换视频无边框全屏（仅 kind==4 时按钮可见）
+    callback toggle-fullscreen();
+    // 视频是否处于全屏（按钮图标切换用）
+    in-out property <bool> video-fullscreen: false;
+    // 归档树：仅包含当前应显示的节点（父目录折叠时其后代由 Rust 过滤掉）
+    in-out property <[ArchiveNode]> archive-nodes;
+    // 切换第 idx 个节点的展开/折叠（Rust 侧维护展开集合并重算可见节点）
+    callback toggle-folder(int);
+    // 关闭预览（Esc / 空格 / 头部关闭按钮 / 窗口 X）
+    callback close-preview();
+}
+
+export component PreviewWindow inherits Window {
+    title: PreviewState.name == "" ? "预览" : "预览 - " + PreviewState.name;
+    preferred-width: 860px;
+    preferred-height: 640px;
+    min-width: 420px;
+    min-height: 320px;
+    background: Theme.bg;
+    forward-focus: keys;
+
+    // 空格 / Esc 关闭，与主窗口的 Quick Look 手感一致
+    keys := FocusScope {
+        key-pressed(ev) => {
+            if (ev.text == " " || ev.text == Key.Escape) {
+                PreviewState.close-preview();
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            // ── 头部：图标 + 名称/副标题 + 视图切换 ──
+            Rectangle {
+                height: 60px;
+                background: Theme.surface;
+                HorizontalLayout {
+                    padding: 10px;
+                    padding-left: 14px;
+                    padding-right: 12px;
+                    spacing: 12px;
+                    Rectangle {
+                        width: 40px;
+                        height: 40px;
+                        y: (parent.height - 40px) / 2;
+                        FileIcon {
+                            icon-class: PreviewState.icon-class;
+                            thumb: PreviewState.thumb;
+                            has-thumb: PreviewState.has-thumb;
+                            box: 40px;
+                            radius: 9px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: PreviewState.name;
+                            font-size: 15px;
+                            font-weight: 700;
+                            color: Theme.text;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: PreviewState.subtitle;
+                            font-size: Theme.fs-small;
+                            color: Theme.muted;
+                            overflow: elide;
+                        }
+                    }
+                    // 渲染 / 源码切换（仅 Markdown/HTML/PHP）
+                    if PreviewState.can-render: Rectangle {
+                        width: 116px;
+                        height: 30px;
+                        y: (parent.height - 30px) / 2;
+                        border-radius: 8px;
+                        background: Theme.surface-2;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding: 2px;
+                            spacing: 2px;
+                            Rectangle {
+                                border-radius: 6px;
+                                background: PreviewState.web-mode ? Theme.primary-soft : (render-btn.has-hover ? Theme.primary-hover : transparent);
+                                Text {
+                                    text: "渲染";
+                                    font-size: Theme.fs-tiny;
+                                    color: PreviewState.web-mode ? Theme.primary : Theme.muted;
+                                    font-weight: PreviewState.web-mode ? 700 : 400;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                render-btn := TouchArea { clicked => { PreviewState.set-web-mode(true); } }
+                            }
+                            Rectangle {
+                                border-radius: 6px;
+                                background: !PreviewState.web-mode ? Theme.primary-soft : (source-btn.has-hover ? Theme.primary-hover : transparent);
+                                Text {
+                                    text: "源码";
+                                    font-size: Theme.fs-tiny;
+                                    color: !PreviewState.web-mode ? Theme.primary : Theme.muted;
+                                    font-weight: !PreviewState.web-mode ? 700 : 400;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                source-btn := TouchArea { clicked => { PreviewState.set-web-mode(false); } }
+                            }
+                        }
+                    }
+                    // 全屏按钮（仅视频预览显示）。
+                    // 头部不再放关闭按钮：本窗口有系统标题栏，其 X 已是关闭入口，
+                    // 再画一个等于同一功能出现两次。
+                    if PreviewState.kind == 4: Rectangle {
+                        width: 30px;
+                        height: 30px;
+                        y: (parent.height - 30px) / 2;
+                        border-radius: 8px;
+                        background: fsbtn.has-hover ? Theme.primary-hover : transparent;
+                        Text {
+                            text: PreviewState.video-fullscreen ? "\u{E73F}" : "\u{E740}";
+                            font-family: "Segoe MDL2 Assets";
+                            font-size: 13px;
+                            color: fsbtn.has-hover ? Theme.primary : Theme.muted;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        fsbtn := TouchArea { clicked => { PreviewState.toggle-fullscreen(); } }
+                    }
+                }
+                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            }
+
+            // ── 内容区：原生视频/网页子窗口按本区域矩形对齐覆盖 ──
+            Rectangle {
+                vertical-stretch: 1;
+                background: Theme.surface-2;
+                clip: true;
+
+                // 图片（kind == 1）：滚轮缩放、拖动查看
+                if PreviewState.kind == 1: img-area := Rectangle {
+                    clip: true;
+                    // 自适应初始缩放：能放下就 1:1（小图不放大），放不下缩到刚好容纳
+                    property <float> fit-zoom: min(1.0, min(
+                        self.width / max(1px, PreviewState.img-w * 1px),
+                        self.height / max(1px, PreviewState.img-h * 1px)));
+                    property <float> user-zoom: 0;
+                    property <float> zoom: img-area.user-zoom > 0 ? img-area.user-zoom : img-area.fit-zoom;
+                    property <length> off-x: 0px;
+                    property <length> off-y: 0px;
+                    property <length> max-off-x: max(0px, (PreviewState.img-w * 1px * img-area.zoom - self.width) / 2);
+                    property <length> max-off-y: max(0px, (PreviewState.img-h * 1px * img-area.zoom - self.height) / 2);
+                    // 切换到另一张图片时重置缩放与偏移
+                    property <string> cur-img: PreviewState.name;
+                    changed cur-img => { self.user-zoom = 0; self.off-x = 0px; self.off-y = 0px; }
+
+                    if PreviewState.has-image: Image {
+                        x: (img-area.width - self.width) / 2 + clamp(img-area.off-x, -img-area.max-off-x, img-area.max-off-x);
+                        y: (img-area.height - self.height) / 2 + clamp(img-area.off-y, -img-area.max-off-y, img-area.max-off-y);
+                        width: max(1px, PreviewState.img-w * 1px * img-area.zoom);
+                        height: max(1px, PreviewState.img-h * 1px * img-area.zoom);
+                        source: PreviewState.preview-image;
+                        image-fit: fill;
+                    }
+                    // 位图解码在后台线程进行，期间显示加载动画（窗口已是最终尺寸）
+                    if !PreviewState.has-image: LoadingOverlay {
+                        label: PreviewState.loading ? "正在加载图片…" : "无法生成预览";
+                    }
+                    if PreviewState.has-image: TouchArea {
+                        mouse-cursor: self.pressed ? MouseCursor.grabbing : MouseCursor.grab;
+                        property <length> press-off-x: 0px;
+                        property <length> press-off-y: 0px;
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                                self.press-off-x = img-area.off-x;
+                                self.press-off-y = img-area.off-y;
+                            }
+                        }
+                        moved => {
+                            img-area.off-x = clamp(self.press-off-x + (self.mouse-x - self.pressed-x), -img-area.max-off-x, img-area.max-off-x);
+                            img-area.off-y = clamp(self.press-off-y + (self.mouse-y - self.pressed-y), -img-area.max-off-y, img-area.max-off-y);
+                        }
+                        scroll-event(ev) => {
+                            img-area.user-zoom = clamp(img-area.zoom * (ev.delta-y > 0 ? 1.15 : 1 / 1.15), 0.05, 8.0);
+                            return accept;
+                        }
+                    }
+                    if PreviewState.has-image: Rectangle {
+                        x: parent.width - self.width - 10px;
+                        y: 10px;
+                        width: zoom-label.preferred-width + 16px;
+                        height: 24px;
+                        border-radius: 7px;
+                        background: #00000066;
+                        zoom-label := Text {
+                            width: 100%;
+                            height: 100%;
+                            text: round(img-area.zoom * 100) + "%";
+                            color: white;
+                            font-size: Theme.fs-tiny;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // 网页渲染视图（kind == 2 且渲染模式）：WebView2 子窗口覆盖本区域
+                if PreviewState.kind == 2 && PreviewState.web-mode: Rectangle {
+                    background: white;
+                    LoadingOverlay { label: "正在加载渲染视图…"; }
+                }
+
+                // 文本/代码（kind == 2 源码模式）：四层等宽 Text 字符对齐叠加实现多色高亮
+                if PreviewState.kind == 2 && !PreviewState.web-mode: ScrollView {
+                    VerticalLayout {
+                        padding: 16px;
+                        Rectangle {
+                            height: code-base.preferred-height;
+                            code-base := Text {
+                                x: 0; y: 0; width: parent.width;
+                                text: PreviewState.text-content;
+                                font-size: Theme.fs-small;
+                                font-family: "Consolas";
+                                color: Theme.text;
+                                horizontal-alignment: left;
+                                vertical-alignment: top;
+                            }
+                            Text {
+                                x: 0; y: 0; width: parent.width;
+                                text: PreviewState.code-kw;
+                                font-size: Theme.fs-small;
+                                font-family: "Consolas";
+                                color: Theme.dark ? #6aa9ff : #005fb0;
+                                horizontal-alignment: left;
+                                vertical-alignment: top;
+                            }
+                            Text {
+                                x: 0; y: 0; width: parent.width;
+                                text: PreviewState.code-str;
+                                font-size: Theme.fs-small;
+                                font-family: "Consolas";
+                                color: Theme.dark ? #e0a06a : #b06a1f;
+                                horizontal-alignment: left;
+                                vertical-alignment: top;
+                            }
+                            Text {
+                                x: 0; y: 0; width: parent.width;
+                                text: PreviewState.code-cmt;
+                                font-size: Theme.fs-small;
+                                font-family: "Consolas";
+                                color: Theme.muted;
+                                horizontal-alignment: left;
+                                vertical-alignment: top;
+                            }
+                        }
+                    }
+                }
+
+                // 视频（kind == 4）：黑底衬托，画面与控制栏由原生子窗口覆盖绘制。
+                // 媒体源解析完成前原生子窗口保持隐藏，此处加载动画可见。
+                if PreviewState.kind == 4: Rectangle {
+                    background: black;
+                    if PreviewState.loading: LoadingOverlay {
+                        label: "正在加载视频…";
+                        on-dark: true;
+                    }
+                }
+
+                // 归档树（kind == 5）：资源管理器风格的层级列表，目录可展开/折叠
+                if PreviewState.kind == 5: ScrollView {
+                    VerticalLayout {
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        for node[idx] in PreviewState.archive-nodes: Rectangle {
+                            height: 30px;
+                            background: row-ta.has-hover ? Theme.primary-hover : transparent;
+                            HorizontalLayout {
+                                // 每级缩进 18px，与参考图的树形层级观感一致
+                                padding-left: 10px + node.level * 18px;
+                                padding-right: 14px;
+                                spacing: 6px;
+                                // 展开箭头：仅含子项的目录显示，点击整行即可切换
+                                Rectangle {
+                                    width: 16px;
+                                    if node.has-children: Text {
+                                        text: node.expanded ? "\u{E70D}" : "\u{E76C}";
+                                        font-family: "Segoe MDL2 Assets";
+                                        font-size: 9px;
+                                        color: Theme.muted;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                // 类型图标：目录用主题文件夹色，文件用矢量文档图标
+                                Rectangle {
+                                    width: 20px;
+                                    FileIcon {
+                                        icon-class: node.is-dir ? "folder" : "default";
+                                        box: 18px;
+                                        radius: 4px;
+                                        compact: true;
+                                        y: (parent.height - 18px) / 2;
+                                    }
+                                }
+                                Text {
+                                    text: node.name;
+                                    font-size: Theme.fs-body;
+                                    color: Theme.text;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                // 大小：文件显示字节量，目录显示后代合计
+                                Text {
+                                    text: node.size;
+                                    font-size: Theme.fs-small;
+                                    color: Theme.muted;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: right;
+                                    min-width: 86px;
+                                }
+                            }
+                            row-ta := TouchArea {
+                                mouse-cursor: node.has-children ? MouseCursor.pointer : MouseCursor.default;
+                                clicked => {
+                                    if (node.has-children) {
+                                        PreviewState.toggle-folder(idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 文件夹（3）/ 其它信息（0）：大图标衬底 + 名称 + 信息行
+                if PreviewState.kind == 0 || PreviewState.kind == 3: VerticalLayout {
+                    alignment: center;
+                    spacing: 14px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 132px;
+                            height: 132px;
+                            border-radius: 24px;
+                            background: Theme.surface.with-alpha(Theme.dark ? 0.35 : 0.75);
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            FileIcon {
+                                icon-class: PreviewState.icon-class;
+                                thumb: PreviewState.thumb;
+                                has-thumb: PreviewState.has-thumb;
+                                box: 96px;
+                                radius: 18px;
+                                x: (parent.width - 96px) / 2;
+                                y: (parent.height - 96px) / 2;
+                            }
+                        }
+                    }
+                    Text {
+                        width: 100%;
+                        text: PreviewState.name;
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: Theme.text;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        width: 100%;
+                        text: PreviewState.info;
+                        font-size: Theme.fs-body;
+                        color: Theme.muted;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                        vertical-stretch: 1;
+                    }
+                }
+            }
+
+            // ── 底部提示栏：原生视频画面亦止于此栏上方 ──
+            Rectangle {
+                height: 38px;
+                background: Theme.surface;
+                Rectangle { y: 0; height: 1px; background: Theme.border; }
+                Text {
+                    text: PreviewState.kind == 1
+                        ? "滚轮缩放 · 拖动查看 · 按 空格 或 Esc 关闭"
+                        : PreviewState.kind == 5
+                            ? "点击文件夹展开 / 折叠 · 按 空格 或 Esc 关闭"
+                            : "按 空格 或 Esc 关闭预览";
+                    font-size: Theme.fs-tiny;
+                    color: Theme.muted;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

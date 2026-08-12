@@ -11,7 +11,10 @@
 //! MFPlay 通过隐藏窗口把事件序列化回创建线程（UI 线程）的消息循环，回调内可安全
 //! 调用播放器方法；分辨率就绪后经 `ready` 回调上报（预览卡片按视频宽高比自适应）。
 
-fn display_size(native: (u32, u32), aspect: (u32, u32)) -> (u32, u32) {
+/// 由编码帧尺寸与显示宽高比（DAR）推导「显示尺寸」。
+/// `aspect` 是 MFPlay GetNativeVideoSize 第二个输出（display size），
+/// 表示视频最终的显示比例；当它与编码帧方向不一致时，以高度为基准换算宽度。
+pub(crate) fn display_size(native: (u32, u32), aspect: (u32, u32)) -> (u32, u32) {
     let (nw, nh) = native;
     let (aw, ah) = aspect;
     if nw == 0 || nh == 0 {
@@ -31,6 +34,55 @@ fn display_size(native: (u32, u32), aspect: (u32, u32)) -> (u32, u32) {
     (display_width as u32, display_height as u32)
 }
 
+/// 按像素宽高比（PAR）修正编码帧尺寸。
+///
+/// 与 `display_size` 的区别：`display_size` 的第二参数是 MFPlay 给出的
+/// 「显示尺寸（像素）」，而 Shell 的 System.Video.HorizontalAspectRatio /
+/// VerticalAspectRatio 是**单个像素**的宽高比，方形像素为 1:1。两者语义不同，
+/// 把 1:1 当显示尺寸喂给 `display_size` 会被判成横屏并把宽度当高度基准，
+/// 使竖屏视频塌成正方形（720×960 → 720×720）。
+pub(crate) fn apply_par(native: (u32, u32), par: (u32, u32)) -> (u32, u32) {
+    let (nw, nh) = native;
+    let (pw, ph) = par;
+    if nw == 0 || nh == 0 {
+        return (0, 0);
+    }
+    // 缺失或方形像素：编码尺寸即显示尺寸
+    if pw == 0 || ph == 0 || pw == ph {
+        return native;
+    }
+    // 非方形像素：宽度按 PAR 拉伸，高度不变
+    let w = ((nw as u64 * pw as u64) / ph as u64).max(1);
+    (w as u32, nh)
+}
+
+/// 按旋转角度换算显示尺寸：90/270 度需交换宽高。
+/// Shell 属性处理器给的是「编码帧尺寸 + 旋转角」两个独立字段，手机竖拍视频
+/// 常见 1920×1080 + 90°，必须交换后才是实际观感尺寸（与 MFPlay 上报的一致）。
+pub(crate) fn apply_rotation(size: (u32, u32), rotation: u32) -> (u32, u32) {
+    if rotation % 180 == 90 {
+        (size.1, size.0)
+    } else {
+        size
+    }
+}
+
+/// 打开播放器之前先读出视频显示尺寸（宽, 高），失败返回 None。
+///
+/// 目的：预览窗口在显示前就知道视频宽高比，一次性按正确比例开窗，
+/// 不再「先横屏、拿到分辨率后再跳一次」。走 Shell 属性处理器（与资源管理器
+/// 详细信息列同源，通常只读容器头部且有系统缓存），比开 Media Foundation
+/// 媒体源快一个量级。UNC/虚拟路径跳过，避免网络往返卡住 UI 线程。
+#[cfg(windows)]
+pub fn probe_display_size(path: &str) -> Option<(u32, u32)> {
+    win_impl::probe_display_size(path)
+}
+
+#[cfg(not(windows))]
+pub fn probe_display_size(_path: &str) -> Option<(u32, u32)> {
+    None
+}
+
 /// 原生控制条回调。控制条位于 MFPlay 子窗口上方，因此按钮事件由原生窗口
 /// 转发到 Slint 状态回调，保持与非原生控件相同的播放、重播、静音和拖动行为。
 pub struct ControlCallbacks {
@@ -38,6 +90,9 @@ pub struct ControlCallbacks {
     pub replay: Box<dyn Fn() + Send>,
     pub mute: Box<dyn Fn() + Send>,
     pub seek: Box<dyn Fn(f32) + Send>,
+    /// 关闭预览。兜底用：若焦点意外落到控制条上，空格/Esc 会被它的窗口过程
+    /// 吞掉（两个 Slint 窗口都收不到），此时由控制条自己转发关闭。
+    pub close: Box<dyn Fn() + Send>,
 }
 
 /// 启动播放：`parent` 为主窗口 HWND（isize），`rect` 为子窗口在父窗口客户区内的
@@ -81,6 +136,25 @@ pub fn reposition(rect: (i32, i32, i32, i32)) {
 
 #[cfg(not(windows))]
 pub fn reposition(_rect: (i32, i32, i32, i32)) {}
+
+/// 仅按上次的客户区矩形重新贴合控制条到宿主窗口（未在播放时为空操作）。
+///
+/// 画面子窗口是宿主的真子窗口，宿主移动时由系统一起搬走；控制条是 WS_POPUP
+/// owned 窗口，坐标在屏幕系，宿主移动后必须主动重算。拖动标题栏期间 Windows
+/// 进入模态 move 循环、Slint 定时器停摆，故由宿主窗口过程在 WM_MOVE 内同步调用。
+#[cfg(windows)]
+pub fn sync_controls() {
+    win_impl::sync_controls();
+}
+
+#[cfg(not(windows))]
+pub fn sync_controls() {}
+
+/// 媒体就绪后显示画面与控制条（加载期间保持隐藏，由 Slint 侧显示加载动画）。
+pub fn reveal() {
+    #[cfg(windows)]
+    win_impl::reveal();
+}
 
 /// 设置原生半透明控制条的显示状态。控制条位于 MFPlay 视频子窗口上方。
 pub fn set_controls_visible(visible: bool) {
@@ -172,14 +246,20 @@ mod win_impl {
         MFP_OPTION_NONE, MFP_POSITIONTYPE_100NS,
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+
+    /// 空格 / Esc 虚拟键码。直接写常量而非引 Win32_UI_Input_KeyboardAndMouse：
+    /// windows crate 未开该 feature（仅 windows-sys 开了），为两个常量加 feature 不值得。
+    const VK_SPACE_CODE: usize = 0x20;
+    const VK_ESCAPE_CODE: usize = 0x1B;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
         MoveWindow, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
         ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOP, LWA_ALPHA,
-        MA_NOACTIVATE, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_SHOWWINDOW, WNDCLASSW,
+        SW_SHOWNOACTIVATE, WM_KEYDOWN,
+        MA_NOACTIVATE, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, WNDCLASSW,
         WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WS_CHILD,
-        WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+        WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     /// STATIC 控件的 SS_BLACKRECT 样式：黑色矩形填充，免自绘视频底色
@@ -214,6 +294,11 @@ mod win_impl {
             muted: false,
             visible: true,
         }) };
+        /// 最近一次 reposition 的矩形（宿主客户区坐标，物理像素）。
+        /// 宿主纯移动时尺寸不变，只需用它重算控制条的屏幕坐标。
+        static LAST_RECT: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
+        /// 媒体是否已就绪（未就绪时画面与控制条保持隐藏，让位给加载动画）
+        static REVEALED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// 播放代次：每次 start/stop 自增。异步事件携带发起时代次（dwUserData），
@@ -302,13 +387,17 @@ mod win_impl {
         stop();
         // 新播放从播放态开始（PAUSED 复位）
         PAUSED.with(|p| p.set(false));
+        REVEALED.with(|r| r.set(false));
+        LAST_RECT.with(|c| c.set(rect));
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
         let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
         let url: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
-            // 黑底子窗口承载视频画面（SS_BLACKRECT 静态控件免自绘背景）
-            let style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WINDOW_STYLE(SS_BLACKRECT_STYLE);
+            // 黑底子窗口承载视频画面（SS_BLACKRECT 静态控件免自绘背景）。
+            // 不带 WS_VISIBLE：媒体就绪前保持隐藏，让 Slint 的加载动画可见
+            // （原生子窗口会盖住同区域的 Slint 绘制，一开就显示等于黑屏等待）。
+            let style = WS_CHILD | WS_CLIPSIBLINGS | WINDOW_STYLE(SS_BLACKRECT_STYLE);
             let hwnd = match CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 PCWSTR(class.as_ptr()),
@@ -376,6 +465,7 @@ mod win_impl {
     pub fn stop() {
         // 代次自增：在途的异步事件全部作废
         GENERATION.fetch_add(1, Ordering::SeqCst);
+        REVEALED.with(|r| r.set(false));
         ACTIVE.with(|a| {
             if let Some((player, hwnd, controls_hwnd)) = a.borrow_mut().take() {
                 unsafe {
@@ -393,6 +483,7 @@ mod win_impl {
     /// UpdateVideo() 通知播放器重算视频布局，否则画面仍按旧窗口
     /// 大小渲染（表现为切换视频后首次预览比例错误、直到重开才恢复）。
     pub fn reposition(rect: (i32, i32, i32, i32)) {
+        LAST_RECT.with(|c| c.set(rect));
         ACTIVE.with(|a| {
             if let Some((player, hwnd, controls_hwnd)) = a.borrow().as_ref() {
                 unsafe {
@@ -409,6 +500,96 @@ mod win_impl {
                 }
             }
         });
+    }
+
+    /// 只把控制条贴回宿主客户区底部（宿主移动时用；不动画面子窗口、不调播放器）
+    pub fn sync_controls() {
+        let rect = LAST_RECT.with(|c| c.get());
+        if rect.2 <= 0 || rect.3 <= 0 {
+            return;
+        }
+        ACTIVE.with(|a| {
+            if let Some((_, _, controls_hwnd)) = a.borrow().as_ref() {
+                position_controls(HWND(*controls_hwnd as *mut core::ffi::c_void), rect);
+            }
+        });
+    }
+
+    /// 媒体就绪：显示画面子窗口，并按可见性状态显示控制条
+    pub fn reveal() {
+        if REVEALED.with(|r| r.replace(true)) {
+            return;
+        }
+        let controls_visible = CONTROL_STATE.with(|s| s.get().visible);
+        ACTIVE.with(|a| {
+            if let Some((_, hwnd, controls_hwnd)) = a.borrow().as_ref() {
+                unsafe {
+                    // 画面是真子窗口，SW_SHOW 不会激活
+                    let _ = ShowWindow(HWND(*hwnd as *mut core::ffi::c_void), SW_SHOW);
+                    if controls_visible {
+                        // 控制条是 WS_POPUP 顶层窗口：必须用 SW_SHOWNOACTIVATE。
+                        // WS_EX_NOACTIVATE 只拦「点击激活」，显式 SW_SHOW 仍会激活它
+                        // 并夺走前台焦点，使空格/Esc 不再送到 Slint 预览窗口。
+                        let _ = ShowWindow(
+                            HWND(*controls_hwnd as *mut core::ffi::c_void),
+                            SW_SHOWNOACTIVATE,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// System.Video.* 属性集的 FMTID（与 Shell 详细信息列同源）
+    const PKEY_VIDEO_FMTID: windows::core::GUID =
+        windows::core::GUID::from_u128(0x64440491_4c8b_11d1_8b70_080036b11a03);
+    /// System.Video.FrameWidth / FrameHeight / HorizontalAspectRatio /
+    /// VerticalAspectRatio / Orientation 的 PID
+    const PID_FRAME_WIDTH: u32 = 3;
+    const PID_FRAME_HEIGHT: u32 = 4;
+    const PID_ASPECT_H: u32 = 42;
+    const PID_ASPECT_V: u32 = 45;
+    const PID_ORIENTATION: u32 = 99;
+
+    /// 经 Shell 属性处理器读出视频显示尺寸。UNC/虚拟路径直接放弃（避免网络阻塞）。
+    pub fn probe_display_size(path: &str) -> Option<(u32, u32)> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::PROPERTYKEY;
+        use windows::Win32::UI::Shell::PropertiesSystem::{
+            IPropertyStore, SHGetPropertyStoreFromParsingName, GPS_DEFAULT,
+        };
+
+        // 网络路径的属性处理器可能要拉取整段容器头，UI 线程上不可接受
+        if path.is_empty() || path.starts_with("\\\\") || crate::fs::virtualfs::is_virtual(path) {
+            return None;
+        }
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let store: IPropertyStore = unsafe {
+            SHGetPropertyStoreFromParsingName(PCWSTR(wide.as_ptr()), None, GPS_DEFAULT).ok()?
+        };
+        let read = |pid: u32| -> Option<u32> {
+            let key = PROPERTYKEY {
+                fmtid: PKEY_VIDEO_FMTID,
+                pid,
+            };
+            let value = unsafe { store.GetValue(&key).ok()? };
+            u32::try_from(&value).ok()
+        };
+        let w = read(PID_FRAME_WIDTH)?;
+        let h = read(PID_FRAME_HEIGHT)?;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // Shell 的宽高比字段是「像素宽高比 PAR」，非方形像素才需拉伸宽度；
+        // 之后再按旋转角交换宽高（手机竖拍常见 1920×1080 + 90°）。
+        let par = match (read(PID_ASPECT_H), read(PID_ASPECT_V)) {
+            (Some(aw), Some(ah)) if aw > 0 && ah > 0 => (aw, ah),
+            _ => (0, 0),
+        };
+        let size = super::apply_par((w, h), par);
+        let rotation = read(PID_ORIENTATION).unwrap_or(0);
+        let size = super::apply_rotation(size, rotation);
+        (size.0 > 0 && size.1 > 0).then_some(size)
     }
 
     fn control_class() -> Vec<u16> {
@@ -509,6 +690,12 @@ mod win_impl {
             }
             WM_LBUTTONUP => {
                 set_dragging(hwnd, false);
+                LRESULT(0)
+            }
+            // 兜底：焦点若意外落到控制条，空格/Esc 本会被 DefWindowProc 吞掉，
+            // 这里转发到关闭回调，保证按键手感与预览窗口一致。
+            WM_KEYDOWN if wparam.0 == VK_SPACE_CODE || wparam.0 == VK_ESCAPE_CODE => {
+                invoke_control(hwnd, 4, 0.0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -653,6 +840,7 @@ mod win_impl {
                 1 => ((*ptr).callbacks.replay)(),
                 2 => ((*ptr).callbacks.mute)(),
                 3 => ((*ptr).callbacks.seek)(ratio),
+                4 => ((*ptr).callbacks.close)(),
                 _ => {}
             }
             // 不在这里调用 SetActiveWindow/SetFocus：WM_MOUSEACTIVATE 已保证焦点从未离开
@@ -707,6 +895,8 @@ mod win_impl {
                     y: rect.1 + rect.3 - CONTROL_H,
                 };
                 let _ = windows::Win32::Graphics::Gdi::ClientToScreen(owner_hwnd, &mut origin);
+                // 不带 SWP_SHOWWINDOW：显示与否统一由 reveal / set_controls_visible 决定，
+                // 否则媒体加载期间的每次定位都会把控制条提前亮出来。
                 let _ = SetWindowPos(
                     hwnd,
                     Some(HWND_TOP),
@@ -714,7 +904,7 @@ mod win_impl {
                     origin.y,
                     rect.2,
                     CONTROL_H,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOACTIVATE,
                 );
             }
         }
@@ -726,11 +916,20 @@ mod win_impl {
             state.visible = visible;
             s.set(state);
         });
+        // 媒体尚未就绪：只记状态，实际显示交给 reveal
+        if !REVEALED.with(|r| r.get()) {
+            return;
+        }
         ACTIVE.with(|a| {
             if let Some((_, _, hwnd)) = a.borrow().as_ref() {
                 unsafe {
                     let overlay = HWND(*hwnd as *mut core::ffi::c_void);
-                    let _ = ShowWindow(overlay, if visible { SW_SHOW } else { SW_HIDE });
+                    // 同 reveal：本函数由 250ms 鼠标轮询反复调用，用 SW_SHOW 会
+                    // 在光标每次移入预览区时抢一次焦点，空格随之失效。
+                    let _ = ShowWindow(
+                        overlay,
+                        if visible { SW_SHOWNOACTIVATE } else { SW_HIDE },
+                    );
                 }
             }
         });
@@ -856,7 +1055,38 @@ mod win_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::display_size;
+    use super::{apply_par, apply_rotation, display_size};
+
+    /// 方形像素（Shell 对绝大多数视频报 1:1）必须原样保留编码尺寸。
+    /// 回归用例：曾把 PAR 误当显示尺寸喂给 display_size，
+    /// 使 720×960 竖屏塌成 720×720、852×480 横屏塌成 480×480。
+    #[test]
+    fn par_one_to_one_keeps_frame_size() {
+        assert_eq!(apply_par((720, 960), (1, 1)), (720, 960));
+        assert_eq!(apply_par((852, 480), (1, 1)), (852, 480));
+        assert_eq!(apply_par((1920, 1080), (1, 1)), (1920, 1080));
+    }
+
+    /// PAR 字段缺失（读不到属性）时同样保留编码尺寸
+    #[test]
+    fn par_missing_keeps_frame_size() {
+        assert_eq!(apply_par((720, 960), (0, 0)), (720, 960));
+    }
+
+    /// 非方形像素按 PAR 拉伸宽度，高度不变（PAL DV 720×576 PAR 64:45 → 1024×576）
+    #[test]
+    fn par_non_square_stretches_width_only() {
+        assert_eq!(apply_par((720, 576), (64, 45)), (1024, 576));
+    }
+
+    /// 90/270 度旋转交换宽高，0/180 度保持原样
+    #[test]
+    fn rotation_swaps_only_on_quarter_turns() {
+        assert_eq!(apply_rotation((1920, 1080), 0), (1920, 1080));
+        assert_eq!(apply_rotation((1920, 1080), 90), (1080, 1920));
+        assert_eq!(apply_rotation((1920, 1080), 180), (1920, 1080));
+        assert_eq!(apply_rotation((1920, 1080), 270), (1080, 1920));
+    }
 
     #[test]
     fn display_size_keeps_landscape_and_portrait() {

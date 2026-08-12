@@ -188,22 +188,7 @@ export component InputOverlay inherits TouchArea {
             root.last-box-x1 = 0px;
             root.last-box-y1 = 0px;
             // 重命名进行中：先提交当前编辑再处理新的点击，避免丢失编辑内容
-            if (AppState.editing-index >= 0) {
-                let t = AppState.rename-text;
-                let idx = AppState.editing-index;
-                AppState.editing-index = -1;
-                if (t != "") {
-                    AppState.rename-entry(idx, t);
-                }
-            }
-            if (AppState.r-editing-index >= 0) {
-                let t = AppState.r-rename-text;
-                let idx = AppState.r-editing-index;
-                AppState.r-editing-index = -1;
-                if (t != "") {
-                    AppState.r-rename-entry(idx, t);
-                }
-            }
+            AppState.commit-pending-rename();
             root.press-x = self.mouse-x;
             root.press-y = self.mouse-y;
             root.press-ctrl = ev.modifiers.control;

@@ -23,18 +23,35 @@ pub enum PreviewKind {
 }
 
 impl PreviewKind {
-    /// 传给 Slint 的整型编码（与 quick_look.slint 约定一致）
-    /// 0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频。
-    /// 归档清单以等宽文本展示，直接复用文本面板（编码 2）。
+    /// 传给 Slint 的整型编码（与 preview_window.slint / quick_look.slint 约定一致）
+    /// 0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频 / 5 归档树。
+    /// 归档改为可展开/折叠的树形列表，单独占用编码 5。
     pub fn code(self) -> i32 {
         match self {
             PreviewKind::Info => 0,
             PreviewKind::Image => 1,
-            PreviewKind::Text | PreviewKind::Archive => 2,
+            PreviewKind::Text => 2,
             PreviewKind::Folder => 3,
             PreviewKind::Video => 4,
+            PreviewKind::Archive => 5,
         }
     }
+}
+
+/// 归档树的单个节点（供预览窗口渲染可展开/折叠的层级列表）
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveTreeNode {
+    /// 仅本级名称（不含父级路径）
+    pub name: String,
+    /// 归档内完整路径（以 / 分隔，目录不带尾斜杠），作为展开状态的稳定键
+    pub full_path: String,
+    /// 文件字节数；目录为其所有后代文件之和
+    pub size: u64,
+    pub is_dir: bool,
+    /// 缩进层级，根级为 0
+    pub level: i32,
+    /// 目录是否含子项（决定是否绘制展开箭头）
+    pub has_children: bool,
 }
 
 /// 可作为图片大图预览的扩展名（与缩略图提取能力一致）
@@ -192,13 +209,13 @@ pub fn read_text_head(path: &Path, max_bytes: usize) -> String {
     text
 }
 
-/// 列出归档内文件清单（供空格预览展示）。按格式读取条目名/大小/是否目录，
-/// 上限 2000 项防超大归档卡顿；失败返回错误说明文本。复用 tasks.rs 已验证的
-/// 读取路径（zip::ZipArchive / sevenz_rust::SevenZReader / tar::Archive）。
-pub fn archive_listing(path: &Path) -> String {
+/// 读取归档原始条目 (名, 大小, 是否目录)。按格式读取条目名/大小/是否目录，
+/// 上限 2000 项防超大归档卡顿。复用 tasks.rs 已验证的读取路径
+/// （zip::ZipArchive / sevenz_rust::SevenZReader / tar::Archive）。
+pub fn read_archive_entries(path: &Path) -> Result<Vec<(String, u64, bool)>, String> {
     use std::io::Read;
     let ext = ext_of(path);
-    // 用闭包包裹使 `?` 可用（外层函数返回 String，不能直接用 `?`）
+    // 用闭包包裹使 `?` 可用并保持原有各格式分支不变
     let result: Result<Vec<(String, u64, bool)>, String> = (|| {
         let mut items: Vec<(String, u64, bool)> = Vec::new();
         match ext.as_str() {
@@ -280,44 +297,129 @@ pub fn archive_listing(path: &Path) -> String {
         }
         Ok(items)
     })();
-    match result {
-        Ok(items) => format_listing(&items),
-        Err(e) => format!("无法读取归档：{}", e),
-    }
+    result
 }
 
-/// 把 (名, 大小, 是否目录) 列表格式化为预览文本
-fn format_listing(items: &[(String, u64, bool)]) -> String {
-    if items.is_empty() {
-        return "（归档为空）".to_string();
+/// 由归档原始条目构建树形节点列表（深度优先展开顺序）。
+///
+/// 归档内的条目名是扁平的相对路径（如 `a/b/c.txt`），中间目录未必有显式条目，
+/// 因此这里按 `/` 拆分并补齐所有中间目录。目录大小为其后代文件之和；
+/// 同层内目录在前、文件在后，各自按名称不区分大小写排序，与文件管理器一致。
+pub fn build_archive_tree(items: &[(String, u64, bool)]) -> Vec<ArchiveTreeNode> {
+    use std::collections::BTreeMap;
+
+    /// 构建期的中间树：children 用 BTreeMap 保证遍历顺序稳定
+    #[derive(Default)]
+    struct Node {
+        children: BTreeMap<String, Node>,
+        is_dir: bool,
+        size: u64,
     }
-    use std::fmt::Write;
-    let mut out = String::new();
-    let dirs = items.iter().filter(|(_, _, d)| *d).count();
-    let files = items.len() - dirs;
-    let total: u64 = items.iter().map(|(_, s, _)| s).sum();
-    let _ = writeln!(out, "📦 归档内容 | 共 {} 项", items.len());
-    let _ = writeln!(out, "   ├─ 📁 {} 个文件夹", dirs);
-    let _ = writeln!(out, "   ├─ 📄 {} 个文件", files);
-    let _ = writeln!(
-        out,
-        "   └─ 💾 合计 {}\n",
-        super::metadata::human_size(total)
-    );
-    let _ = writeln!(out, "{}", "─".repeat(60));
-    for (name, size, is_dir) in items {
-        let _ = writeln!(
-            out,
-            "{}  {}",
-            if *is_dir { "📁" } else { "📄" },
-            if *is_dir {
+
+    let mut root = Node {
+        is_dir: true,
+        ..Default::default()
+    };
+
+    for (raw_name, size, is_dir) in items {
+        // 归一化分隔符：部分归档（尤其 7z/zip 由 Windows 工具创建）使用反斜杠
+        let normalized = raw_name.replace('\\', "/");
+        let parts: Vec<&str> = normalized
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let last = parts.len() - 1;
+        let mut cur = &mut root;
+        for (i, part) in parts.iter().enumerate() {
+            let entry = cur.children.entry((*part).to_string()).or_default();
+            if i == last {
+                // 末段：目录条目标记为目录，文件记录大小
+                if *is_dir {
+                    entry.is_dir = true;
+                } else {
+                    entry.size = *size;
+                }
+            } else {
+                // 中间段一定是目录（即使归档未给出显式目录条目）
+                entry.is_dir = true;
+            }
+            cur = entry;
+        }
+    }
+
+    // 递归累计目录大小，并按「目录优先 + 名称序」展平为带层级的列表
+    fn accumulate(node: &Node) -> u64 {
+        if node.is_dir {
+            node.children.values().map(accumulate).sum()
+        } else {
+            node.size
+        }
+    }
+
+    fn flatten(
+        node: &Node,
+        prefix: &str,
+        level: i32,
+        out: &mut Vec<ArchiveTreeNode>,
+    ) {
+        let mut dirs: Vec<(&String, &Node)> = Vec::new();
+        let mut files: Vec<(&String, &Node)> = Vec::new();
+        for (name, child) in node.children.iter() {
+            if child.is_dir {
+                dirs.push((name, child));
+            } else {
+                files.push((name, child));
+            }
+        }
+        let by_name = |a: &(&String, &Node), b: &(&String, &Node)| {
+            a.0.to_lowercase().cmp(&b.0.to_lowercase())
+        };
+        dirs.sort_by(by_name);
+        files.sort_by(by_name);
+
+        for (name, child) in dirs.into_iter().chain(files.into_iter()) {
+            let full_path = if prefix.is_empty() {
                 name.clone()
             } else {
-                format!("{}  ({})", name, super::metadata::human_size(*size))
+                format!("{}/{}", prefix, name)
+            };
+            out.push(ArchiveTreeNode {
+                name: name.clone(),
+                full_path: full_path.clone(),
+                size: accumulate(child),
+                is_dir: child.is_dir,
+                level,
+                has_children: !child.children.is_empty(),
+            });
+            if child.is_dir {
+                flatten(child, &full_path, level + 1, out);
             }
-        );
+        }
     }
+
+    let mut out = Vec::new();
+    flatten(&root, "", 0, &mut out);
     out
+}
+
+/// 读取归档并直接构建树（失败时返回错误说明，供 UI 以信息态展示）
+pub fn archive_tree(path: &Path) -> Result<Vec<ArchiveTreeNode>, String> {
+    read_archive_entries(path).map(|items| build_archive_tree(&items))
+}
+
+/// 归档整体统计：(目录数, 文件数, 文件总字节)，用于预览副标题
+pub fn archive_summary(nodes: &[ArchiveTreeNode]) -> (usize, usize, u64) {
+    let dirs = nodes.iter().filter(|n| n.is_dir).count();
+    let files = nodes.len() - dirs;
+    let total = nodes
+        .iter()
+        .filter(|n| !n.is_dir)
+        .map(|n| n.size)
+        .sum::<u64>();
+    (dirs, files, total)
 }
 
 /// 文件夹递归统计：返回 (子文件夹数, 文件数, 文件总字节)。
@@ -388,6 +490,184 @@ mod tests {
         let t = read_text_head(&p, 100);
         assert!(t.contains("仅显示开头部分"));
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn test_build_archive_tree_nests_and_sorts() {
+        // 扁平条目：中间目录 dir 无显式条目，需自动补齐
+        let items = vec![
+            ("b.txt".to_string(), 100, false),
+            ("dir/inner.txt".to_string(), 20, false),
+            ("dir/sub/deep.txt".to_string(), 5, false),
+            ("a.txt".to_string(), 10, false),
+            ("empty/".to_string(), 0, true),
+        ];
+        let tree = build_archive_tree(&items);
+        let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+        // 目录优先并按名称排序，文件其后；子项紧随父目录
+        assert_eq!(
+            names,
+            vec!["dir", "sub", "deep.txt", "inner.txt", "empty", "a.txt", "b.txt"]
+        );
+
+        let dir = &tree[0];
+        assert!(dir.is_dir);
+        assert_eq!(dir.level, 0);
+        assert!(dir.has_children);
+        // 目录大小为后代文件之和
+        assert_eq!(dir.size, 25);
+
+        let sub = &tree[1];
+        assert_eq!(sub.level, 1);
+        assert_eq!(sub.full_path, "dir/sub");
+        assert_eq!(tree[2].level, 2);
+        assert_eq!(tree[2].full_path, "dir/sub/deep.txt");
+
+        // 空目录不显示展开箭头
+        let empty = tree.iter().find(|n| n.name == "empty").unwrap();
+        assert!(empty.is_dir);
+        assert!(!empty.has_children);
+    }
+
+    #[test]
+    fn test_build_archive_tree_backslash_and_summary() {
+        // Windows 工具生成的反斜杠路径也应正确分层
+        let items = vec![
+            ("top\\mid\\f.bin".to_string(), 8, false),
+            ("top\\g.bin".to_string(), 2, false),
+        ];
+        let tree = build_archive_tree(&items);
+        assert_eq!(tree[0].name, "top");
+        assert_eq!(tree[0].size, 10);
+        assert_eq!(tree[1].full_path, "top/mid");
+        let (dirs, files, total) = archive_summary(&tree);
+        assert_eq!((dirs, files), (2, 2));
+        assert_eq!(total, 10);
+    }
+
+    /// 端到端：写一个真实 zip，走 read_archive_entries → build_archive_tree。
+    /// 结构对齐参考截图：空文件夹若干 + 含子文件夹与文件的文件夹 + 根级文件。
+    #[test]
+    fn test_real_zip_end_to_end_tree() {
+        use std::io::Write;
+        let mut p = std::env::temp_dir();
+        p.push(format!("ff_arch_tree_{}.zip", std::process::id()));
+
+        let f = std::fs::File::create(&p).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.add_directory("新建文件夹 (3)/", opts).unwrap();
+        zip.add_directory("新建文件夹 (7)/新建文件夹/", opts).unwrap();
+        zip.start_file("新建文件夹 (7)/新建 PPT 演示文稿.ppt", opts)
+            .unwrap();
+        zip.write_all(&vec![b'p'; 2048]).unwrap();
+        zip.start_file("新建 DOC 文档.doc", opts).unwrap();
+        zip.write_all(&vec![b'd'; 1024]).unwrap();
+        zip.finish().unwrap();
+
+        let items = read_archive_entries(&p).expect("读取 zip 失败");
+        let tree = build_archive_tree(&items);
+        let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+        // 目录优先、同层按名称序；子项紧随父目录；根级文件最后
+        assert_eq!(
+            names,
+            vec![
+                "新建文件夹 (3)",
+                "新建文件夹 (7)",
+                "新建文件夹",
+                "新建 PPT 演示文稿.ppt",
+                "新建 DOC 文档.doc",
+            ]
+        );
+
+        // 空目录无箭头；含子项的目录有箭头且大小为后代之和
+        let d3 = &tree[0];
+        assert!(d3.is_dir && !d3.has_children && d3.level == 0);
+        let d7 = &tree[1];
+        assert!(d7.is_dir && d7.has_children && d7.size == 2048);
+        // 嵌套空目录层级为 1，文件层级为 1
+        assert_eq!(tree[2].level, 1);
+        assert!(tree[2].is_dir && !tree[2].has_children);
+        assert_eq!(tree[3].level, 1);
+        assert_eq!(tree[3].full_path, "新建文件夹 (7)/新建 PPT 演示文稿.ppt");
+        // 根级文件
+        assert!(!tree[4].is_dir && tree[4].level == 0 && tree[4].size == 1024);
+
+        let (dirs, files, total) = archive_summary(&tree);
+        assert_eq!((dirs, files), (3, 2));
+        assert_eq!(total, 3072);
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 端到端：写一个真实 7z（含显式空目录条目），验证 sevenz_rust 的
+    /// 目录条目语义下树构建同样正确（is_directory 而非 zip 的尾斜杠约定）。
+    #[test]
+    fn test_real_7z_end_to_end_tree() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("ff_7z_src_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("空文件夹")).unwrap();
+        std::fs::create_dir_all(dir.join("有内容/子层")).unwrap();
+        std::fs::write(dir.join("有内容/子层/深层.bin"), vec![b'x'; 300]).unwrap();
+        std::fs::write(dir.join("根文件.txt"), vec![b'y'; 100]).unwrap();
+
+        let mut archive = std::env::temp_dir();
+        archive.push(format!("ff_7z_{}.7z", std::process::id()));
+        let _ = std::fs::remove_file(&archive);
+        {
+            let mut sz = sevenz_rust::SevenZWriter::create(&archive).unwrap();
+            // 目录条目 + 文件条目，相对路径用 / 分隔
+            for (rel, is_dir) in [
+                ("空文件夹", true),
+                ("有内容", true),
+                ("有内容/子层", true),
+                ("有内容/子层/深层.bin", false),
+                ("根文件.txt", false),
+            ] {
+                let src = dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let entry = sevenz_rust::SevenZWriter::<std::fs::File>::create_archive_entry(
+                    &src,
+                    rel.to_string(),
+                );
+                let reader = if is_dir {
+                    None
+                } else {
+                    Some(std::fs::File::open(&src).unwrap())
+                };
+                sz.push_archive_entry(entry, reader).unwrap();
+            }
+            sz.finish().unwrap();
+        }
+
+        let items = read_archive_entries(&archive).expect("读取 7z 失败");
+        let tree = build_archive_tree(&items);
+        let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+        // 目录优先，同层按 to_lowercase() 码点序（与 app.rs 的文件列表排序一致，
+        // 中文因此按码点而非拼音排列）；子项紧随父目录。
+        assert_eq!(
+            names,
+            vec!["有内容", "子层", "深层.bin", "空文件夹", "根文件.txt"]
+        );
+        // 含子项的目录有箭头，大小为后代之和
+        assert!(tree[0].is_dir && tree[0].has_children && tree[0].size == 300);
+        assert_eq!(tree[1].level, 1);
+        assert_eq!(tree[2].level, 2);
+        assert_eq!(tree[2].full_path, "有内容/子层/深层.bin");
+        // 空目录无箭头，且不吞掉后续同层节点
+        assert!(tree[3].is_dir && !tree[3].has_children);
+        assert!(!tree[4].is_dir && tree[4].size == 100);
+
+        std::fs::remove_file(&archive).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_archive_kind_code_is_tree() {
+        // 归档不再复用文本面板，独立编码 5
+        assert_eq!(PreviewKind::Archive.code(), 5);
+        assert_eq!(PreviewKind::Text.code(), 2);
     }
 
     #[test]

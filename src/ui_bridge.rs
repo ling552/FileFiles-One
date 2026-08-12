@@ -100,7 +100,7 @@ fn icon_request_for_entry(
 }
 
 /// 由缓存的图标像素构建 Slint 图像（必须在 UI 线程调用）。
-fn image_from(ic: &crate::fs::thumbnail::IconPixels) -> Image {
+pub(crate) fn image_from(ic: &crate::fs::thumbnail::IconPixels) -> Image {
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(ic.w, ic.h);
     buf.make_mut_bytes().copy_from_slice(&ic.pixels);
     Image::from_rgba8(buf)
@@ -1460,81 +1460,11 @@ fn fill_signature(state: &AppState, path: &Path, is_dir: bool) {
 
 /// Quick Look 大图提取尺寸（图片预览用，比列表缩略图更大更清晰）
 // 预览位图提取上限：更高的源分辨率让滚轮放大查看时保持清晰
-const QL_IMAGE_SIZE: u32 = 1600;
-
-/// 预览卡片头部/底部高度（逻辑像素）——与 quick_look.slint 布局约定一致，
-/// 视频/网页原生子窗口矩形换算（main.rs quicklook_content_rect_phys）共用。
-pub const QL_HEADER_H: f32 = 68.0;
-pub const QL_FOOTER_H: f32 = 38.0;
-/// 按内容类型计算并应用预览卡片尺寸（逻辑像素）。
-/// `kind_code` 与 PreviewKind::code 一致；`iw`/`ih` 为图片或视频原生分辨率
-/// （未知传 0）；`web_mode` 表示 Markdown/HTML 的渲染视图。
-/// 规则：图片/视频按分辨率适应显示无空白（内容区最小 256×256，更小的居中留白）；
-/// 文件夹/信息紧凑；文本中等；网页渲染视图较大；全部不超过窗口可用区域。
-pub fn apply_ql_card_size(ui: &MainWindow, kind_code: i32, iw: i32, ih: i32, web_mode: bool) {
-    let state = ui.global::<AppState>();
-    let scale = ui.window().scale_factor().max(0.5);
-    let size = ui.window().size();
-    let win_w = size.width as f32 / scale;
-    let win_h = size.height as f32 / scale;
-    // 所有预览统一保留底部提示栏，视频原生画面仅占据提示栏上方内容区。
-    let chrome = QL_HEADER_H + QL_FOOTER_H;
-    // 内容区可用上限（窗口小则收缩，但不低于最小 256）
-    let max_cw = (win_w - 96.0).clamp(256.0, 1200.0);
-    let max_ch = (win_h - 96.0 - chrome).clamp(256.0, 900.0);
-    let (cw, ch) = match kind_code {
-        // 图片：按原生分辨率适应（放不下等比缩小，小图 1:1，最小 256）
-        1 => {
-            if iw > 0 && ih > 0 {
-                let fit = (max_cw / iw as f32).min(max_ch / ih as f32).min(1.0);
-                let mut width = iw as f32 * fit;
-                let mut height = ih as f32 * fit;
-                if width < 256.0 && height < 256.0 {
-                    let grow = (256.0 / width.max(height))
-                        .min(max_cw / width)
-                        .min(max_ch / height);
-                    width *= grow;
-                    height *= grow;
-                }
-                (width.max(1.0), height.max(1.0))
-            } else {
-                (704.0_f32.min(max_cw), 396.0_f32.min(max_ch))
-            }
-        }
-        // 视频：画面适应内容区，底部提示栏由 Quick Look 统一保留。
-        4 => {
-            let video_max_ch = max_ch;
-            if iw > 0 && ih > 0 {
-                let fit = (max_cw / iw as f32).min(video_max_ch / ih as f32).min(1.0);
-                let mut width = iw as f32 * fit;
-                let mut height = ih as f32 * fit;
-                if width < 256.0 && height < 256.0 {
-                    let grow = (256.0 / width.max(height))
-                        .min(max_cw / width)
-                        .min(video_max_ch / height);
-                    width *= grow;
-                    height *= grow;
-                }
-                (width.max(1.0), height.max(1.0))
-            } else {
-                // 视频分辨率未知（异步加载中）：先按 16:9，就绪后再调整
-                (704.0_f32.min(max_cw), 396.0_f32.min(video_max_ch))
-            }
-        }
-        // 文本/代码：渲染视图更大，源码视图中等
-        2 if web_mode => (880.0_f32.min(max_cw), max_ch),
-        2 => (680.0_f32.min(max_cw), 520.0_f32.min(max_ch)),
-        // 文件夹：紧凑但至少容纳两行统计文本与底部提示栏
-        3 => (420.0, 340.0),
-        // 其它信息：更紧凑
-        _ => (420.0, 264.0),
-    };
-    // 卡片最小宽度保证头部（图标+文件名+按钮）可读
-    state.set_ql_card_w(cw.max(380.0));
-    state.set_ql_card_h(ch + chrome);
-}
+pub(crate) const QL_IMAGE_SIZE: u32 = 1600;
 
 /// 填充 Quick Look 预览内容：根据选中项类型设置 ql-* 属性。
+/// 内容由 preview_host 镜像到独立预览窗口的 PreviewState；窗口尺寸不再由
+/// 内容驱动（main.rs::apply_preview_initial_size 只在首次打开时给初值）。
 /// `right` 为真时预览右侧面板的选中项（双面板右侧活动）。
 /// 文件夹递归统计放到调用方后台执行，避免空格键阻塞 UI。
 /// 返回是否成功设置（无选中项返回 false，调用方据此决定是否打开浮层）。
@@ -1554,6 +1484,11 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
     state.set_ql_kind(kind.code());
     state.set_ql_name(e.name.clone().into());
     state.set_ql_icon_class(e.icon_class.clone().into());
+    // 所有类型加载态默认开启：窗口显示第一帧前先盖住内容区，
+    // 避免复用窗口的旧画面/透明背景闪一下再出新内容。
+    // 同步类型（文本/归档/文件夹/信息）由 main.rs 在显示后一帧关闭；
+    // 图片/视频由各自的后台就绪回调关闭。
+    state.set_ql_loading(true);
     // 默认清空上一次的图片/文本，避免切换文件时残留旧内容
     state.set_ql_has_image(false);
     state.set_ql_text("".into());
@@ -1585,45 +1520,19 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
 
     match kind {
         PreviewKind::Image => {
-            // 真实像素尺寸：仅解析文件头，不解码整图
+            // 真实像素尺寸：仅解析文件头，不解码整图。窗口在显示前就据此定尺寸，
+            // 位图解码交给 main.rs 打开窗口后的后台线程（大图不再卡住空格键）。
             let (iw, ih) = imagesize::size(path)
                 .map(|d| (d.width as i32, d.height as i32))
                 .unwrap_or((0, 0));
-            // 复用缩略图提取，按更大尺寸取清晰位图（缩放查看时仍然清晰）
-            #[cfg(windows)]
-            if let Some(icon) = crate::fs::thumbnail::extract(&e.path, QL_IMAGE_SIZE)
-                .map(|(pixels, w, h)| crate::fs::thumbnail::IconPixels { pixels, w, h })
-            {
-                // 文件头解析失败（如损坏/罕见格式）时回退位图自身尺寸
-                let (iw, ih) = if iw > 0 {
-                    (iw, ih)
-                } else {
-                    (icon.w as i32, icon.h as i32)
-                };
-                state.set_ql_img_w(iw);
-                state.set_ql_img_h(ih);
-                state.set_ql_subtitle(
-                    format!(
-                        "{}×{} 像素 · {}",
-                        iw,
-                        ih,
-                        metadata::human_size(e.size_bytes)
-                    )
-                    .into(),
-                );
-                state.set_ql_image(image_from(&icon));
-                state.set_ql_has_image(true);
+            state.set_ql_img_w(iw);
+            state.set_ql_img_h(ih);
+            state.set_ql_loading(true);
+            state.set_ql_subtitle(if iw > 0 && ih > 0 {
+                format!("{}×{} 像素 · {}", iw, ih, metadata::human_size(e.size_bytes)).into()
             } else {
-                state.set_ql_img_w(iw);
-                state.set_ql_img_h(ih);
-                state.set_ql_subtitle(size_text.into());
-            }
-            #[cfg(not(windows))]
-            {
-                state.set_ql_img_w(iw);
-                state.set_ql_img_h(ih);
-                state.set_ql_subtitle(size_text.into());
-            }
+                size_text.into()
+            });
         }
         PreviewKind::Text => {
             state.set_ql_subtitle(size_text.into());
@@ -1645,18 +1554,26 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
             state.set_ql_code_cmt(layers.comments.into());
         }
         PreviewKind::Video => {
-            // 视频：内容由 Media Foundation 子窗口渲染（main.rs 打开预览时启动），
-            // 这里只填标题信息。分辨率必须清零：残留上一个视频的宽高比会让
-            // 首帧子窗口按旧比例定位/压缩画面，直到重新打开预览才恢复。
-            state.set_ql_img_w(0);
-            state.set_ql_img_h(0);
-            state.set_ql_subtitle(size_text.into());
+            // 视频：画面由 Media Foundation 子窗口渲染（main.rs 打开预览时启动）。
+            // 分辨率先经 Shell 属性处理器同步探测，使窗口一次性按正确宽高比打开；
+            // 探测不到（罕见容器/网络路径）才清零，退回「媒体就绪后再调尺寸」。
+            // 清零很重要：残留上一个视频的宽高比会让首帧子窗口按旧比例定位。
+            let probed = crate::fs::video_preview::probe_display_size(&e.path);
+            let (vw, vh) = probed.unwrap_or((0, 0));
+            state.set_ql_img_w(vw as i32);
+            state.set_ql_img_h(vh as i32);
+            state.set_ql_loading(true);
+            state.set_ql_subtitle(if vw > 0 && vh > 0 {
+                format!("{}×{} 像素 · {}", vw, vh, size_text).into()
+            } else {
+                size_text.into()
+            });
         }
         PreviewKind::Archive => {
-            // 归档：列出压缩包内文件清单（复用文本面板，ql-kind 经 code() 映射为 2）
+            // 归档：内容为可展开/折叠的树（kind==5），由 preview_host 读取归档并
+            // 生成节点模型；此处只给出「类型 · 压缩包体积」副标题，
+            // 归档内统计由 preview_host 追加。
             state.set_ql_subtitle(size_text.into());
-            let listing = preview::archive_listing(path);
-            state.set_ql_text(listing.into());
         }
         PreviewKind::Folder => {
             state.set_ql_subtitle("文件夹".into());
@@ -1678,13 +1595,6 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
             );
         }
     }
-    // 按内容类型自适应卡片尺寸（图片用真实分辨率；视频分辨率异步就绪后再调整）
-    let (iw, ih) = if kind == PreviewKind::Image {
-        (state.get_ql_img_w(), state.get_ql_img_h())
-    } else {
-        (0, 0)
-    };
-    apply_ql_card_size(ui, kind.code(), iw, ih, state.get_ql_web_mode());
     true
 }
 

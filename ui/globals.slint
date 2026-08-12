@@ -278,6 +278,29 @@ export global AppState {
     in-out property <string> rename-text;
     // 右面板重命名输入框中的文本
     in-out property <string> r-rename-text;
+    // 提交并退出任一面板正在进行的行内重命名（无编辑进行时为空操作）。
+    // 供所有「点击别处即退出编辑」的入口共用（InputOverlay 的指针按下、
+    // 主窗口的失焦点击层 blur-touch），保证任意一次点击都能一步退出编辑态：
+    // 先清 editing-index 让编辑框在同一帧销毁，再提交文本（Rust 侧对空串/
+    // 未改名做无副作用处理），因此不会出现「编辑框已失焦但仍显示」的中间态。
+    public function commit-pending-rename() {
+        if (root.editing-index >= 0) {
+            let t = root.rename-text;
+            let idx = root.editing-index;
+            root.editing-index = -1;
+            if (t != "") {
+                root.rename-entry(idx, t);
+            }
+        }
+        if (root.r-editing-index >= 0) {
+            let t = root.r-rename-text;
+            let idx = root.r-editing-index;
+            root.r-editing-index = -1;
+            if (t != "") {
+                root.r-rename-entry(idx, t);
+            }
+        }
+    }
     // 进入重命名时应选中的主名长度（按字节偏移；不含扩展名）。
     // ponytail: 左右面板共用一个属性——同一时刻仅一个编辑框活动，无冲突；
     // 若未来需并发编辑再按面板拆分。由 name-select-len 计算、Rust 实现覆盖。
@@ -311,9 +334,15 @@ export global AppState {
     in-out property <[HashResult]> hashes;
 
     // ════════ 空格键 Quick Look 预览（类 macOS 快速查看）════════
+    // 预览内容显示在独立窗口（preview_window.slint 的 PreviewState）；
+    // 这里的 ql-* 仍是内容的唯一数据源，由 Rust 填充后镜像到预览窗口，
+    // 并供原生视频子窗口的定位与控制条读取。
+    // 预览窗口是否打开（空格切换、主窗口 Esc 关闭均据此判断）
     in-out property <bool> quicklook-open: false;
-    // 预览内容类型：0 信息 / 1 图片 / 2 文本 / 3 文件夹
+    // 预览内容类型：0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频 / 5 归档树
     in-out property <int> ql-kind;
+    // 内容仍在后台加载（图片解码 / 视频媒体源解析），预览窗口据此显示加载动画
+    in-out property <bool> ql-loading: false;
     in-out property <string> ql-name;
     in-out property <string> ql-subtitle;     // 类型 + 大小等副标题
     in-out property <image> ql-image;          // 图片预览大图（ql-kind==1）
@@ -331,10 +360,6 @@ export global AppState {
     // 条目的真实缩略图/系统图标（取自文件列表模型），头部与信息页大图标优先使用
     in-out property <image> ql-thumb;
     in-out property <bool> ql-has-thumb: false;
-    // 预览卡片尺寸（逻辑像素）：Rust 按内容类型/图片视频分辨率/窗口大小计算，
-    // 与视频/网页原生子窗口矩形共用一套公式（详见 ui_bridge::apply_ql_card_size）
-    in-out property <length> ql-card-w: 640px;
-    in-out property <length> ql-card-h: 560px;
     // Markdown/HTML/PHP：支持「渲染 ↔ 源码」双视图
     in-out property <bool> ql-can-render: false;
     // 当前处于渲染模式（WebView2 原生子窗口覆盖内容区显示网页）

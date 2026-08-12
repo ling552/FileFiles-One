@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod fs;
 mod git;
+mod preview_host;
 mod ui_bridge;
 mod update;
 
@@ -192,7 +193,38 @@ fn main() -> Result<(), slint::PlatformError> {
     // 文件名索引：重建（带进度）+ 后台索引开关的启动自动重建
     bind_index(&ui, &core);
 
+    // 预热独立预览窗口：启动后空闲时创建（保持隐藏），把首次空格预览的
+    // Slint 窗口/着色器初始化开销前移到启动期，视频/图片首开不再卡顿。
+    warmup_preview_window(&ui);
+
     ui.run()
+}
+
+/// 启动 1.2s 后（避开主窗口首帧与设备枚举高峰）预创建预览窗口实例。
+/// 失败静默：首次空格仍会即时创建。
+fn warmup_preview_window(ui: &MainWindow) {
+    let close_weak = ui.as_weak();
+    let web_weak = ui.as_weak();
+    let fs_weak = ui.as_weak();
+    slint::Timer::single_shot(std::time::Duration::from_millis(1200), move || {
+        let _ = preview_host::ensure_window(
+            move || {
+                if let Some(ui) = close_weak.upgrade() {
+                    ui.global::<AppState>().invoke_close_quicklook();
+                }
+            },
+            move |on| {
+                if let Some(ui) = web_weak.upgrade() {
+                    ui.global::<AppState>().invoke_ql_set_web_mode(on);
+                }
+            },
+            move || {
+                if let Some(ui) = fs_weak.upgrade() {
+                    ui.global::<AppState>().invoke_ql_toggle_video_fullscreen();
+                }
+            },
+        );
+    });
 }
 
 /// 计算"设备 + 驱动器"拓扑签名。WPD、卷标/容量和回收站 API 可能被慢设备
@@ -1769,6 +1801,114 @@ fn schedule_pane_reloads(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, delays_ms
             if let Some(ui) = w.upgrade() {
                 reload_active_pane(&ui, &c);
             }
+        });
+    }
+}
+
+/// 归一化路径用于比较：剥离 `\\?\` 长路径前缀与尾随分隔符。
+/// 与 select_created_and_edit / select_completed_paths 的比较口径一致。
+fn norm_path_key(s: &str) -> String {
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+    s.trim_end_matches(['/', '\\']).to_string()
+}
+
+/// 给定面板当前目录的磁盘快照（归一化后的路径集合）。
+/// 虚拟路径或读取失败返回 None——此时不做「新增项」比对。
+fn snapshot_pane_dir(
+    core: &Rc<RefCell<AppCore>>,
+    right: bool,
+) -> Option<std::collections::HashSet<String>> {
+    let c = core.borrow();
+    let dir = c.pane(right).history.current().clone();
+    if fs::virtualfs::is_virtual(&dir.to_string_lossy()) {
+        return None;
+    }
+    let (show_hidden, show_protected) = (
+        c.config.settings.show_hidden,
+        c.config.settings.show_protected,
+    );
+    drop(c);
+    ops::read_dir(&dir, show_hidden, show_protected)
+        .ok()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|e| norm_path_key(&e.path))
+                .collect::<std::collections::HashSet<String>>()
+        })
+}
+
+/// 刷新面板，并选中相对 `before` 快照新出现的条目。
+///
+/// 用于系统 Shell 右键菜单的「新建」：菜单命令由 Shell 自己执行，本程序既拿不到
+/// 返回的新路径、也收不到通知，只能刷新后与操作前的目录快照比对，把新增项选中，
+/// 与应用内「新增」菜单（select_created_and_edit）的行为对齐。
+/// 返回是否已选中到新增项（true 时调用方可停止后续延迟比对）。
+fn reload_and_select_new(
+    ui: &MainWindow,
+    core: &Rc<RefCell<AppCore>>,
+    right: bool,
+    before: &std::collections::HashSet<String>,
+) -> bool {
+    if right {
+        load_right(ui, core);
+    } else {
+        load_current(ui, core);
+    }
+    let created: Vec<PathBuf> = {
+        let c = core.borrow();
+        let tab = c.pane(right);
+        tab.filtered
+            .iter()
+            .filter_map(|&ei| tab.entries.get(ei))
+            .filter(|e| !before.contains(&norm_path_key(&e.path)))
+            .map(|e| PathBuf::from(&e.path))
+            .collect()
+    };
+    if created.is_empty() {
+        return false;
+    }
+    // 新建单项：与应用内「新增」一致，选中并直接进入行内重命名，
+    // 用户可立刻输入名称。多项（粘贴/解压等）仅选中，不进入编辑。
+    if created.len() == 1 {
+        select_created_and_edit(ui, core, right, &created[0].to_string_lossy());
+    } else {
+        select_completed_paths(ui, core, right, &created);
+    }
+    true
+}
+
+/// 系统 Shell 菜单命令后的刷新序列：立即比对一次，并在给定延迟点重试。
+/// Shell 命令（新建/粘贴/删除）异步收尾，立即读目录常常还看不到新项；
+/// 一旦某次比对成功选中，后续重试只做普通刷新，避免把随后到达的其它变化
+/// （如外部程序写入的文件）误当成本次新建项再次抢选。
+fn schedule_reload_selecting_new(
+    ui: &MainWindow,
+    core: &Rc<RefCell<AppCore>>,
+    right: bool,
+    before: std::collections::HashSet<String>,
+    delays_ms: &[u64],
+) {
+    let before = Rc::new(before);
+    let done = Rc::new(std::cell::Cell::new(reload_and_select_new(
+        ui, core, right, &before,
+    )));
+    for &delay in delays_ms {
+        let w = ui.as_weak();
+        let c = core.clone();
+        let before = before.clone();
+        let done = done.clone();
+        slint::Timer::single_shot(std::time::Duration::from_millis(delay), move || {
+            let Some(ui) = w.upgrade() else { return };
+            if done.get() {
+                if right {
+                    load_right(&ui, &c);
+                } else {
+                    load_current(&ui, &c);
+                }
+                return;
+            }
+            done.set(reload_and_select_new(&ui, &c, right, &before));
         });
     }
 }
@@ -3653,11 +3793,22 @@ fn bind_context_menu_ext(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             if fs::virtualfs::is_virtual(&dir) {
                 return;
             }
+            // 弹出前留一份目录快照：系统菜单的「新建」由 Shell 自己执行，不回传新
+            // 路径，只能靠菜单前后的目录差集找出新建项，并将其选中 + 进入重命名，
+            // 与应用内「新增」菜单一致（此前仅刷新，用户看不到新建的文件/文件夹）。
+            let before = snapshot_pane_dir(&c, right);
             let invoked = show_system_background_menu(&ui, &dir, mx, my);
             if invoked {
-                reload_active_pane(&ui, &c);
-                // 背景菜单命令（新建/粘贴等）同样可能异步收尾
-                schedule_pane_reloads(&ui, &c, &[600, 2000]);
+                // 背景菜单命令（新建/粘贴等）可能异步收尾，故立即比对 + 延迟重试
+                match before {
+                    Some(before) => {
+                        schedule_reload_selecting_new(&ui, &c, right, before, &[600, 2000])
+                    }
+                    None => {
+                        reload_active_pane(&ui, &c);
+                        schedule_pane_reloads(&ui, &c, &[600, 2000]);
+                    }
+                }
             }
         }
     });
@@ -4651,17 +4802,23 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         }
     });
 
-    // 空格键 Quick Look：填充预览内容并打开浮层（按活动面板取选中项）
+    // 空格键 Quick Look：填充预览内容并打开独立预览窗口（按活动面板取选中项）
     let c = core.clone();
     let w = ui.as_weak();
     state.on_open_quicklook(move || {
         if let Some(ui) = w.upgrade() {
             let right = toolbar_routes_right(&ui);
             if ui_bridge::fill_quicklook(&ui, &c.borrow(), right) {
+                let preview_generation = next_preview_generation();
                 let st = ui.global::<AppState>();
                 st.set_quicklook_open(true);
                 st.set_ql_video_fullscreen(false);
                 let path = st.get_sel_path().to_string();
+                // 先把内容推到独立窗口并显示，原生子窗口随后按其客户区定位
+                if !show_preview_window(&ui, &path, preview_generation) {
+                    st.set_quicklook_open(false);
+                    return;
+                }
                 if st.get_ql_kind() == 4 {
                     // 视频：在预览内容区之上启动 Media Foundation 子窗口播放（含音频）
                     fs::web_preview::stop();
@@ -4693,15 +4850,17 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                             if let Some(ui) = w_summary.upgrade() {
                                 let state = ui.global::<AppState>();
                                 if state.get_quicklook_open() && state.get_sel_path() == ql_path.as_str() {
-                                    state.set_ql_info(
-                                        format!(
-                                            "包含 {} 个子文件夹、{} 个文件\n文件总大小 {}",
-                                            dirs,
-                                            files,
-                                            fs::metadata::human_size(size)
-                                        )
-                                        .into(),
+                                    let info = format!(
+                                        "包含 {} 个子文件夹、{} 个文件\n文件总大小 {}",
+                                        dirs,
+                                        files,
+                                        fs::metadata::human_size(size)
                                     );
+                                    state.set_ql_info(info.clone().into());
+                                    // 同步到独立预览窗口（统计为后台线程回填）
+                                    if let Some(pw) = preview_host::window() {
+                                        preview_host::set_info(&pw, &info);
+                                    }
                                 }
                             }
                         });
@@ -4711,7 +4870,7 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         }
     });
 
-    // 关闭 Quick Look：同时停止可能进行中的视频播放与网页渲染
+    // 关闭 Quick Look：隐藏独立预览窗口，并停止可能进行中的视频播放与网页渲染
     let w_close = ui.as_weak();
     state.on_close_quicklook(move || {
         if let Some(ui) = w_close.upgrade() {
@@ -4720,16 +4879,18 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             fs::web_preview::stop();
             let st = ui.global::<AppState>();
             if st.get_ql_video_fullscreen() {
-                set_quicklook_window_fullscreen(&ui, false);
-                #[cfg(windows)]
-                schedule_window_effects(&ui, &[40, 180, 500]);
+                set_quicklook_window_fullscreen(false);
             }
             st.set_ql_video_fullscreen(false);
             st.set_quicklook_open(false);
+            #[cfg(windows)]
+            clear_preview_window_icon();
+            preview_host::hide();
         }
     });
 
-    // 视频全屏：复用当前播放器，把主窗口切换为当前显示器的无边框全屏。
+    // 视频全屏：复用当前播放器，把独立预览窗口切换为当前显示器的无边框全屏。
+    // 主窗口不参与，因此无需重新应用其无边框样式。
     let w_fs = ui.as_weak();
     state.on_ql_toggle_video_fullscreen(move || {
         if let Some(ui) = w_fs.upgrade() {
@@ -4739,12 +4900,15 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             }
             let fullscreen = !st.get_ql_video_fullscreen();
             st.set_ql_video_fullscreen(fullscreen);
-            set_quicklook_window_fullscreen(&ui, fullscreen);
+            // 同步按钮图标态到预览窗口
+            if let Some(pw) = preview_host::window() {
+                pw.global::<PreviewState>().set_video_fullscreen(fullscreen);
+            }
+            set_quicklook_window_fullscreen(fullscreen);
             schedule_video_repositions(&ui, &[40, 180]);
-            // winit 全屏切换会触发 Windows 非客户区重算，可能重新带回原生标题栏按钮；
-            // 延迟重新应用无边框样式，确保进入和退出全屏都只保留应用自绘的一套按钮。
-            #[cfg(windows)]
-            schedule_window_effects(&ui, &[40, 180, 500]);
+            // 原点已变，立即触发一次重定位（全屏切换后控制条需重新对齐）
+            LAST_PREVIEW_ORIGIN.with(|c| c.set((i32::MIN, i32::MIN)));
+            reposition_video_if_moved(&ui);
         }
     });
 
@@ -4798,7 +4962,8 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         }
     });
 
-    // 渲染/源码视图切换（Markdown/HTML/PHP）：启停 WebView2 子层并重算卡片尺寸
+    // 渲染/源码视图切换（Markdown/HTML/PHP）：启停 WebView2 子层。
+    // 预览已是独立窗口，尺寸由用户/初始值决定，无需按视图重算卡片。
     let w = ui.as_weak();
     state.on_ql_set_web_mode(move |on| {
         if let Some(ui) = w.upgrade() {
@@ -4807,7 +4972,10 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 return;
             }
             st.set_ql_web_mode(on);
-            ui_bridge::apply_ql_card_size(&ui, st.get_ql_kind(), 0, 0, on);
+            // 同步到预览窗口，让其切换渲染占位层与源码文本层
+            if let Some(pw) = preview_host::window() {
+                pw.global::<PreviewState>().set_web_mode(on);
+            }
             if on {
                 let path = st.get_sel_path().to_string();
                 if !path.is_empty() {
@@ -4820,43 +4988,36 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     });
 }
 
-/// 预览卡片内容区在窗口内的物理像素矩形。
-/// 与 quick_look.slint 布局约定一致：卡片（AppState.ql-card-w/h 逻辑像素）居中、
-/// 头部和底部提示栏高度取 ui_bridge 常量；原生视频/网页子窗口仅覆盖中间内容区。
-/// 卡片尺寸唯一来源是 ui_bridge::apply_ql_card_size，原生子窗口据此对齐。
+/// 预览窗口内容区的物理像素矩形（相对预览窗口客户区左上角）。
+/// 与 preview_window.slint 布局约定一致：头部 60px、底部提示栏 38px，
+/// 中间为内容区；原生视频/网页子窗口只覆盖内容区。
+/// 视频按分辨率在内容区内等比居中，其余类型铺满内容区。
 #[cfg(windows)]
-fn quicklook_content_rect_phys(ui: &MainWindow) -> Option<(i32, i32, i32, i32)> {
-    let mut out = None;
+fn preview_content_rect_phys(ui: &MainWindow) -> Option<(i32, i32, i32, i32)> {
+    let pw = preview_host::window()?;
     let st = ui.global::<AppState>();
-    let (card_lw, card_lh) = (st.get_ql_card_w(), st.get_ql_card_h());
-    ui.window().with_winit_window(|winit_window| {
+    let mut out = None;
+    pw.window().with_winit_window(|winit_window| {
         let scale = winit_window.scale_factor() as f32;
         let size = winit_window.inner_size();
         let (win_w, win_h) = (size.width as f32, size.height as f32);
-        let card_w = card_lw * scale;
-        let card_h = card_lh * scale;
-        let card_x = (win_w - card_w) / 2.0;
-        let card_y = (win_h - card_h) / 2.0;
-        let content_y = card_y + ui_bridge::QL_HEADER_H * scale;
-        // 视频与其它预览统一为底部提示栏保留固定高度，原生画面不延伸到卡片底边。
-        let content_h = card_h - (ui_bridge::QL_HEADER_H + ui_bridge::QL_FOOTER_H) * scale;
-        let mut x = card_x;
-        let mut y = content_y;
-        let mut width = card_w;
+        let header = PREVIEW_HEADER_H * scale;
+        let footer = PREVIEW_FOOTER_H * scale;
+        let content_h = (win_h - header - footer).max(1.0);
+        let mut x = 0.0_f32;
+        let mut y = header;
+        let mut width = win_w;
         let mut height = content_h;
         if st.get_ql_kind() == 4 {
             let vw = st.get_ql_img_w().max(0) as f32;
             let vh = st.get_ql_img_h().max(0) as f32;
-            // 原生控制条叠加在视频内容区底部；卡片底部提示栏已在上方矩形计算中扣除。
+            // 分辨率已知：等比适配并在内容区内居中，避免画面被拉伸。
             if vw > 0.0 && vh > 0.0 {
-                let fit = (card_w / vw).min(content_h / vh);
+                let fit = (win_w / vw).min(content_h / vh);
                 width = vw * fit;
                 height = vh * fit;
-                x += (card_w - width) / 2.0;
+                x += (win_w - width) / 2.0;
                 y += (content_h - height) / 2.0;
-            } else {
-                // 视频尺寸未知：子窗口覆盖完整内容区，分辨率就绪后再按比例居中。
-                height = content_h;
             }
         }
         out = Some((x as i32, y as i32, width as i32, height as i32));
@@ -4864,19 +5025,28 @@ fn quicklook_content_rect_phys(ui: &MainWindow) -> Option<(i32, i32, i32, i32)> 
     out
 }
 
-/// 切换主窗口无边框全屏。
-fn set_quicklook_window_fullscreen(ui: &MainWindow, fullscreen: bool) {
-    ui.window().with_winit_window(|window| {
-        // 主窗口已经由 Slint no-frame 配置为无边框并自绘标题栏；这里仅切换
-        // Borderless 全屏，不改 decorations，避免 Windows 临时重建第二套标题栏按钮。
-        window.set_fullscreen(if fullscreen {
-            Some(winit::window::Fullscreen::Borderless(
-                window.current_monitor(),
-            ))
-        } else {
-            None
+#[cfg(not(windows))]
+fn preview_content_rect_phys(_ui: &MainWindow) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
+/// 预览窗口头部/底部高度（逻辑像素）——与 preview_window.slint 布局一致
+const PREVIEW_HEADER_H: f32 = 60.0;
+const PREVIEW_FOOTER_H: f32 = 38.0;
+
+/// 切换预览窗口无边框全屏（视频全屏作用于预览窗口，不再影响主窗口）。
+fn set_quicklook_window_fullscreen(fullscreen: bool) {
+    if let Some(pw) = preview_host::window() {
+        pw.window().with_winit_window(|window| {
+            window.set_fullscreen(if fullscreen {
+                Some(winit::window::Fullscreen::Borderless(
+                    window.current_monitor(),
+                ))
+            } else {
+                None
+            });
         });
-    });
+    }
 }
 
 /// 全屏切换后窗口尺寸异步更新，按固定延迟重对齐视频子窗口。
@@ -4890,9 +5060,9 @@ fn schedule_video_repositions(ui: &MainWindow, delays_ms: &[u64]) {
                     return;
                 }
                 let rect = if st.get_ql_video_fullscreen() {
-                    quicklook_fullscreen_rect_phys(&ui)
+                    quicklook_fullscreen_rect_phys()
                 } else {
-                    quicklook_content_rect_phys(&ui)
+                    preview_content_rect_phys(&ui)
                 };
                 if let Some(rect) = rect {
                     fs::video_preview::reposition(rect);
@@ -4902,13 +5072,14 @@ fn schedule_video_repositions(ui: &MainWindow, delays_ms: &[u64]) {
     }
 }
 
-/// 主窗口客户区全屏矩形（物理像素）。
+/// 预览窗口客户区全屏矩形（物理像素）。
 #[cfg(windows)]
-fn quicklook_fullscreen_rect_phys(ui: &MainWindow) -> Option<(i32, i32, i32, i32)> {
+fn quicklook_fullscreen_rect_phys() -> Option<(i32, i32, i32, i32)> {
+    let pw = preview_host::window()?;
     let mut out = None;
-    ui.window().with_winit_window(|window| {
+    pw.window().with_winit_window(|window| {
         let size = window.inner_size();
-        // 全屏时播放器子窗口覆盖整个主窗口客户区。MFPlay 会在该矩形内自行
+        // 全屏时播放器子窗口覆盖整个预览窗口客户区。MFPlay 会在该矩形内自行
         // 按视频比例留黑边；控制栏也以窗口矩形定位，始终贴住窗口最底部。
         out = Some((0, 0, size.width as i32, size.height as i32));
     });
@@ -4916,9 +5087,497 @@ fn quicklook_fullscreen_rect_phys(ui: &MainWindow) -> Option<(i32, i32, i32, i32
 }
 
 #[cfg(not(windows))]
-fn quicklook_fullscreen_rect_phys(_ui: &MainWindow) -> Option<(i32, i32, i32, i32)> {
+fn quicklook_fullscreen_rect_phys() -> Option<(i32, i32, i32, i32)> {
     None
 }
+
+/// 取预览窗口 HWND（isize；窗口未就绪返回 0）
+#[cfg(windows)]
+fn preview_hwnd() -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Some(pw) = preview_host::window() else {
+        return 0;
+    };
+    let mut hwnd_isize: isize = 0;
+    pw.window().with_winit_window(|winit_window| {
+        if let Ok(handle) = winit_window.window_handle() {
+            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                hwnd_isize = isize::from(h.hwnd);
+            }
+        }
+    });
+    hwnd_isize
+}
+
+/// 创建/复用独立预览窗口，推送内容并显示。返回是否成功打开。
+/// 窗口在显示前已按内容尺寸定型，显示后仅需等待图片/视频解码完成。
+fn show_preview_window(ui: &MainWindow, path: &str, preview_generation: u64) -> bool {
+    let close_weak = ui.as_weak();
+    let web_weak = ui.as_weak();
+    let fs_weak = ui.as_weak();
+    let created = preview_host::ensure_window(
+        move || {
+            // 预览窗口内触发的关闭：走主窗口同一套清理逻辑
+            if let Some(ui) = close_weak.upgrade() {
+                ui.global::<AppState>().invoke_close_quicklook();
+            }
+        },
+        move |on| {
+            if let Some(ui) = web_weak.upgrade() {
+                ui.global::<AppState>().invoke_ql_set_web_mode(on);
+            }
+        },
+        move || {
+            if let Some(ui) = fs_weak.upgrade() {
+                ui.global::<AppState>().invoke_ql_toggle_video_fullscreen();
+            }
+        },
+    );
+    let pw = match created {
+        Ok(pw) => pw,
+        Err(e) => {
+            eprintln!("[preview] 创建预览窗口失败：{e}");
+            ui.global::<AppState>()
+                .set_status_text(format!("无法打开预览窗口：{e}").into());
+            return false;
+        }
+    };
+    preview_host::sync_theme(ui, &pw);
+    preview_host::push_content(ui, &pw, path);
+
+    // 每次打开都按内容尺寸重算并居中（图片/视频已在 ui_bridge 中探测尺寸）
+    let kind = ui.global::<AppState>().get_ql_kind();
+    center_and_size_preview(ui, &pw, kind);
+
+    // 标题栏图标：用文件自身的系统图标替代默认应用图标
+    set_preview_window_icon(path);
+
+    if pw.show().is_err() {
+        return false;
+    }
+
+    // 安装 WM_MOVE 子类：拖动窗口时同步移动视频控制栏（避免拖动延迟）
+    install_preview_move_handler();
+
+    // 置顶到主窗口之上并取得焦点，使空格/Esc 直接作用于预览
+    focus_preview_window(&pw);
+
+    // 图片：后台解码位图（避免大图阻塞 UI 线程）
+    if kind == 1 {
+        decode_image_async(ui, &pw, path, preview_generation);
+    } else if kind != 4 {
+        // 文本/归档/文件夹/信息等内容已同步就绪，下一帧关闭加载动画。
+        // 视频（kind==4）由 on_video_size_ready 关闭。
+        // 加一帧延迟：让本帧的加载占位先绘制出来，再换内容，避免透明窗口闪现。
+        let pw_weak = pw.as_weak();
+        let ui_weak = ui.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(16), move || {
+            if let (Some(pw), Some(ui)) = (pw_weak.upgrade(), ui_weak.upgrade()) {
+                if ui.global::<AppState>().get_quicklook_open() && preview_generation_is_current(preview_generation) {
+                    preview_host::set_loading(&pw, false);
+                    ui.global::<AppState>().set_ql_loading(false);
+                }
+            }
+        });
+    }
+
+    true
+}
+
+/// 按内容类型计算预览窗口尺寸并居中到主窗口所在显示器，每次打开时调用。
+/// 图片/视频按真实分辨率适配当前显示器可用区，其余类型用各自的经验值。
+/// 窗口在显示前完成定位和定型，避免先显示再调整的闪烁。
+fn center_and_size_preview(ui: &MainWindow, pw: &PreviewWindow, kind: i32) {
+    let st = ui.global::<AppState>();
+    let chrome = PREVIEW_HEADER_H + PREVIEW_FOOTER_H;
+
+    // 获取主窗口所在显示器的工作区（物理像素）和 DPI
+    #[cfg(windows)]
+    let (work_w, work_h, work_x, work_y, dpi) = {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        use windows::Win32::Foundation::HWND;
+
+        let work_area = ui.window().with_winit_window(|w| {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let handle = w.window_handle().ok()?;
+            let hwnd = match handle.as_raw() {
+                RawWindowHandle::Win32(h) => HWND(h.hwnd.get() as *mut _),
+                _ => return None,
+            };
+
+            unsafe {
+                let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                    let work = mi.rcWork;
+                    let scale = w.scale_factor() as f32;
+                    Some((
+                        (work.right - work.left) as f32,
+                        (work.bottom - work.top) as f32,
+                        work.left as f32,
+                        work.top as f32,
+                        (scale * 96.0) as u32,
+                    ))
+                } else {
+                    None
+                }
+            }
+        }).flatten();
+
+        work_area.unwrap_or_else(|| {
+            // 后备：使用 winit 提供的显示器信息
+            ui.window().with_winit_window(|w| {
+                w.current_monitor()
+                    .map(|m| {
+                        let size = m.size();
+                        let pos = m.position();
+                        let scale = w.scale_factor() as f32;
+                        // 预留任务栏空间（通常在底部 48 逻辑像素）
+                        (
+                            size.width as f32,
+                            (size.height as f32) - (48.0 * scale),
+                            pos.x as f32,
+                            pos.y as f32,
+                            (scale * 96.0) as u32,
+                        )
+                    })
+            }).flatten().unwrap_or((1920.0, 1080.0 - 48.0, 0.0, 0.0, 96))
+        })
+    };
+
+    #[cfg(not(windows))]
+    let (work_w, work_h, work_x, work_y, dpi) = {
+        ui.window().with_winit_window(|w| {
+            w.current_monitor()
+                .map(|m| {
+                    let size = m.size();
+                    let pos = m.position();
+                    let scale = w.scale_factor() as f32;
+                    // 预留任务栏/停靠栏空间
+                    (
+                        size.width as f32,
+                        (size.height as f32) - (48.0 * scale),
+                        pos.x as f32,
+                        pos.y as f32,
+                        (scale * 96.0) as u32,
+                    )
+                })
+        }).flatten().unwrap_or((1920.0, 1080.0 - 48.0, 0.0, 0.0, 96))
+    };
+
+    // 逻辑可用区：留出 160 逻辑像素边距，转换到目标 DPI
+    let scale = dpi as f32 / 96.0;
+    let max_w = ((work_w / scale) - 160.0).clamp(420.0, 2000.0);
+    let max_h = ((work_h / scale) - 160.0).clamp(320.0, 1400.0);
+
+    let (cw, ch) = match kind {
+        // 图片：按原生分辨率适配（放不下等比缩小，小图不放大）
+        1 => {
+            let iw = st.get_ql_img_w().max(0) as f32;
+            let ih = st.get_ql_img_h().max(0) as f32;
+            if iw > 0.0 && ih > 0.0 {
+                let fit = (max_w / iw).min((max_h - chrome) / ih).min(1.0);
+                ((iw * fit).max(420.0), (ih * fit).max(280.0))
+            } else {
+                (860.0_f32.min(max_w), 560.0_f32.min(max_h - chrome))
+            }
+        }
+        // 视频：按探测到的分辨率计算，失败时回退 16:9
+        4 => {
+            let vw = st.get_ql_img_w().max(0) as f32;
+            let vh = st.get_ql_img_h().max(0) as f32;
+            if vw > 0.0 && vh > 0.0 {
+                let fit = (max_w / vw).min((max_h - chrome) / vh).min(1.0);
+                ((vw * fit).max(420.0), (vh * fit).max(280.0))
+            } else {
+                (880.0_f32.min(max_w), 495.0_f32.min(max_h - chrome))
+            }
+        }
+        // 归档树：偏高，便于展开层级后浏览
+        5 => (760.0_f32.min(max_w), 620.0_f32.min(max_h - chrome)),
+        // 文本/网页
+        2 => (900.0_f32.min(max_w), 660.0_f32.min(max_h - chrome)),
+        // 文件夹/信息：紧凑
+        _ => (520.0_f32.min(max_w), 420.0_f32.min(max_h - chrome)),
+    };
+
+    let logical_size = slint::LogicalSize::new(cw.max(420.0), ch + chrome);
+    pw.window().set_size(logical_size);
+
+    // 居中：在工作区内居中显示，考虑 Chrome（标题栏 + 间隙）
+    let work_w_logical = work_w / scale;
+    let work_h_logical = work_h / scale;
+    let centered_x = work_x / scale + (work_w_logical - logical_size.width) / 2.0;
+    let centered_y = work_y / scale + (work_h_logical - logical_size.height) / 2.0;
+
+    pw.window().set_position(slint::LogicalPosition::new(
+        centered_x,
+        centered_y,
+    ));
+
+    #[cfg(not(windows))]
+    {
+        // 非 Windows：Slint 的 set_position 在某些平台可能不可靠，至少先设尺寸
+        let _ = (work_x, work_y, work_w, work_h, scale);
+    }
+}
+
+thread_local! {
+    static PREVIEW_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn next_preview_generation() -> u64 {
+    PREVIEW_GENERATION.with(|generation| {
+        let next = generation.get().wrapping_add(1);
+        generation.set(next);
+        next
+    })
+}
+
+fn preview_generation_is_current(generation: u64) -> bool {
+    PREVIEW_GENERATION.with(|current| current.get() == generation)
+}
+
+/// 图片后台解码：大图解码可能耗时数百毫秒，放后台线程避免卡住空格键。
+/// 窗口已在显示前按真实尺寸定型，这里只回填像素数据。
+fn decode_image_async(ui: &MainWindow, pw: &PreviewWindow, path: &str, preview_generation: u64) {
+    let path = path.to_string();
+    let pw_weak = pw.as_weak();
+    let ui_weak = ui.as_weak();
+
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        let icon_opt = crate::fs::thumbnail::extract(&path, crate::ui_bridge::QL_IMAGE_SIZE)
+            .map(|(pixels, w, h)| crate::fs::thumbnail::IconPixels { pixels, w, h });
+
+        #[cfg(not(windows))]
+        let icon_opt: Option<crate::fs::thumbnail::IconPixels> = None;
+
+        slint::invoke_from_event_loop(move || {
+            let Some(pw) = pw_weak.upgrade() else { return };
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if !preview_generation_is_current(preview_generation)
+                || !ui.global::<AppState>().get_quicklook_open()
+            {
+                return;
+            }
+
+            preview_host::set_loading(&pw, false);
+            ui.global::<AppState>().set_ql_loading(false);
+
+            if let Some(icon) = icon_opt {
+                let image = crate::ui_bridge::image_from(&icon);
+                preview_host::set_image(&pw, image);
+            }
+        })
+        .ok();
+    });
+}
+
+/// 安装 WM_MOVE 和 WM_SIZE 子类：拖动/调整预览窗口时同步移动视频控制栏和画面
+#[cfg(windows)]
+fn install_preview_move_handler() {
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Shell::{
+        DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{WM_MOVE, WM_NCDESTROY, WM_SIZE};
+
+    let hwnd = preview_hwnd();
+    if hwnd == 0 {
+        return;
+    }
+
+    unsafe extern "system" fn subclass_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _uid: usize,
+        _data: usize,
+    ) -> LRESULT {
+        match msg {
+            WM_MOVE => {
+                // 先让 winit 处理（触发 Slint 的窗口移动事件）
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                // 同步移动控制栏到窗口新位置
+                crate::fs::video_preview::sync_controls();
+                result
+            }
+            WM_SIZE => {
+                // 先让 winit 处理（触发 Slint 的窗口尺寸变化）
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                // 重新计算视频内容区矩形并重定位播放器子窗口
+                if let Some(pw) = crate::preview_host::window() {
+                    // 直接从预览窗口计算内容区物理矩形
+                    let rect_opt = pw.window().with_winit_window(|window| {
+                        let scale = window.scale_factor();
+                        let size = window.inner_size();
+
+                        // 计算内容区：去掉头部和底部边距
+                        let chrome_h = ((PREVIEW_HEADER_H + PREVIEW_FOOTER_H) * scale as f32) as i32;
+                        let content_h = (size.height as i32).saturating_sub(chrome_h).max(0);
+
+                        Some((0, (PREVIEW_HEADER_H * scale as f32) as i32, size.width as i32, content_h))
+                    });
+
+                    if let Some(Some(rect)) = rect_opt {
+                        crate::fs::video_preview::reposition(rect);
+                    }
+                }
+                result
+            }
+            WM_NCDESTROY => {
+                let _ = RemoveWindowSubclass(hwnd, Some(subclass_proc), 0);
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    unsafe {
+        let _ = SetWindowSubclass(
+            HWND(hwnd as *mut _),
+            Some(subclass_proc),
+            0, // subclass ID
+            0, // ref data
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn install_preview_move_handler() {}
+
+#[cfg(not(windows))]
+fn preview_hwnd() -> isize {
+    0
+}
+
+/// 把预览窗口提到前台并聚焦（Windows 下用 SetForegroundWindow 确保键盘焦点）。
+/// 关键：必须真正取得键盘焦点，否则空格/Esc 仍会送到主窗口而非预览窗口。
+fn focus_preview_window(pw: &PreviewWindow) {
+    pw.window().with_winit_window(|w| {
+        w.focus_window();
+    });
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, SetForegroundWindow, ShowWindow, SW_SHOWNORMAL,
+        };
+        use windows_sys::Win32::System::Threading::{
+            AttachThreadInput, GetCurrentThreadId,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+
+        let hwnd = preview_hwnd() as HWND;
+        if hwnd.is_null() {
+            return;
+        }
+        unsafe {
+            // 先确保窗口可见且未最小化
+            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+            // AttachThreadInput 把当前前台窗口的线程与本线程输入队列挂接，
+            // 这样 SetFocus 才能跨线程把焦点设到预览窗口。否则另一线程拥有
+            // 前台焦点时，SetFocus 会静默失败——这是空格/Esc 关不上的根因。
+            let mut fore_thread = 0u32;
+            let _ = GetWindowThreadProcessId(hwnd, &mut fore_thread);
+            let cur_thread = GetCurrentThreadId();
+            let attached = if fore_thread != 0 && fore_thread != cur_thread {
+                AttachThreadInput(cur_thread, fore_thread, 1)
+            } else {
+                0
+            };
+            let _ = SetForegroundWindow(hwnd);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetFocus(hwnd);
+            if attached != 0 {
+                AttachThreadInput(cur_thread, fore_thread, 0);
+            }
+        }
+    }
+}
+
+// 预览窗口标题栏图标：上次设置的大/小 HICON，切换文件前销毁旧图标防泄漏。
+thread_local! {
+    static PREVIEW_ICON: std::cell::Cell<(isize, isize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// 用文件自身的系统图标设置预览窗口标题栏图标（替代默认应用图标）。
+/// 虚拟路径/提取失败时保持默认图标不动。
+#[cfg(windows)]
+fn set_preview_window_icon(path: &str) {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Shell::{
+        SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_SETICON, ICON_BIG, ICON_SMALL};
+
+    let hwnd = preview_hwnd() as HWND;
+    if hwnd.is_null() || path.is_empty() {
+        return;
+    }
+    // 虚拟路径没有系统图标，跳过（保持默认）
+    if path.starts_with("device://")
+        || crate::fs::virtualfs::is_virtual(path)
+    {
+        clear_preview_window_icon();
+        return;
+    }
+    let mut wide: Vec<u16> = path.encode_utf16().collect();
+    wide.push(0);
+    let mut big: SHFILEINFOW = unsafe { std::mem::zeroed() };
+    let mut small: SHFILEINFOW = unsafe { std::mem::zeroed() };
+    let big_ok = unsafe {
+        SHGetFileInfoW(
+            wide.as_ptr(),
+            0,
+            &mut big,
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        )
+    };
+    let small_ok = unsafe {
+        SHGetFileInfoW(
+            wide.as_ptr(),
+            0,
+            &mut small,
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_SMALLICON,
+        )
+    };
+    // 销毁上次设置的图标
+    clear_preview_window_icon();
+    let mut stored = (0isize, 0isize);
+    if big_ok != 0 && !big.hIcon.is_null() {
+        unsafe { SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big.hIcon as isize) };
+        stored.0 = big.hIcon as isize;
+    }
+    if small_ok != 0 && !small.hIcon.is_null() {
+        unsafe { SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small.hIcon as isize) };
+        stored.1 = small.hIcon as isize;
+    }
+    PREVIEW_ICON.with(|c| c.set(stored));
+}
+
+#[cfg(windows)]
+fn clear_preview_window_icon() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon;
+    let (big, small) = PREVIEW_ICON.with(|c| c.replace((0, 0)));
+    if big != 0 {
+        unsafe { DestroyIcon(big as *mut _) };
+    }
+    if small != 0 {
+        unsafe { DestroyIcon(small as *mut _) };
+    }
+}
+
+#[cfg(not(windows))]
+fn set_preview_window_icon(_path: &str) {}
 
 /// 取主窗口 HWND（isize；窗口未就绪返回 0）
 #[cfg(windows)]
@@ -4945,6 +5604,11 @@ thread_local! {
         const { std::cell::Cell::new((i32::MIN, i32::MIN)) };
     static MOUSE_LAST_ACTIVE: std::cell::Cell<Option<std::time::Instant>> =
         const { std::cell::Cell::new(None) };
+    /// 上次重定位视频子窗口时预览窗口的屏幕原点（物理像素）。
+    /// 预览窗口可被用户拖动；控制条是 WS_POPUP owned 窗口（不随 owner 移动），
+    /// 因此检测到原点变化时需主动重定位画面与控制条。
+    static LAST_PREVIEW_ORIGIN: std::cell::Cell<(i32, i32)> =
+        const { std::cell::Cell::new((i32::MIN, i32::MIN)) };
 }
 
 /// 视频轮询中的鼠标活动检测：光标在当前预览卡片内移动就显示控制条；
@@ -4959,37 +5623,20 @@ fn poll_video_controls_visibility(ui: &MainWindow) {
     if !st.get_quicklook_open() || st.get_ql_kind() != 4 {
         return;
     }
-    // 唤醒范围按“预览窗口”而不是仅视频像素区域计算：横竖屏视频即使因
-    // 等比适配在卡片内有边带，鼠标移到标题栏或边带也应视为该窗口内活动。
-    let rect = if st.get_ql_video_fullscreen() {
-        let mut rect = None;
-        ui.window().with_winit_window(|window| {
-            let size = window.inner_size();
-            rect = Some((0, 0, size.width as i32, size.height as i32));
-        });
-        rect
-    } else {
-        let mut rect = None;
-        let card_w = st.get_ql_card_w();
-        let card_h = st.get_ql_card_h();
-        ui.window().with_winit_window(|window| {
-            let scale = window.scale_factor() as f32;
-            let size = window.inner_size();
-            let width = (card_w * scale) as i32;
-            let height = (card_h * scale) as i32;
-            rect = Some((
-                (size.width as i32 - width) / 2,
-                (size.height as i32 - height) / 2,
-                width,
-                height,
-            ));
-        });
-        rect
+    // 唤醒范围按整个预览窗口客户区计算：横竖屏视频即使因等比适配留有边带，
+    // 鼠标移到头部或边带也应视为该窗口内活动。
+    let Some(pw) = preview_host::window() else {
+        return;
     };
+    let mut rect = None;
+    pw.window().with_winit_window(|window| {
+        let size = window.inner_size();
+        rect = Some((0, 0, size.width as i32, size.height as i32));
+    });
     let Some(rect) = rect else {
         return;
     };
-    let hwnd = main_hwnd(ui) as windows_sys::Win32::Foundation::HWND;
+    let hwnd = preview_hwnd() as windows_sys::Win32::Foundation::HWND;
     if hwnd.is_null() {
         return;
     }
@@ -5034,6 +5681,46 @@ fn poll_video_controls_visibility(ui: &MainWindow) {
 #[cfg(not(windows))]
 fn poll_video_controls_visibility(_ui: &MainWindow) {}
 
+/// 预览窗口移动或缩放后重定位原生视频画面与控制条。
+/// 控制条是 WS_POPUP owned 窗口，不随 owner 自动移动，需在此主动校正。
+#[cfg(windows)]
+fn reposition_video_if_moved(ui: &MainWindow) {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    let st = ui.global::<AppState>();
+    if !st.get_quicklook_open() || st.get_ql_kind() != 4 {
+        return;
+    }
+    let Some(pw) = preview_host::window() else {
+        return;
+    };
+    let hwnd = preview_hwnd() as windows_sys::Win32::Foundation::HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    let mut origin = POINT { x: 0, y: 0 };
+    if unsafe { ClientToScreen(hwnd, &mut origin) } == 0 {
+        return;
+    }
+    let prev = LAST_PREVIEW_ORIGIN.with(|c| c.get());
+    if prev == (origin.x, origin.y) {
+        return;
+    }
+    LAST_PREVIEW_ORIGIN.with(|c| c.set((origin.x, origin.y)));
+    if let Some(rect) = if st.get_ql_video_fullscreen() {
+        quicklook_fullscreen_rect_phys()
+    } else {
+        preview_content_rect_phys(ui)
+    } {
+        fs::video_preview::reposition(rect);
+    }
+    // 让窗口自身在下面借用一次，避免「未使用」告警
+    drop(pw);
+}
+
+#[cfg(not(windows))]
+fn reposition_video_if_moved(_ui: &MainWindow) {}
+
 fn start_video_timer(ui: &MainWindow) {
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
@@ -5055,6 +5742,9 @@ fn start_video_timer(ui: &MainWindow) {
                     st.get_ql_video_paused(),
                     st.get_ql_video_muted(),
                 );
+                // 预览窗口被拖动/缩放时，原生控制条（WS_POPUP owned 窗口）不会
+                // 跟随 owner，这里在 250ms 轮询中检测原点变化并主动重定位。
+                reposition_video_if_moved(&ui);
                 // 预览卡片内鼠标活动 → 显示；静止 5 秒 → 隐藏
                 poll_video_controls_visibility(&ui);
             }
@@ -5075,10 +5765,11 @@ fn stop_video_timer_impl() {
 /// 分辨率就绪后回调 on_video_size_ready 把卡片调整为视频宽高比。
 #[cfg(windows)]
 fn start_video_preview(ui: &MainWindow, path: &str) {
-    let Some(rect) = quicklook_content_rect_phys(ui) else {
+    let Some(rect) = preview_content_rect_phys(ui) else {
         return;
     };
-    let hwnd = main_hwnd(ui);
+    // 视频子窗口挂到独立预览窗口而不是主窗口
+    let hwnd = preview_hwnd();
     if hwnd == 0 {
         return;
     }
@@ -5087,6 +5778,7 @@ fn start_video_preview(ui: &MainWindow, path: &str) {
     let replay_weak = ui.as_weak();
     let mute_weak = ui.as_weak();
     let seek_weak = ui.as_weak();
+    let close_weak = ui.as_weak();
     let ok = fs::video_preview::start(
         hwnd,
         rect,
@@ -5131,11 +5823,20 @@ fn start_video_preview(ui: &MainWindow, path: &str) {
                     }
                 }
             }),
+            close: Box::new(move || {
+                if let Some(ui) = close_weak.upgrade() {
+                    ui.global::<AppState>().invoke_close_quicklook();
+                }
+            }),
         },
     );
     if !ok {
-        ui.global::<AppState>()
-            .set_status_text("视频播放启动失败（编解码器不支持）".into());
+        let st = ui.global::<AppState>();
+        st.set_ql_loading(false);
+        if let Some(pw) = preview_host::window() {
+            preview_host::set_loading(&pw, false);
+        }
+        st.set_status_text("视频播放启动失败（编解码器不支持）".into());
     } else {
         // 复位进度并启动轮询定时器刷新进度条
         let st = ui.global::<AppState>();
@@ -5154,7 +5855,7 @@ fn start_video_preview(ui: &MainWindow, path: &str) {
 #[cfg(not(windows))]
 fn start_video_preview(_ui: &MainWindow, _path: &str) {}
 
-/// 视频原生分辨率就绪：把预览卡片调整为视频宽高比并对齐播放子窗口
+/// 视频原生分辨率就绪：更新副标题并显示播放器（窗口尺寸已在打开前探测）
 #[cfg(windows)]
 fn on_video_size_ready(ui: &MainWindow, vw: u32, vh: u32) {
     let st = ui.global::<AppState>();
@@ -5162,19 +5863,35 @@ fn on_video_size_ready(ui: &MainWindow, vw: u32, vh: u32) {
     if !st.get_quicklook_open() || st.get_ql_kind() != 4 {
         return;
     }
-    st.set_ql_img_w(vw as i32);
-    st.set_ql_img_h(vh as i32);
-    // 副标题前缀分辨率（与图片预览格式一致）
-    let sub = st.get_ql_subtitle().to_string();
-    let res = format!("{}×{}", vw, vh);
-    if !sub.starts_with(&res) {
-        st.set_ql_subtitle(format!("{} 像素 · {}", res, sub).into());
+
+    // 探测失败时才记录媒体真实分辨率（探测成功在 ui_bridge 已记录）。
+    // 此时还需更新字幕：ui_bridge 探测失败时字幕只有「视频文件 · 30.5 MB」，
+    // 现在媒体就绪拿到真实尺寸后补上分辨率前缀。
+    if st.get_ql_img_w() == 0 {
+        st.set_ql_img_w(vw as i32);
+        st.set_ql_img_h(vh as i32);
+        // 只有探测失败（宽度为 0）时才需要添加分辨率前缀
+        let sub = st.get_ql_subtitle().to_string();
+        let res = format!("{}×{}", vw, vh);
+        if !sub.starts_with(&res) {
+            let sub = format!("{} 像素 · {}", res, sub);
+            st.set_ql_subtitle(sub.clone().into());
+            if let Some(pw) = preview_host::window() {
+                preview_host::set_subtitle(&pw, &sub);
+            }
+        }
     }
-    ui_bridge::apply_ql_card_size(ui, 4, vw as i32, vh as i32, false);
+
+    // 媒体就绪：关闭加载动画，显示播放器和控制栏
+    st.set_ql_loading(false);
+    if let Some(pw) = preview_host::window() {
+        preview_host::set_loading(&pw, false);
+    }
+    crate::fs::video_preview::reveal();
     if let Some(rect) = if st.get_ql_video_fullscreen() {
-        quicklook_fullscreen_rect_phys(ui)
+        quicklook_fullscreen_rect_phys()
     } else {
-        quicklook_content_rect_phys(ui)
+        preview_content_rect_phys(ui)
     } {
         fs::video_preview::reposition(rect);
     }
@@ -5184,10 +5901,11 @@ fn on_video_size_ready(ui: &MainWindow, vw: u32, vh: u32) {
 /// 运行时不可用时回退源码视图并提示。
 #[cfg(windows)]
 fn start_web_preview(ui: &MainWindow, path: &str) {
-    let Some(rect) = quicklook_content_rect_phys(ui) else {
+    let Some(rect) = preview_content_rect_phys(ui) else {
         return;
     };
-    let hwnd = main_hwnd(ui);
+    // WebView2 控制器挂到独立预览窗口
+    let hwnd = preview_hwnd();
     if hwnd == 0 {
         return;
     }
@@ -5203,7 +5921,10 @@ fn start_web_preview(ui: &MainWindow, path: &str) {
     if !ok {
         let st = ui.global::<AppState>();
         st.set_ql_web_mode(false);
-        ui_bridge::apply_ql_card_size(ui, st.get_ql_kind(), 0, 0, false);
+        // 回退源码视图：同步到预览窗口，让其显示高亮文本层
+        if let Some(pw) = preview_host::window() {
+            pw.global::<PreviewState>().set_web_mode(false);
+        }
         st.set_status_text("渲染视图不可用（需要 WebView2 运行时），已切换到源码视图".into());
     }
 }
@@ -5382,6 +6103,12 @@ fn restore_window_geometry(
         if maximized {
             ui.set_window_maximized(true);
         }
+        // 恢复几何（尺寸/位置/最大化）都会触发 WM_NCCALCSIZE / FRAMECHANGED，
+        // DWM 借此重算非客户区并丢弃边框延伸与亚克力策略。本函数的重试可能落在
+        // schedule_window_effects 的最后一次（800ms）之后，冷启动便表现为
+        // 「磨砂全丢、窗口全透明」。故几何落地后补一轮窗口效果。
+        #[cfg(windows)]
+        schedule_window_effects(ui, &[0, 60, 240]);
         return;
     }
     // winit 窗口尚未创建（with_winit_window 未执行闭包）：稍后重试
@@ -5429,13 +6156,18 @@ fn apply_current_window_effects(ui: &MainWindow) {
     // 原生边缘 resize hook（幂等）：winit 窗口可能晚于首个定时器创建，
     // 借助与 DWM 效果相同的重试序列，确保窗口就绪后完成安装
     install_native_resize(ui);
+    // 无条件剥离 WS_CAPTION | WS_SYSMENU：winit 无边框窗口仍会带上它们，Windows 11 DWM
+    // 据此自绘一套原生标题栏按钮（最小化/最大化/关闭），与本程序自绘按钮重叠成「两套」，
+    // 并在延伸边框后于客户区顶部合成一条原生标题栏玻璃带（表现为窗口顶部莫名的半透明条）。
+    //
+    // 必须排在 DWM 效果之前：剥离样式要用 SetWindowPos(SWP_FRAMECHANGED) 通知系统重算
+    // 非客户区，而这次重算会连带清掉 DwmExtendFrameIntoClientArea 的边框延伸与
+    // SetWindowCompositionAttribute 的亚克力策略。此前顺序相反（先材质后剥离），
+    // 冷启动的重试序列里最后一步总是 FRAMECHANGED，把刚设好的磨砂清成全透明，
+    // 用户须手动重开一次模糊度/半透明才恢复。改为先剥离、后设材质，材质总是最后落地。
+    strip_native_caption_buttons(ui);
     apply_window_round_corners(ui);
     apply_window_material(ui);
-    // 无条件剥离 WS_SYSMENU：winit 无边框窗口仍会带上 WS_SYSMENU，Windows 11 DWM
-    // 据此自绘一套原生标题栏按钮（最小化/最大化/关闭），与本程序自绘按钮重叠成「两套」。
-    // 此前仅在半透明（延伸边框）时剥离，导致默认非透明模式下原生按钮在最大化/DPI
-    // 变更等触发 DWM 重算后重现。此处随重试序列与最大化 80ms 补刷一并调用，恒久消除。
-    strip_native_caption_buttons(ui);
 }
 
 #[cfg(windows)]
@@ -5565,11 +6297,10 @@ fn apply_acrylic_backdrop(ui: &MainWindow, translucent: bool) {
         }
     });
 
-    // 把边框延伸到整个客户区会重新启用 DWM 非客户区绘制，导致系统又画出一套
-    // Windows 11 原生标题栏按钮。延伸边框后立即剥离 WS_SYSMENU 消除它们。
-    if translucent {
-        strip_native_caption_buttons(ui);
-    }
+    // 注意：这里不再回头调用 strip_native_caption_buttons。剥离样式必然伴随
+    // SWP_FRAMECHANGED，会把上面刚设好的边框延伸连同随后的亚克力策略一起清掉。
+    // 剥离已提前到 apply_current_window_effects 的第一步，且做了幂等短路，
+    // WS_CAPTION | WS_SYSMENU 在窗口整个生命周期内保持剥离状态，无需在此重复。
 }
 
 /// 通过非公开 API `SetWindowCompositionAttribute`（user32.dll 导出，TranslucentTB、
@@ -5720,9 +6451,15 @@ fn strip_native_caption_buttons(ui: &MainWindow) {
         if let RawWindowHandle::Win32(h) = handle.as_raw() {
             let hwnd = isize::from(h.hwnd) as HWND;
             unsafe {
-                let mut style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-                style &= !((WS_CAPTION | WS_SYSMENU) as isize);
-                SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                let stripped = style & !((WS_CAPTION | WS_SYSMENU) as isize);
+                // 幂等：样式位已经是目标值时直接返回，不再触发 SWP_FRAMECHANGED。
+                // 这次重算会清掉 DWM 的边框延伸与亚克力策略，重试序列/最大化补刷里
+                // 每次都无条件发一遍，等于反复把刚设好的磨砂清掉。
+                if stripped == style {
+                    return;
+                }
+                SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
                 // 通知系统样式变更并重算非客户区，使原生按钮立即消失
                 SetWindowPos(
                     hwnd,
