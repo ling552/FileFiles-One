@@ -255,15 +255,12 @@ mod win_impl {
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
         MoveWindow, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
         ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOP, LWA_ALPHA,
-        SW_SHOWNOACTIVATE, WM_KEYDOWN,
+        SW_SHOWNOACTIVATE, WM_KEYDOWN, WM_MOUSEWHEEL,
         MA_NOACTIVATE, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, WNDCLASSW,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WINDOW_EX_STYLE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WS_CHILD,
         WS_CLIPSIBLINGS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
-
-    /// STATIC 控件的 SS_BLACKRECT 样式：黑色矩形填充，免自绘视频底色
-    const SS_BLACKRECT_STYLE: u32 = 0x0004;
 
     const CONTROL_H: i32 = 48;
 
@@ -274,6 +271,8 @@ mod win_impl {
         paused: bool,
         muted: bool,
         visible: bool,
+        /// 音量百分比 0..100（滚轮调节时短暂显示在控制条时间区）
+        volume: i32,
     }
 
     struct ControlWindowData {
@@ -293,7 +292,11 @@ mod win_impl {
             paused: false,
             muted: false,
             visible: true,
+            volume: 100,
         }) };
+        /// 音量反馈显示截止时间：滚轮调节后 1.2s 内控制条时间区改显音量百分比。
+        /// 控制条每 250ms 轮询重绘，到期后自然恢复时间显示，无需额外定时器。
+        static VOLUME_FLASH_UNTIL: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
         /// 最近一次 reposition 的矩形（宿主客户区坐标，物理像素）。
         /// 宿主纯移动时尺寸不变，只需用它重算控制条的屏幕坐标。
         static LAST_RECT: Cell<(i32, i32, i32, i32)> = const { Cell::new((0, 0, 0, 0)) };
@@ -391,13 +394,23 @@ mod win_impl {
         LAST_RECT.with(|c| c.set(rect));
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
+        let class: Vec<u16> = "FileFilesOneVideoHost"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let url: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
-            // 黑底子窗口承载视频画面（SS_BLACKRECT 静态控件免自绘背景）。
+            // 自定义窗口类（而非系统 STATIC）：窗口过程需接收 WM_MOUSEWHEEL 调节音量，
+            // STATIC 类会把滚轮消息直接丢弃。黑色背景笔刷替代 SS_BLACKRECT 免自绘底色。
+            let mut wc = WNDCLASSW::default();
+            wc.style = CS_HREDRAW | CS_VREDRAW;
+            wc.lpfnWndProc = Some(video_wnd_proc);
+            wc.hbrBackground = CreateSolidBrush(COLORREF(0));
+            wc.lpszClassName = PCWSTR(class.as_ptr());
+            let _ = RegisterClassW(&wc);
             // 不带 WS_VISIBLE：媒体就绪前保持隐藏，让 Slint 的加载动画可见
             // （原生子窗口会盖住同区域的 Slint 绘制，一开就显示等于黑屏等待）。
-            let style = WS_CHILD | WS_CLIPSIBLINGS | WINDOW_STYLE(SS_BLACKRECT_STYLE);
+            let style = WS_CHILD | WS_CLIPSIBLINGS;
             let hwnd = match CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 PCWSTR(class.as_ptr()),
@@ -457,7 +470,9 @@ mod win_impl {
                 paused: false,
                 muted: false,
                 visible: true,
+                volume: 100,
             }));
+            VOLUME_FLASH_UNTIL.with(|t| t.set(None));
         }
         true
     }
@@ -596,6 +611,59 @@ mod win_impl {
         "FileFilesOneVideoControls".encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// 视频画面子窗口过程：滚轮调节音量（STATIC 类会丢弃滚轮消息，故用自定义类）。
+    unsafe extern "system" fn video_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            // 滚轮调音量：WHEEL_DELTA=120/格，每格 5% 音量
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
+                adjust_volume(delta * 0.05);
+                LRESULT(0)
+            }
+            // 与控制条一致：点击画面不抢占焦点，空格/Esc 仍由 Slint 预览窗口处理
+            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// 滚轮音量调节：在当前音量上累加 delta（±0.05/格），夹紧 0..1；
+    /// 静音状态下上调自动取消静音，保证调节即刻可听。
+    /// 调节后 1.2s 内控制条时间区改显音量百分比作为反馈。
+    fn adjust_volume(delta: f32) {
+        ACTIVE.with(|a| {
+            let Some((player, _, controls_hwnd)) = a.borrow().as_ref().cloned() else {
+                return;
+            };
+            unsafe {
+                let cur = player.GetVolume().unwrap_or(1.0);
+                let muted = player.GetMute().unwrap_or_default().as_bool();
+                let vol = (cur + delta).clamp(0.0, 1.0);
+                if delta > 0.0 && muted {
+                    let _ = player.SetMute(false);
+                }
+                let _ = player.SetVolume(vol);
+                CONTROL_STATE.with(|s| {
+                    let mut st = s.get();
+                    st.volume = (vol * 100.0).round() as i32;
+                    s.set(st);
+                });
+                VOLUME_FLASH_UNTIL.with(|t| {
+                    t.set(Some(std::time::Instant::now() + std::time::Duration::from_millis(1200)))
+                });
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(
+                    Some(HWND(controls_hwnd as *mut core::ffi::c_void)),
+                    None,
+                    false,
+                );
+            }
+        });
+    }
+
     unsafe fn create_controls_window(
         parent: HWND,
         callbacks: super::ControlCallbacks,
@@ -692,6 +760,12 @@ mod win_impl {
                 set_dragging(hwnd, false);
                 LRESULT(0)
             }
+            // 控制条上滚轮同样调节音量（与画面区手感一致）
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / 120.0;
+                adjust_volume(delta * 0.05);
+                LRESULT(0)
+            }
             // 兜底：焦点若意外落到控制条，空格/Esc 本会被 DefWindowProc 吞掉，
             // 这里转发到关闭回调，保证按键手感与预览窗口一致。
             WM_KEYDOWN if wparam.0 == VK_SPACE_CODE || wparam.0 == VK_ESCAPE_CODE => {
@@ -783,10 +857,17 @@ mod win_impl {
         );
         let _ = SelectObject(hdc, old_font);
         let _ = DeleteObject(icon_font.into());
-        let safe_pos = state.position.max(0);
-        let mut time = format!("{:02}:{:02}", safe_pos / 60, safe_pos % 60)
-            .encode_utf16()
-            .collect::<Vec<_>>();
+        // 滚轮调节后 1.2s 内时间区改显音量百分比（控制条 250ms 轮询重绘，到期自动恢复）
+        let flashing = VOLUME_FLASH_UNTIL
+            .with(|t| t.get())
+            .is_some_and(|until| std::time::Instant::now() < until);
+        let label = if flashing {
+            format!("音量 {}%", state.volume)
+        } else {
+            let safe_pos = state.position.max(0);
+            format!("{:02}:{:02}", safe_pos / 60, safe_pos % 60)
+        };
+        let mut time = label.encode_utf16().collect::<Vec<_>>();
         let mut timer = RECT {
             left: width - 126,
             top: 0,
@@ -943,6 +1024,7 @@ mod win_impl {
                 paused,
                 muted,
                 visible: s.get().visible,
+                volume: s.get().volume,
             })
         });
         ACTIVE.with(|a| {

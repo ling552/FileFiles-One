@@ -836,11 +836,13 @@ fn load_current(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         {
             let mut c = core.borrow_mut();
             let folders_first = c.config.settings.folders_first;
+            let prev = selected_path_set(c.active_tab());
             let tab = c.active_tab_mut();
             tab.entries = entries;
             tab.folders_first = folders_first;
             tab.search.clear();
             tab.rebuild();
+            restore_selection_by_path(tab, &prev);
         }
         {
             let c = core.borrow();
@@ -872,11 +874,13 @@ fn load_current(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     match ops::read_dir(&path, show_hidden, show_protected) {
         Ok(entries) => {
             let mut c = core.borrow_mut();
+            let prev = selected_path_set(c.active_tab());
             let tab = c.active_tab_mut();
             tab.entries = entries;
             tab.folders_first = folders_first;
             tab.search.clear();
             tab.rebuild();
+            restore_selection_by_path(tab, &prev);
         }
         Err(e) => {
             let st = ui.global::<AppState>();
@@ -956,6 +960,41 @@ fn reload_current_soft(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     let c = core.borrow();
     ui_bridge::push_entries(ui, &c);
     ui_bridge::push_tabs(ui, &c);
+}
+
+/// 右面板「软刷新」：与 reload_current_soft 同语义——重读目录并推送 UI，
+/// 保留搜索词与按路径恢复选中，且不退出行内重命名。
+/// 供 Shell 菜单新建后的延迟补刷使用：硬刷新会清掉刚建立的选中/重命名。
+fn reload_right_soft(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
+    let path = core.borrow().right_pane.history.current().clone();
+    if fs::virtualfs::is_virtual(&path.to_string_lossy()) {
+        return;
+    }
+    let (show_hidden, show_protected, folders_first) = {
+        let c = core.borrow();
+        (
+            c.config.settings.show_hidden,
+            c.config.settings.show_protected,
+            c.config.settings.folders_first,
+        )
+    };
+    let entries = match ops::read_dir(&path, show_hidden, show_protected) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    {
+        let mut c = core.borrow_mut();
+        let prev = selected_path_set(&c.right_pane);
+        let tab = &mut c.right_pane;
+        tab.entries = entries;
+        tab.folders_first = folders_first;
+        tab.rebuild();
+        restore_selection_by_path(tab, &prev);
+    }
+    ui_bridge::push_right(ui, &core.borrow());
+    if toolbar_routes_right(ui) {
+        ui_bridge::update_selection_pane(ui, &core.borrow(), true);
+    }
 }
 
 /// 初始化当前目录实时监听：绑定 `auto-refresh` 回调到软刷新，创建 `DirWatcher`
@@ -1685,6 +1724,8 @@ fn rename_in_pane(
         .pane_entry_at(right, idx as usize)
         .map(|e| PathBuf::from(&e.path));
     let trimmed = new_name.trim();
+    // 重命名成功后的新路径：reload 后重新选中（资源管理器同款：重命名后保持选中）
+    let mut renamed_to: Option<PathBuf> = None;
     // 名称未变（含清空或仅空白差异）：直接退出编辑，跳过文件系统重命名与全目录重载。
     // 点击别处退出重命名时按下层 pointer-event 会触发本提交，若每次都 reload 整个目录
     // （重读目录 + 重建模型 + 图标缓存查询）在大目录下明显卡顿；名称未变时无需任何副作用。
@@ -1730,6 +1771,7 @@ fn rename_in_pane(
                     if c.borrow().config.settings.background_index {
                         fs::index::rename_path(&old, &new_path);
                     }
+                    renamed_to = Some(new_path);
                 }
                 Err(error) => {
                     let args = vec![old.as_os_str().to_os_string(), new_name.into()];
@@ -1760,6 +1802,10 @@ fn rename_in_pane(
             load_right(ui, c);
         } else {
             load_current(ui, c);
+        }
+        // 重命名后的条目按新路径重新选中，保持「一直选中直到取消」
+        if let Some(p) = renamed_to {
+            select_completed_paths(ui, c, right, &[p]);
         }
     }
 }
@@ -1810,6 +1856,31 @@ fn schedule_pane_reloads(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, delays_ms
 fn norm_path_key(s: &str) -> String {
     let s = s.strip_prefix(r"\\?\").unwrap_or(s);
     s.trim_end_matches(['/', '\\']).to_string()
+}
+
+/// 刷新前选中路径快照（归一化键集合），供重建后按路径恢复选中。
+fn selected_path_set(tab: &app::TabSession) -> std::collections::HashSet<String> {
+    tab.selected_paths()
+        .iter()
+        .map(|p| norm_path_key(&p.to_string_lossy()))
+        .collect()
+}
+
+/// 目录重载后按路径恢复选中：选中状态保持到用户主动取消为止，
+/// 刷新/补刷/重命名提交等一切 reload 都不再偷选；
+/// 导航到新目录时路径不匹配自然为空，保持原有导航语义。
+fn restore_selection_by_path(tab: &mut app::TabSession, prev: &std::collections::HashSet<String>) {
+    if prev.is_empty() {
+        return;
+    }
+    for fi in 0..tab.filtered.len() {
+        if tab
+            .entry_at(fi)
+            .is_some_and(|e| prev.contains(&norm_path_key(&e.path)))
+        {
+            tab.selected[fi] = true;
+        }
+    }
 }
 
 /// 给定面板当前目录的磁盘快照（归一化后的路径集合）。
@@ -1901,10 +1972,11 @@ fn schedule_reload_selecting_new(
         slint::Timer::single_shot(std::time::Duration::from_millis(delay), move || {
             let Some(ui) = w.upgrade() else { return };
             if done.get() {
+                // 已选中新项：后续补刷改走软刷新，保留选中状态与进行中的重命名
                 if right {
-                    load_right(&ui, &c);
+                    reload_right_soft(&ui, &c);
                 } else {
-                    load_current(&ui, &c);
+                    reload_current_soft(&ui, &c);
                 }
                 return;
             }
@@ -2036,11 +2108,13 @@ fn load_right(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     match ops::read_dir(&path, show_hidden, show_protected) {
         Ok(entries) => {
             let mut c = core.borrow_mut();
+            let prev = selected_path_set(&c.right_pane);
             let t = &mut c.right_pane;
             t.entries = entries;
             t.folders_first = folders_first;
             t.search.clear();
             t.rebuild();
+            restore_selection_by_path(t, &prev);
         }
         Err(e) => {
             ui.global::<AppState>()
@@ -3466,14 +3540,14 @@ fn bind_click_rename(ui: &MainWindow, _core: &Rc<RefCell<AppCore>>) {
         let p2 = p.clone();
         let g2 = g.clone();
         let w2 = w.clone();
-        // 使用 Windows 当前双击时间，避免固定延迟在用户自定义双击速度下误判。
-        // 略加 20ms 让 Slint 的 double-clicked 回调有机会先取消挂起请求。
+        // 使用 Windows 当前双击时间并额外加宽 300ms 识别窗口：
+        // 保证慢速双击/误触不会在打开的同时抢入重命名状态。
         #[cfg(windows)]
         let delay_ms = unsafe {
-            windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() as u64 + 20
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() as u64 + 300
         };
         #[cfg(not(windows))]
-        let delay_ms = 520;
+        let delay_ms = 800;
         t.start(
             slint::TimerMode::SingleShot,
             Duration::from_millis(delay_ms),

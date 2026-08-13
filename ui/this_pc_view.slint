@@ -16,12 +16,11 @@ export component ThisPcView inherits Rectangle {
     clip: true;
 
     // 平铺卡片尺寸随图标缩放（Ctrl+滚轮）
-    // tile-h 增至 82px：确保名称(13px行高) + 容量条(5px) + 副标题(11px行高) + 间距
-    // 在 10px*2 padding 内完整显示，不再纵向截断
-    property <length> tile-w: 248px * AppState.icon-scale;
-    // 名称(18px)+间距(4px)+容量条(5px)+间距(4px)+副标题(15px)+上下padding(20px) = 66px 为文字内容所需的最小高度，
-    // 与固定字号一同不随 icon-scale 缩小，避免小缩放时卡片高度不够而被裁切（见下方 Text 的固定 height）
-    property <length> tile-h: max(82px * AppState.icon-scale, 74px);
+    // 布局：首行 [图标 | 名称 | 占用比(底部对齐→紧贴容量条上方最右侧)]，
+    // 次行容量条全宽，末行副标题。占用比不单独占行，卡片不增高。
+    property <length> tile-w: max(280px * AppState.icon-scale, 264px);
+    // 首行(图标高)+间距(4)+容量条(5)+间距(4)+副标题(15)+上下padding(20)+余量(4)
+    property <length> tile-h: max(root.icon-box + 52px, 88px * AppState.icon-scale);
     property <length> icon-box: 44px * AppState.icon-scale;
     property <length> gap: 12px;
     property <length> pitch-x: root.tile-w + root.gap;
@@ -30,14 +29,16 @@ export component ThisPcView inherits Rectangle {
     property <int> rows: ceil(AppState.entries.length / max(1, root.cols));
 
     list := ListView {
+        // 顶部 12px 留白由 ListView 整体下移提供（而非首行 padding-top），
+        // 避免首行吃掉行间距导致选中时第一、二行卡片粘连
+        y: 12px;
         width: 100%;
-        height: 100%;
+        height: root.height - 12px;
         for r in root.rows: Rectangle {
             height: root.row-h;
             HorizontalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
-                padding-top: r == 0 ? 12px : 0px;
                 spacing: root.gap;
                 alignment: start;
 
@@ -59,58 +60,78 @@ export component ThisPcView inherits Rectangle {
                                 : Theme.surface.with-alpha(Theme.card-alpha));
                         clip: true;
 
-                        HorizontalLayout {
+                        VerticalLayout {
                             padding: 10px;
-                            spacing: 10px;
-                            alignment: start;
+                            spacing: 4px;
 
-                            // 左：图标（系统图标模式回填后显示真实盘符/缩略图）
-                            VerticalLayout {
-                                alignment: center;
-                                FileIcon {
-                                    icon-class: card.entry.icon-class;
-                                    label: card.entry.icon-label;
-                                    thumb: card.entry.thumb;
-                                    has-thumb: card.entry.has-thumb;
-                                    box: root.icon-box;
+                            // 首行：左图标 | 中名称 | 右占用比(底部对齐)
+                            // 注意：勿加 alignment: start——非 stretch 对齐下名称区的
+                            // horizontal-stretch 失效，占用比会停在名称后而非最右侧
+                            HorizontalLayout {
+                                spacing: 10px;
+
+                                // 左：图标（系统图标模式回填后显示真实盘符/缩略图）
+                                VerticalLayout {
+                                    alignment: center;
+                                    FileIcon {
+                                        icon-class: card.entry.icon-class;
+                                        label: card.entry.icon-label;
+                                        thumb: card.entry.thumb;
+                                        has-thumb: card.entry.has-thumb;
+                                        box: root.icon-box;
+                                    }
+                                }
+
+                                // 中：名称（独占图标右侧空间）
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: card.entry.name;
+                                        font-size: Theme.fs-body;
+                                        font-weight: 600;
+                                        color: Theme.text;
+                                        overflow: elide;
+                                        height: 18px;
+                                    }
+                                }
+
+                                // 右：占用比，底部对齐→位于容量条正上方最右侧（不额外占行高）；
+                                // 占用 ≥90% 变红
+                                if card.entry.disk-ratio > 0: VerticalLayout {
+                                    alignment: end;
+                                    Text {
+                                        text: Math.round(card.entry.disk-ratio * 100) + "%";
+                                        font-size: Theme.fs-tiny;
+                                        color: card.entry.disk-ratio >= 0.9 ? card.entry.disk-color : Theme.subtle;
+                                        horizontal-alignment: right;
+                                        height: 14px;
+                                    }
                                 }
                             }
 
-                            // 右：名称 / 容量条 / 副标题
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 4px;
-                                horizontal-stretch: 1;
-                                Text {
-                                    text: card.entry.name;
-                                    font-size: Theme.fs-body;
-                                    font-weight: 600;
-                                    color: Theme.text;
-                                    overflow: elide;
-                                    height: 18px;
-                                }
-                                // 驱动器容量条（disk-ratio>0 时显示）
-                                if card.entry.disk-ratio > 0: Rectangle {
-                                    height: 5px;
+                            // 次行：容量条从左到右全宽（仅驱动器）
+                            if card.entry.disk-ratio > 0: Rectangle {
+                                height: 5px;
+                                border-radius: 2.5px;
+                                background: #dce6f0;
+                                clip: true;
+                                Rectangle {
+                                    x: 0;
+                                    width: parent.width * card.entry.disk-ratio;
+                                    height: parent.height;
                                     border-radius: 2.5px;
-                                    background: #dce6f0;
-                                    clip: true;
-                                    Rectangle {
-                                        x: 0;
-                                        width: parent.width * card.entry.disk-ratio;
-                                        height: parent.height;
-                                        border-radius: 2.5px;
-                                        background: card.entry.disk-color;
-                                    }
+                                    background: card.entry.disk-color;
                                 }
-                                Text {
-                                    // 驱动器显示容量副标题；其它（如便携设备）显示类型
-                                    text: card.entry.disk-ratio > 0 ? card.entry.disk-info : card.entry.kind;
-                                    font-size: Theme.fs-tiny;
-                                    color: Theme.subtle;
-                                    overflow: elide;
-                                    height: 15px;
-                                }
+                            }
+
+                            // 末行：容量副标题独占整行宽（驱动器显示容量，其它如便携设备显示类型）
+                            Text {
+                                text: card.entry.disk-ratio > 0 ? card.entry.disk-info : card.entry.kind;
+                                font-size: Theme.fs-tiny;
+                                color: card.entry.disk-ratio >= 0.9 ? card.entry.disk-color : Theme.subtle;
+                                overflow: elide;
+                                height: 15px;
                             }
                         }
                     }

@@ -42,6 +42,25 @@ export component InputOverlay inherits TouchArea {
     property <bool> press-ctrl: false;
     // 按下时是否按住 Shift：双面板模式下 Shift+拖动条目 = OLE 拖出（普通拖动为跨面板）
     property <bool> press-shift: false;
+    // 本次点击是否刚双击打开过条目：是则不再挂起单击重命名，
+    // 避免「打开文件的同时进入重命名状态」。
+    property <bool> just-opened: false;
+    // 单击重命名识别区域（仅点击名称区域才挂起重命名，点图标/其它列只选中）：
+    // grid 模式用 zone-y（名称区顶边的行内偏移）；list 模式用 zone-x0/x1（名称列左右界）。
+    // 负值表示不限制。
+    in property <length> zone-y: -1px;
+    in property <length> zone-x0: -1px;
+    in property <length> zone-x1: -1px;
+    // 点击是否落在名称区域内
+    pure function in-rename-zone(lx: length, ly: length) -> bool {
+        if (root.mode == "grid") {
+            if (root.zone-y < 0px) { return true; }
+            return root.content-y(ly) - root.row-of(ly) * root.row-h >= root.zone-y;
+        }
+        if (root.zone-x0 < 0px) { return true; }
+        if (lx < root.zone-x0) { return false; }
+        return root.zone-x1 < 0px || lx <= root.zone-x1;
+    }
 
     // 任一面板处于行内重命名时，InputOverlay 仍然保持启用以捕获点击事件。
     // 点击后先提交编辑内容，再处理正常的点击/选择逻辑。
@@ -119,11 +138,12 @@ export component InputOverlay inherits TouchArea {
 
     double-clicked => {
         // 双击打开优先于「二次单击重命名」：取消可能刚挂起的重命名再打开。
-        // 挂起由 Rust 延迟提交（约 280ms），双击在此窗口内到达即取消，从而避免
-        // 双击打开时先闪一下重命名输入框。
+        // 挂起由 Rust 延迟提交，双击在此窗口内到达即取消，从而避免
+        // 双击打开时先闪一下重命名框。
         AppState.cancel-click-rename();
         AppState.editing-index = -1;
         AppState.r-editing-index = -1;
+        root.just-opened = true;
         if (root.hit-idx(self.mouse-x, self.mouse-y) >= 0) {
             root.do-open(root.hit-idx(self.mouse-x, self.mouse-y));
         }
@@ -182,6 +202,7 @@ export component InputOverlay inherits TouchArea {
         if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
             // 新的按下取消任何挂起的「单击重命名」：点击别处或换项后不应再进入重命名
             AppState.cancel-click-rename();
+            root.just-opened = false;
             // 新的按下重置框选状态缓存
             root.last-box-x0 = 0px;
             root.last-box-y0 = 0px;
@@ -228,7 +249,10 @@ export component InputOverlay inherits TouchArea {
                         // 「单击打开文件夹」：单击目录直接进入（等同双击）
                         root.do-open(root.press-idx);
                     } else if (AppState.set-click-rename && !AppState.set-single-click
-                               && plain && already-selected) {
+                               && plain && already-selected
+                               // 双击打开的同一次点击不挂起重命名；且仅点击名称区域才识别
+                               && !root.just-opened
+                               && root.in-rename-zone(root.press-x, root.press-y)) {
                         // 「选中后单击重命名」：单击「已选中」的单个项（文件或文件夹）挂起重命名。
                         // 不立即进入编辑：若该次点击实为双击的前半，double-clicked 会取消挂起并打开，
                         // 避免双击打开时先闪重命名框。延迟提交由 Rust 用 Timer 实现。

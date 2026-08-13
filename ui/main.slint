@@ -44,6 +44,19 @@ component WinCtrlBtn inherits Rectangle {
     }
 }
 
+// 空白点击条带：重命名期间「点击输入框外」提交编辑并归还焦点。
+// 顶层若用单个全屏 TouchArea 会连重命名框内的点击一并吞掉（无法点击定位光标），
+// 故用四条条带拼出「全屏减去输入框矩形」：洞内点击下落到 TextInput。
+// 洞矩形由 RenameEdit 实时上报（edit-hole-*），无编辑时洞为 0 → 下条带覆盖全屏。
+component BlurStrip inherits TouchArea {
+    callback blur();
+    pointer-event(ev) => {
+        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+            root.blur();
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "FileFiles One";
     preferred-width: 1280px;
@@ -558,16 +571,56 @@ export component MainWindow inherits Window {
     // 于是「点击别处退出重命名」的第一次点击只做失焦、不提交，编辑框失焦但仍在
     // 显示，表现为需要再点一次才回到正常显示的中间态。故此处必须同样提交并退出
     // 编辑（与 InputOverlay 共用 commit-pending-rename），使任意一次点击都一步到位。
-    blur-touch := TouchArea {
-        width: 100%;
-        height: 100%;
+    // 空白点击层：四条 BlurStrip 拼出全屏（重命名输入框矩形处挖洞）。
+    // 启用时位于最上层并吞掉该次点击（下层 InputOverlay 收不到）；
+    // 与 InputOverlay 共用 commit-pending-rename，使「点击别处退出重命名」一步到位。
+    // 洞内（输入框）点击则下落到 TextInput，光标随点击定位。
+    BlurStrip {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: max(0px, AppState.edit-hole-y);
         enabled: AppState.input-active;
-        pointer-event(ev) => {
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
-                AppState.commit-pending-rename();
-                AppState.input-blur-token = AppState.input-blur-token + 1;
-                key-scope.focus();
-            }
+        blur => {
+            AppState.commit-pending-rename();
+            AppState.input-blur-token = AppState.input-blur-token + 1;
+            key-scope.focus();
+        }
+    }
+    BlurStrip {
+        x: 0px;
+        y: AppState.edit-hole-y + AppState.edit-hole-h;
+        width: root.width;
+        height: max(0px, root.height - self.y);
+        enabled: AppState.input-active;
+        blur => {
+            AppState.commit-pending-rename();
+            AppState.input-blur-token = AppState.input-blur-token + 1;
+            key-scope.focus();
+        }
+    }
+    BlurStrip {
+        x: 0px;
+        y: AppState.edit-hole-y;
+        width: max(0px, AppState.edit-hole-x);
+        height: AppState.edit-hole-h;
+        enabled: AppState.input-active;
+        blur => {
+            AppState.commit-pending-rename();
+            AppState.input-blur-token = AppState.input-blur-token + 1;
+            key-scope.focus();
+        }
+    }
+    BlurStrip {
+        x: AppState.edit-hole-x + AppState.edit-hole-w;
+        y: AppState.edit-hole-y;
+        width: max(0px, root.width - self.x);
+        height: AppState.edit-hole-h;
+        enabled: AppState.input-active;
+        blur => {
+            AppState.commit-pending-rename();
+            AppState.input-blur-token = AppState.input-blur-token + 1;
+            key-scope.focus();
         }
     }
 
@@ -582,6 +635,11 @@ export component MainWindow inherits Window {
         changed ei => {
             if (self.ei < 0) {
                 AppState.input-active = false;
+                // 两侧均退出编辑时清零挖洞矩形，恢复全屏空白点击层
+                if (AppState.r-editing-index < 0) {
+                    AppState.edit-hole-w = 0px;
+                    AppState.edit-hole-h = 0px;
+                }
                 key-scope.focus();
             }
         }
@@ -589,6 +647,10 @@ export component MainWindow inherits Window {
         changed rei => {
             if (self.rei < 0) {
                 AppState.input-active = false;
+                if (AppState.editing-index < 0) {
+                    AppState.edit-hole-w = 0px;
+                    AppState.edit-hole-h = 0px;
+                }
                 key-scope.focus();
             }
         }

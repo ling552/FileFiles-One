@@ -37,6 +37,19 @@ export component RenameEdit inherits Rectangle {
     // 条件实例化下每次进入编辑都是新实例，无需再监听状态变化重新装填。
     property <bool> armed: true;
 
+    // 把输入框的窗口坐标矩形上报到全局，供顶层空白点击层「挖洞」：
+    // 洞内点击落到本输入框（光标随点击定位），洞外点击提交重命名。
+    // 滚动/换行伸长会改变绝对位置与尺寸，均需重新上报。
+    function report-hole() {
+        AppState.edit-hole-x = self.absolute-position.x;
+        AppState.edit-hole-y = self.absolute-position.y;
+        AppState.edit-hole-w = self.width;
+        AppState.edit-hole-h = self.height;
+    }
+    changed absolute-position => { root.report-hole(); }
+    changed width => { root.report-hole(); }
+    changed height => { root.report-hole(); }
+
     border-radius: 3px;
     border-width: 1px;
     border-color: Theme.selection-border;
@@ -70,6 +83,12 @@ export component RenameEdit inherits Rectangle {
                 root.cancel();
                 return accept;
             }
+            // 回车确认重命名：多行模式下 TextInput 默认把回车当换行插入，
+            // 这里统一拦截为提交（单行模式拦截后 accepted 不再重复触发）
+            if (ev.text == Key.Return) {
+                root.commit(self.text);
+                return accept;
+            }
             return reject;
         }
         accepted => {
@@ -85,6 +104,8 @@ export component RenameEdit inherits Rectangle {
             edit.focus();
             // 只选主名不含扩展名（rename-name-len 为字节偏移，由 Rust 端 name-select-len 算出）
             edit.set-selection-offsets(0, AppState.rename-name-len);
+            // 首帧布局完成后上报矩形（changed 回调不覆盖初始值）
+            root.report-hole();
         }
     }
 }

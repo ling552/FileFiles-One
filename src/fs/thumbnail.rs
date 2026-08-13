@@ -202,6 +202,24 @@ pub fn load_cached_request(request: &IconRequest, size: u32) -> Option<Arc<IconP
         }
         (IconRequest::Device, _) => extract_device_icon(size),
     };
+    // 全部提取路径失败时的最终回退：Shell Stock 图标（文件夹/文档），
+    // 保证行内始终显示系统图标而非内置矢量图
+    let raw = match raw {
+        Some(r) => Some(r),
+        None => {
+            let is_dir = matches!(
+                request,
+                IconRequest::RealPath {
+                    is_dir: true,
+                    ..
+                } | IconRequest::Type {
+                    is_dir: true,
+                    ..
+                }
+            );
+            stock_fallback(is_dir, size)
+        }
+    };
     let (pixels, w, h) = valid_icon(raw)?;
     let arc = Arc::new(IconPixels { pixels, w, h });
     match kind {
@@ -247,6 +265,13 @@ pub fn load_cached(path: &str, is_dir: bool, mtime: i64, size: u32) -> Option<Ar
 #[cfg(not(windows))]
 pub fn load_cached(_path: &str, _is_dir: bool, _mtime: i64, _size: u32) -> Option<Arc<IconPixels>> {
     None
+}
+
+/// 提取全部失败时的 Stock 回退：文件夹 → SIID_FOLDER，文件 → SIID_DOCNOASSOC（通用文档图标）。
+#[cfg(windows)]
+fn stock_fallback(is_dir: bool, size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use windows::Win32::UI::Shell::{SIID_DOCNOASSOC, SIID_FOLDER};
+    extract_stock(if is_dir { SIID_FOLDER } else { SIID_DOCNOASSOC }, size)
 }
 
 /// 按"具体路径"提取特殊系统文件夹（桌面/下载/文档等）的专属图标。
@@ -297,7 +322,7 @@ pub fn extract(path: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
     };
     use windows::Win32::UI::Shell::{
         IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
-        SIIGBF_RESIZETOFIT,
+        SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
     };
 
     // 本线程初始化 COM（后台线程必须）；已初始化时返回 S_FALSE，忽略即可。
@@ -313,7 +338,9 @@ pub fn extract(path: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
         let factory: IShellItemImageFactory =
             SHCreateItemFromParsingName(windows::core::PCWSTR(wide.as_ptr()), None).ok()?;
 
-        // 请求缩略图/图标位图；RESIZETOFIT 保持纵横比，BIGGERSIZEOK 允许更大尺寸以提清晰度
+        // 请求缩略图/图标位图；RESIZETOFIT 保持纵横比，BIGGERSIZEOK 允许更大尺寸以提清晰度。
+        // 缩略图提供器失败（部分格式缺失/损坏/被占用）时改用 ICONONLY 取类型关联图标，
+        // 避免「部分文件」因提取失败而永远停留在内置矢量图。
         let hbitmap = factory
             .GetImage(
                 SIZE {
@@ -322,6 +349,15 @@ pub fn extract(path: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
                 },
                 SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK,
             )
+            .or_else(|_| {
+                factory.GetImage(
+                    SIZE {
+                        cx: size as i32,
+                        cy: size as i32,
+                    },
+                    SIIGBF_ICONONLY,
+                )
+            })
             .ok()?;
 
         if hbitmap.is_invalid() {

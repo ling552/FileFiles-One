@@ -271,6 +271,10 @@ export global AppState {
     callback cancel-click-rename();
     // 正在重命名编辑的条目下标（-1 表示无）。全局统一管理，避免各视图各持一份导致状态不同步
     in-out property <int> editing-index: -1;
+    // 左/右面板当前选中条目数（Rust 在选中变化/推送条目时维护）。
+    // 网格视图据此决定选中卡片是否展开完整名称：仅单选时展开，多选保持两行裁切。
+    in-out property <int> selected-count: 0;
+    in-out property <int> r-selected-count: 0;
     // 右面板正在重命名编辑的条目下标（-1 表示无）。与 editing-index 独立，
     // 避免双面板下同下标条目同时进入编辑
     in-out property <int> r-editing-index: -1;
@@ -278,6 +282,13 @@ export global AppState {
     in-out property <string> rename-text;
     // 右面板重命名输入框中的文本
     in-out property <string> r-rename-text;
+    // 进行中重命名输入框的窗口坐标矩形（RenameEdit 实时上报）。
+    // 顶层空白点击层据此在该矩形上「挖洞」：洞内点击落到输入框（光标随点击定位），
+    // 洞外点击仍由空白点击层吞掉并提交重命名。
+    in-out property <length> edit-hole-x;
+    in-out property <length> edit-hole-y;
+    in-out property <length> edit-hole-w;
+    in-out property <length> edit-hole-h;
     // 提交并退出任一面板正在进行的行内重命名（无编辑进行时为空操作）。
     // 供所有「点击别处即退出编辑」的入口共用（InputOverlay 的指针按下、
     // 主窗口的失焦点击层 blur-touch），保证任意一次点击都能一步退出编辑态：

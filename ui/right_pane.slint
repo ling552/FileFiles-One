@@ -13,6 +13,8 @@ component RightList inherits Rectangle {
     callback request-context-menu(int, length, length);
     property <length> scaled-row-h: Theme.row-h * AppState.icon-scale;
     property <length> icon-box: 18px * AppState.icon-scale;
+    // 日期列固定宽：行内改为绝对定位后，名称区/重命名覆盖层几何可精确计算
+    property <length> date-w: 110px;
 
     // 滚动重置：右面板导航新目录时归零 viewport-y
     property <int> scroll-token: AppState.r-scroll-top-token;
@@ -31,54 +33,41 @@ component RightList inherits Rectangle {
             // 默认 stretch 布局（勿加 alignment: start——非 stretch 对齐下
             // 名称区包裹 Rectangle 的首选宽为 0，文件名会整体塌缩不可见）：
             // 图标与日期取首选宽，名称区经 horizontal-stretch: 1 占满剩余空间
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
-                spacing: 10px;
-
-                FileIcon {
-                    icon-class: entry.icon-class;
-                    label: entry.icon-label;
-                    thumb: entry.thumb;
-                    has-thumb: entry.has-thumb;
-                    compact: true;
-                    box: root.icon-box;
-                    y: (parent.height - root.icon-box) / 2;
-                }
-                // 名称区：正常显示文本，进入行内重命名（r-editing-index 命中）时换成输入框
-                Rectangle {
-                    horizontal-stretch: 1;
-                    if AppState.r-editing-index != i: cell-name-text := Text {
-                        width: 100%;
-                        height: 100%;
-                        text: entry.name;
-                        font-size: Theme.fs-small;
-                        color: Theme.text;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    if AppState.r-editing-index == i: RenameEdit {
-                        width: 100%;
-                        y: (parent.height - self.height) / 2;
-                        multiline: false;   // 列表模式保持单行
-                        text: entry.name;
-                        font-size: Theme.fs-small;
-                        // 文本变化时保存到全局
-                        text-changed(t) => { AppState.r-rename-text = t; }
-                        // 按 Escape 退出重命名
-                        cancel => { AppState.r-editing-index = -1; }
-                        commit(t) => {
-                            AppState.r-rename-entry(i, t);
-                            AppState.r-editing-index = -1;
-                        }
-                    }
-                }
-                Text {
-                    text: entry.is-dir ? entry.modified : entry.size;
-                    font-size: Theme.fs-tiny;
-                    color: Theme.subtle;
+            // 绝对定位布局：图标 | 名称区 | 日期列，几何与顶层重命名覆盖层逐像素一致
+            FileIcon {
+                x: 12px;
+                y: (root.scaled-row-h - root.icon-box) / 2;
+                icon-class: entry.icon-class;
+                label: entry.icon-label;
+                thumb: entry.thumb;
+                has-thumb: entry.has-thumb;
+                compact: true;
+                box: root.icon-box;
+            }
+            // 名称区：正常显示文本，进入行内重命名（r-editing-index 命中）时由顶层覆盖层绘制输入框
+            Rectangle {
+                x: 12px + root.icon-box + 10px;
+                width: parent.width - self.x - 10px - root.date-w - 12px;
+                height: 100%;
+                if AppState.r-editing-index != i: cell-name-text := Text {
+                    width: 100%;
+                    height: 100%;
+                    text: entry.name;
+                    font-size: Theme.fs-small;
+                    color: Theme.text;
                     vertical-alignment: center;
+                    overflow: elide;
                 }
+            }
+            Text {
+                x: parent.width - 12px - root.date-w;
+                width: root.date-w;
+                height: 100%;
+                text: entry.is-dir ? entry.modified : entry.size;
+                font-size: Theme.fs-tiny;
+                color: Theme.subtle;
+                vertical-alignment: center;
+                overflow: elide;
             }
         }
     }
@@ -91,10 +80,31 @@ component RightList inherits Rectangle {
         cols: 1;
         row-h: root.scaled-row-h;
         left-pad: 12px;
+        // 单击重命名仅识别名称列区域（图标与日期列之间）
+        zone-x0: 12px + root.icon-box + 10px;
+        zone-x1: self.width - 12px - root.date-w;
         vp-y <=> list.viewport-y;
         vp-h: list.viewport-height;
         vis-h: list.visible-height;
         request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
+    }
+
+    // 重命名覆盖层：声明在 InputOverlay 之后，输入框位于输入层之上：
+    // 点击框内由 TextInput 接收（光标随点击定位）；点击框外落到 InputOverlay 提交编辑。
+    if AppState.r-editing-index >= 0 && AppState.r-editing-index < AppState.r-entries.length: RenameEdit {
+        x: 12px + root.icon-box + 10px;
+        width: list.width - self.x - 10px - root.date-w - 12px;
+        y: AppState.r-editing-index * root.scaled-row-h + list.viewport-y
+            + (root.scaled-row-h - self.height) / 2;
+        multiline: false;   // 列表模式保持单行
+        text: AppState.r-entries[AppState.r-editing-index].name;
+        font-size: Theme.fs-small;
+        text-changed(t) => { AppState.r-rename-text = t; }
+        cancel => { AppState.r-editing-index = -1; }
+        commit(t) => {
+            AppState.r-rename-entry(AppState.r-editing-index, t);
+            AppState.r-editing-index = -1;
+        }
     }
 }
 
@@ -120,14 +130,16 @@ component RightGrid inherits Rectangle {
     changed scroll-token => { list.viewport-y = 0px; }
 
     list := ListView {
+        // 顶部 12px 留白由 ListView 整体下移提供（而非首行 padding-top），
+        // 避免首行吃掉行间距导致选中时第一、二行粘连（与左面板 FileGrid 一致）
+        y: 12px;
         width: 100%;
-        height: 100%;
+        height: root.height - 12px;
         for r in root.rows: Rectangle {
             height: root.row-h;
             HorizontalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
-                padding-top: r == 0 ? 12px : 0px;
                 spacing: 10px;
                 alignment: start;
 
@@ -220,7 +232,7 @@ component RightGrid inherits Rectangle {
         property <bool> visible-card: entry.selected;
         property <int> grid-row: floor(i / root.cols);
         property <int> grid-col: mod(i, root.cols);
-        property <length> content-y: (self.grid-row == 0 ? 12px : self.grid-row * root.row-h) + list.viewport-y;
+        property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
         visible: self.visible-card;
         x: 12px + self.grid-col * root.pitch;
         y: self.content-y;
@@ -248,7 +260,7 @@ component RightGrid inherits Rectangle {
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap;
             width: parent.width - 16px;
-            height: self.preferred-height;
+            height: selected-card.expand-name ? self.preferred-height : root.name-h;
             text: entry.name;
             font-size: Theme.fs-small;
             color: Theme.text;
@@ -257,8 +269,11 @@ component RightGrid inherits Rectangle {
             wrap: word-wrap;
             overflow: clip;
         }
-        // 信息行固定在默认名称区下方；仅超出两行的实际名称才会把它向下推。
-        property <length> extra-name-h: max(0px, selected-name-text.preferred-height - root.name-h);
+        // 多选时不展开完整名称/不向下延伸（与左面板 FileGrid 一致）
+        property <bool> expand-name: AppState.r-selected-count == 1;
+        // 信息行固定在默认名称区下方；仅单选且名称超两行时才把它向下推。
+        property <length> extra-name-h: self.expand-name
+            ? max(0px, selected-name-text.preferred-height - root.name-h) : 0px;
         Text {
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap + root.name-h + selected-card.extra-name-h;
@@ -274,22 +289,36 @@ component RightGrid inherits Rectangle {
         height: root.cell-h + self.extra-name-h;
     }
 
-    // 重命名覆盖层：r-editing-index 命中时，在对应的右面板卡片名区位置绘制可伸长输入框。
-    // 独立于 ListView 虚拟化与卡片 clip，长名按名区宽度换行后向下伸长，完整可见；
-    // 超出可视区由 RightGrid 的 clip 裁剪。
+    ov := InputOverlay {
+        width: 100%;
+        height: 100%;
+        pane: "right";
+        mode: "grid";
+        count: AppState.r-entries.length;
+        cols: root.cols;
+        row-h: root.row-h;
+        cell-w: root.cell-w;
+        pitch-x: root.pitch;
+        top-pad: 12px;
+        left-pad: 12px;
+        // 单击重命名仅识别名称区域（图标下方）
+        zone-y: root.icon-top + root.icon-box;
+        vp-y <=> list.viewport-y;
+        vp-h: list.viewport-height;
+        vis-h: list.visible-height;
+        request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
+    }
+
+    // 重命名覆盖层：声明在 InputOverlay 之后，使输入框位于输入层之上：
+    // 点击框内由 TextInput 接收（光标随点击定位）；点击框外才提交编辑。
     for entry[i] in AppState.r-entries: editing-card := Rectangle {
         property <int> grid-row: floor(i / root.cols);
         property <int> grid-col: mod(i, root.cols);
-        property <length> content-y: (self.grid-row == 0 ? 12px : self.grid-row * root.row-h) + list.viewport-y;
-        // 与基础卡片名区逐像素对齐（卡片左缘 + 8px 内缩，宽度 cell-w - 16px），
-        // 使编辑态的换行位置与正常显示完全一致，每行字符数相同。
+        property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
         x: 12px + self.grid-col * root.pitch + 8px;
         y: self.content-y + root.icon-top + root.icon-box + root.name-gap;
         width: root.cell-w - 16px;
-        // 定位容器本身不绘制，高度取 0；输入框按文本高度自行向下伸长（无 clip，正常可见）。
         height: 0px;
-        // 必须用条件实例化而非 visible 复用实例：复用时退出编辑会多渲染一帧
-        // 「非编辑外观」（透明底 + 普通文字色叠在选中底色上），表现为洗白的中间态。
         if AppState.r-editing-index == i: RenameEdit {
             x: 0px;
             y: 0px;
@@ -304,24 +333,6 @@ component RightGrid inherits Rectangle {
                 AppState.r-editing-index = -1;
             }
         }
-    }
-
-    ov := InputOverlay {
-        width: 100%;
-        height: 100%;
-        pane: "right";
-        mode: "grid";
-        count: AppState.r-entries.length;
-        cols: root.cols;
-        row-h: root.row-h;
-        cell-w: root.cell-w;
-        pitch-x: root.pitch;
-        top-pad: 12px;
-        left-pad: 12px;
-        vp-y <=> list.viewport-y;
-        vp-h: list.viewport-height;
-        vis-h: list.visible-height;
-        request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
     }
 }
 

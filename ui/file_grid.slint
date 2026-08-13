@@ -40,15 +40,17 @@ export component FileGrid inherits Rectangle {
     changed scroll-token => { list.viewport-y = 0px; }
 
     list := ListView {
+        // 顶部 12px 留白由 ListView 整体下移提供（而非首行 padding-top）：
+        // 首行 padding 会吃掉行间距，导致第一行卡片与第二行粘连（选中底色下尤其明显）
+        y: 12px;
         width: 100%;
-        height: 100%;
+        height: root.height - 12px;
         // 整数即为合法 model：迭代 0..rows，ListView 仅实例化可见行
         for r in root.rows: Rectangle {
             height: root.row-h;
             HorizontalLayout {
                 padding-left: 12px;
                 padding-right: 12px;
-                padding-top: r == 0 ? 12px : 0px;
                 spacing: 10px;
                 alignment: start;
 
@@ -193,7 +195,7 @@ export component FileGrid inherits Rectangle {
         property <bool> visible-card: entry.selected;
         property <int> grid-row: floor(i / root.cols);
         property <int> grid-col: mod(i, root.cols);
-        property <length> content-y: (self.grid-row == 0 ? 12px : self.grid-row * root.row-h) + list.viewport-y;
+        property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
         visible: self.visible-card;
         x: 12px + self.grid-col * root.pitch;
         y: self.content-y;
@@ -222,7 +224,7 @@ export component FileGrid inherits Rectangle {
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap;
             width: parent.width - 16px;
-            height: self.preferred-height;
+            height: selected-card.expand-name ? self.preferred-height : root.name-h;
             text: entry.name;
             font-size: Theme.fs-small;
             color: Theme.text;
@@ -231,8 +233,12 @@ export component FileGrid inherits Rectangle {
             wrap: word-wrap;
             overflow: clip;
         }
-        // 信息行固定在默认名称区下方；仅超出两行的实际名称才会把它向下推。
-        property <length> extra-name-h: max(0px, selected-name-text.preferred-height - root.name-h);
+        // 多选时不展开完整名称/不向下延伸：选中卡片统一保持两行裁切的固定高度，
+        // 仅单选时展开完整名称（避免框选一大片时卡片高低不齐、互相遮盖）
+        property <bool> expand-name: AppState.selected-count == 1;
+        // 信息行固定在默认名称区下方；仅单选且名称超两行时才把它向下推。
+        property <length> extra-name-h: self.expand-name
+            ? max(0px, selected-name-text.preferred-height - root.name-h) : 0px;
         Text {
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap + root.name-h + selected-card.extra-name-h;
@@ -295,15 +301,37 @@ export component FileGrid inherits Rectangle {
         }
     }
 
-    // 重命名覆盖层：editing-index 命中时，在对应卡片名区位置绘制可伸长的输入框。
-    // 独立于 ListView 虚拟化与卡片 clip，长名按名区宽度换行后向下伸长（覆盖下一行），
-    // 完整可见；超出可视区由 FileGrid 的 clip 裁剪。
-    // 绘制顺序在 selected-card 之后、InputOverlay 之前：选中卡片盖住底下各行，
-    // 编辑覆盖层再盖住选中卡片上的名称文本。
+    // 统一输入层：网格模式（二维命中），覆盖在 ListView 之上集中处理指针交互
+    ov := InputOverlay {
+        width: 100%;
+        height: 100%;
+        pane: "left";
+        mode: "grid";
+        count: AppState.entries.length;
+        cols: root.cols;
+        row-h: root.row-h;
+        cell-w: root.cell-w;
+        pitch-x: root.pitch;
+        top-pad: 12px;
+        left-pad: 12px;
+        // 单击重命名仅识别名称区域（图标下方）
+        zone-y: root.icon-top + root.icon-box;
+        vp-y <=> list.viewport-y;
+        vp-h: list.viewport-height;
+        vis-h: list.visible-height;
+        request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
+    }
+
+    // 重命名覆盖层：声明在 InputOverlay 之后，使输入框位于输入层之上。
+    // 点击框内由 TextInput 接收（光标落到点击位置，可拖选/双击选词）；
+    // 点击框外才落到 InputOverlay，提交当前编辑并正常选中。
+    // （此前声明在 InputOverlay 之前，输入层拦截一切点击：无论点不点命名区域都会完成重命名。）
+    // 独立于 ListView 虚拟化与卡片 clip，长名按名区宽度换行后向下伸长，完整可见；
+    // 超出可视区由 FileGrid 的 clip 裁剪。
     for entry[i] in AppState.entries: editing-card := Rectangle {
         property <int> grid-row: floor(i / root.cols);
         property <int> grid-col: mod(i, root.cols);
-        property <length> content-y: (self.grid-row == 0 ? 12px : self.grid-row * root.row-h) + list.viewport-y;
+        property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
         // 与基础卡片名区逐像素对齐（卡片左缘 + 8px 内缩，宽度 cell-w - 16px），
         // 使编辑态的换行位置与正常显示完全一致，每行字符数相同。
         x: 12px + self.grid-col * root.pitch + 8px;
@@ -329,24 +357,5 @@ export component FileGrid inherits Rectangle {
                 AppState.editing-index = -1;
             }
         }
-    }
-
-    // 统一输入层：网格模式（二维命中），覆盖在 ListView 之上集中处理指针交互
-    ov := InputOverlay {
-        width: 100%;
-        height: 100%;
-        pane: "left";
-        mode: "grid";
-        count: AppState.entries.length;
-        cols: root.cols;
-        row-h: root.row-h;
-        cell-w: root.cell-w;
-        pitch-x: root.pitch;
-        top-pad: 12px;
-        left-pad: 12px;
-        vp-y <=> list.viewport-y;
-        vp-h: list.viewport-height;
-        vis-h: list.visible-height;
-        request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
     }
 }

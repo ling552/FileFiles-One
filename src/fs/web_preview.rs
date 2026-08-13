@@ -112,6 +112,10 @@ pub fn url_for(content: &WebContent) -> Option<String> {
             &format!(r#"<head><base href="{}">"#, base),
             1,
         )
+    } else if ext == "docx" {
+        // Word 文档：抽取正文转 HTML 渲染显示
+        let text = super::preview::office_text(path)?;
+        office_to_html(&text, content.dark)
     } else {
         // php 等：按静态 HTML 渲染（<?php ?> 段浏览器视作未知标签忽略）
         let raw = std::fs::read_to_string(path).ok()?;
@@ -120,6 +124,33 @@ pub fn url_for(content: &WebContent) -> Option<String> {
     let tmp = std::env::temp_dir().join("filefiles-one_preview.html");
     std::fs::write(&tmp, html).ok()?;
     Some(file_url(&tmp.to_string_lossy()))
+}
+
+/// Office 文档正文 → 排版 HTML（渲染视图）：pre-wrap 保留段落换行
+pub fn office_to_html(text: &str, dark: bool) -> String {
+    let mut body = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        match c {
+            '&' => body.push_str("&amp;"),
+            '<' => body.push_str("&lt;"),
+            '>' => body.push_str("&gt;"),
+            _ => body.push(c),
+        }
+    }
+    let (bg, fg, muted) = if dark {
+        ("#1e2227", "#d7dde3", "#9aa4ae")
+    } else {
+        ("#ffffff", "#24292f", "#57606a")
+    };
+    format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+  body {{ margin: 0; padding: 24px 32px; background: {bg}; color: {fg};
+         font: 15px/1.75 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }}
+  .doc {{ white-space: pre-wrap; max-width: 860px; margin: 0 auto; }}
+  .meta {{ color: {muted}; font-size: 12px; margin-bottom: 16px; }}
+</style></head><body><div class="doc">{body}</div></body></html>"#
+    )
 }
 
 /// Windows 路径 → file:/// URL（反斜杠转正斜杠，空格等交由 WebView2 处理）
@@ -268,10 +299,19 @@ mod win_impl {
             },
         ));
         unsafe {
+            // 传入 --disable-logging：抑制 Chromium 浏览器进程启停时的无害 ERROR 日志
+            // （如 "Failed to unregister class Chrome_WidgetWin_0. Error = 1412"），
+            // 避免污染控制台输出；不影响页面功能。
+            use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2EnvironmentOptions;
+            use webview2_com::CoreWebView2EnvironmentOptions;
+            let options: ICoreWebView2EnvironmentOptions =
+                CoreWebView2EnvironmentOptions::default().into();
+            let _ = options
+                .SetAdditionalBrowserArguments(windows::core::w!("--disable-logging"));
             let hr = CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),
                 PCWSTR(HSTRING::from(user_data).as_ptr()),
-                None,
+                Some(&options),
                 &env_handler,
             );
             if hr.is_err() {

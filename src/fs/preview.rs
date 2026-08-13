@@ -127,10 +127,15 @@ const TEXT_EXTS: &[&str] = &[
     "lock",
 ];
 
-/// 二进制/可执行文件扩展名：预览时显示应用基本信息而非文本内容
+/// 二进制/可执行/容器类扩展名：预览时显示应用/文件基本信息（含版本资源）。
+/// 注意：bin/dat 等无明确类型归属的不在其内——它们走文本通道的十六进制预览。
 const BINARY_EXTS: &[&str] = &[
-    "exe", "msi", "dll", "sys", "com", "scr", "iso", "bin", "dat", "img", "vhd", "vhdx", "cab",
-    "msu", "dmp", "pdb", "deb", "rpm", "appimage", "dmg", "pkg",
+    // 可执行/系统二进制
+    "exe", "msi", "dll", "sys", "com", "scr",
+    // 磁盘映像/安装包/容器
+    "iso", "img", "vhd", "vhdx", "cab", "msu", "dmp", "pdb", "deb", "rpm", "appimage", "dmg", "pkg",
+    // 旧版 Office / PDF：无轻量解析路径，显示文件信息
+    "doc", "xls", "xlsx", "ppt", "pptx", "pdf",
 ];
 
 fn ext_of(path: &Path) -> String {
@@ -141,11 +146,12 @@ fn ext_of(path: &Path) -> String {
 }
 
 /// 是否支持「渲染视图」（WebView2 显示网页效果，与源码视图可切换）：
-/// Markdown 转 HTML 渲染；HTML/HTM 直接渲染；PHP 渲染其中的静态 HTML 部分
+/// Markdown 转 HTML 渲染；HTML/HTM 直接渲染；PHP 渲染其中的静态 HTML 部分；
+/// DOCX 抽取正文后转 HTML 渲染。
 pub fn renderable_web(path: &Path) -> bool {
     matches!(
         ext_of(path).as_str(),
-        "md" | "markdown" | "html" | "htm" | "php"
+        "md" | "markdown" | "html" | "htm" | "php" | "docx"
     )
 }
 
@@ -162,11 +168,11 @@ pub fn kind_of(path: &Path, is_dir: bool) -> PreviewKind {
     } else if is_archive_kind(&ext, path) {
         PreviewKind::Archive
     } else if is_binary_kind(&ext) {
-        // EXE/MSI/ISO 等二进制文件：显示应用基本信息而非文本内容
+        // EXE/MSI/Office/PDF 等已知类型二进制：显示应用/文件基本信息（含版本资源）
         PreviewKind::Info
     } else {
         // 兜底用文本预览：文本文件显示内容，二进制文件由 read_text_head 的
-        // NUL 检测给出「二进制内容，无法以文本预览」提示（用户要求大部分文件以文本打开）
+        // NUL 检测生成十六进制预览
         PreviewKind::Text
     }
 }
@@ -181,7 +187,8 @@ fn is_archive_kind(ext: &str, _path: &Path) -> bool {
     matches!(ext, "zip" | "7z" | "tar" | "gz" | "tgz")
 }
 
-/// 读取文本文件首部，最多 `max_bytes` 字节并按 UTF-8 有损转换。
+/// 读取文本文件首部，最多 `max_bytes` 字节，按编码检测解码：
+/// UTF-8（含 BOM）→ UTF-16（BOM）→ 系统 ANSI 码页（中文 Windows 为 GBK）。
 /// 截断时在结尾追加省略提示。读取失败返回错误说明文本。
 pub fn read_text_head(path: &Path, max_bytes: usize) -> String {
     use std::io::Read;
@@ -195,18 +202,228 @@ pub fn read_text_head(path: &Path, max_bytes: usize) -> String {
         Err(e) => return format!("读取出错：{}", e),
     };
     buf.truncate(n);
-    // 检测是否为二进制（含 NUL 字节）：避免把二进制文件当文本显示成乱码
-    if buf.iter().any(|&b| b == 0) {
-        return "（二进制内容，无法以文本预览）".to_string();
-    }
-    let mut text = String::from_utf8_lossy(&buf).into_owned();
-    // 文件比读取窗口更大时提示已截断
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() as usize > n {
-            text.push_str("\n\n…（仅显示开头部分）");
+    let truncated = matches!(std::fs::metadata(path), Ok(m) if m.len() as usize > n);
+    let mut text = match decode_text(&buf) {
+        Some(t) => t,
+        // 二进制内容：不再只显示占位提示，改为十六进制预览（仅头部 8KB 防卡顿）
+        None => {
+            let head = &buf[..buf.len().min(8 * 1024)];
+            let mut t = String::from("（二进制内容 · 开头十六进制预览）\n\n");
+            t.push_str(&hex_dump(head));
+            t
         }
+    };
+    // 截断可能劈裂多字节字符，解码会在末尾产出一个替换符，展示前去掉
+    if truncated && text.ends_with('\u{FFFD}') {
+        text.pop();
+    }
+    // 文件比读取窗口更大时提示已截断
+    if truncated {
+        text.push_str("\n\n…（仅显示开头部分）");
     }
     text
+}
+
+/// 二进制内容的十六进制预览（xxd 风格）：偏移 + 16 字节十六进制（8 字节一组）+ ASCII 侧栏。
+/// 不可打印字符以 '.' 表示，与常见十六进制查看器一致。
+fn hex_dump(buf: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(buf.len() / 16 * 78 + 80);
+    for (i, chunk) in buf.chunks(16).enumerate() {
+        let _ = write!(out, "{:08X}  ", i * 16);
+        for (j, b) in chunk.iter().enumerate() {
+            let _ = write!(out, "{:02X} ", b);
+            if j == 7 {
+                out.push(' ');
+            }
+        }
+        // 末行不足 16 字节时补齐间距，保持侧栏对齐
+        if chunk.len() < 16 {
+            for _ in 0..(16 - chunk.len()) {
+                out.push_str("   ");
+            }
+            if chunk.len() <= 7 {
+                out.push(' ');
+            }
+        }
+        out.push(' ');
+        for b in chunk {
+            out.push(if (0x20..0x7F).contains(b) { *b as char } else { '.' });
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// 抽取 Word 文档（.docx）正文：zip 容器读 word/document.xml，
+/// 段落/换行标签转行、剥离其余 XML 标签、解码常见实体。
+/// 读取失败返回 None（调用方回退其它预览方式）。
+pub fn office_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut zip = zip::ZipArchive::new(f).ok()?;
+    let mut raw = String::new();
+    zip.by_name("word/document.xml")
+        .ok()?
+        .read_to_string(&mut raw)
+        .ok()?;
+    // 段落 / 换行 / 制表符标签 → 对应文本字符
+    let raw = raw
+        .replace("</w:p>", "\n")
+        .replace("<w:br/>", "\n")
+        .replace("<w:tab/>", "\t");
+    // 剥离剩余 XML 标签
+    let mut text = String::with_capacity(raw.len());
+    let mut in_tag = false;
+    for c in raw.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    // 解码常见 XML 实体
+    let text = text
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#160;", " ")
+        .replace("&amp;", "&");
+    Some(text)
+}
+
+/// 读取 PE 版本资源中的描述/公司/版本/产品（常见代码页试探）。
+/// 无版本资源或读取失败返回空 vec，调用方仅显示基础信息。
+#[cfg(windows)]
+pub fn exe_version_info(path: &Path) -> Vec<(String, String)> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    use windows::core::PCWSTR;
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()), Some(&mut handle));
+        if size == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(
+            PCWSTR(wide.as_ptr()),
+            Some(handle),
+            size,
+            buf.as_mut_ptr() as *mut _,
+        )
+        .is_err()
+        {
+            return Vec::new();
+        }
+        let query = |sub: &str| -> Option<String> {
+            let subw: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+            let mut len = 0u32;
+            let _ = VerQueryValueW(
+                buf.as_ptr() as *const _,
+                PCWSTR(subw.as_ptr()),
+                &mut ptr,
+                &mut len,
+            );
+            if ptr.is_null() || len == 0 {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(ptr as *const u16, len as usize);
+            let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+            let s = String::from_utf16_lossy(&units[..end]);
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        };
+        let mut out = Vec::new();
+        for (key, label) in [
+            ("FileDescription", "描述"),
+            ("CompanyName", "公司"),
+            ("FileVersion", "版本"),
+            ("ProductName", "产品"),
+        ] {
+            // 常见代码页试探：英文(0409)+UTF-16(04B0)、简体中文(0804)、ANSI(04E4)
+            let v = query(&format!("\\StringFileInfo\\040904B0\\{}", key))
+                .or_else(|| query(&format!("\\StringFileInfo\\080404B0\\{}", key)))
+                .or_else(|| query(&format!("\\StringFileInfo\\040904E4\\{}", key)));
+            if let Some(v) = v {
+                out.push((label.to_string(), v));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(not(windows))]
+pub fn exe_version_info(_path: &Path) -> Vec<(String, String)> {
+    Vec::new()
+}
+
+/// 把原始字节解码为文本。返回 None 表示二进制内容（含 NUL 且非 UTF-16）。
+///
+/// 顺序：UTF-16 LE/BE BOM → 二进制检测 → UTF-8 BOM → 严格 UTF-8 → 系统 ANSI 码页。
+/// 非 UTF-8 的 ANSI/GBK 文件若直接 lossy 会满屏 U+FFFD 替换符（乱码），
+/// 改按系统码页解码后与记事本的「ANSI」行为一致。
+fn decode_text(buf: &[u8]) -> Option<String> {
+    // UTF-16 BOM：ASCII 字符高低字节含大量 0x00，必须先于二进制检测分支
+    if let Some(rest) = buf.strip_prefix(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        return Some(String::from_utf16_lossy(&units));
+    }
+    if let Some(rest) = buf.strip_prefix(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return Some(String::from_utf16_lossy(&units));
+    }
+    // 检测是否为二进制（含 NUL 字节）：避免把二进制文件当文本显示成乱码
+    if buf.iter().any(|&b| b == 0) {
+        return None;
+    }
+    // UTF-8 BOM：剥离 BOM，避免预览首行多出不可见字符
+    if let Some(rest) = buf.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return Some(String::from_utf8_lossy(rest).into_owned());
+    }
+    if let Ok(s) = std::str::from_utf8(buf) {
+        return Some(s.to_string());
+    }
+    // 非 UTF-8：按系统 ANSI 码页解码（中文 Windows = GBK/GB18030）
+    let enc = system_ansi_encoding();
+    Some(enc.decode(buf).0.into_owned())
+}
+
+/// 系统 ANSI 码页对应的文本编码：GetACP() 936→GBK、950→Big5、932→Shift_JIS、1252→Windows-1252…
+/// WHATWG 编码标签对常见码页均接受 `windows-<cp>` 形式。
+#[cfg(windows)]
+fn system_ansi_encoding() -> &'static encoding_rs::Encoding {
+    use windows_sys::Win32::Globalization::GetACP;
+    let cp = unsafe { GetACP() };
+    if cp == 65001 {
+        return encoding_rs::UTF_8;
+    }
+    let label = format!("windows-{}", cp);
+    encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::WINDOWS_1252)
+}
+
+#[cfg(not(windows))]
+fn system_ansi_encoding() -> &'static encoding_rs::Encoding {
+    encoding_rs::WINDOWS_1252
 }
 
 /// 读取归档原始条目 (名, 大小, 是否目录)。按格式读取条目名/大小/是否目录，
@@ -463,8 +680,8 @@ mod tests {
     fn test_kind_of() {
         assert_eq!(kind_of(Path::new("a.png"), false), PreviewKind::Image);
         assert_eq!(kind_of(Path::new("a.rs"), false), PreviewKind::Text);
-        // 已知二进制/磁盘映像显示基础信息，避免把任意二进制内容当文本读取。
-        assert_eq!(kind_of(Path::new("a.bin"), false), PreviewKind::Info);
+        // 已知二进制/磁盘映像走文本通道生成十六进制预览，而非仅显示基础信息。
+        assert_eq!(kind_of(Path::new("a.bin"), false), PreviewKind::Text);
         assert_eq!(kind_of(Path::new("a.zip"), false), PreviewKind::Archive);
         assert_eq!(kind_of(Path::new("a.7z"), false), PreviewKind::Archive);
         assert_eq!(kind_of(Path::new("anything"), true), PreviewKind::Folder);
@@ -489,6 +706,45 @@ mod tests {
         std::fs::write(&p, vec![b'x'; 5000]).unwrap();
         let t = read_text_head(&p, 100);
         assert!(t.contains("仅显示开头部分"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn test_read_text_head_gbk_no_replacement() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("filefiles_prev_gbk_{}.txt", std::process::id()));
+        // GBK 编码的「你好」(0xC4 0xE3 0xBA 0xC3)，不是合法 UTF-8
+        std::fs::write(&p, b"\xc4\xe3\xba\xc3 world").unwrap();
+        let t = read_text_head(&p, 1024);
+        // 按系统码页解码不应再产出 U+FFFD 替换符（乱码根源）
+        assert!(!t.contains('\u{FFFD}'));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn test_read_text_head_utf16_le() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("filefiles_prev_u16_{}.txt", std::process::id()));
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in "hello 预览".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let t = read_text_head(&p, 1024);
+        // UTF-16 含 NUL 字节但不应被判为二进制，且正确解码出中文
+        assert!(t.contains("hello"));
+        assert!(t.contains("预览"));
+        assert!(!t.contains('\u{FFFD}'));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn test_read_text_head_utf8_bom_stripped() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("filefiles_prev_bom_{}.txt", std::process::id()));
+        std::fs::write(&p, b"\xef\xbb\xbfhello bom").unwrap();
+        let t = read_text_head(&p, 1024);
+        assert!(t.starts_with("hello bom"));
         std::fs::remove_file(&p).ok();
     }
 
@@ -676,7 +932,22 @@ mod tests {
         p.push(format!("filefiles_prev_bin_{}.dat", std::process::id()));
         std::fs::write(&p, [0u8, 1, 2, 3, 0, 5]).unwrap();
         let t = read_text_head(&p, 1024);
-        assert!(t.contains("二进制"));
+        // 二进制内容给出十六进制预览：含偏移行与提示头
+        assert!(t.contains("十六进制预览"));
+        assert!(t.contains("00000000"));
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn test_hex_dump_format() {
+        let data: Vec<u8> = (0..20u8).collect();
+        let d = hex_dump(&data);
+        let lines: Vec<&str> = d.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("00000000"));
+        assert!(lines[1].starts_with("00000010"));
+        // ASCII 侧栏：0x00-0x13 均不可打印，全为 '.'
+        assert!(lines[0].ends_with("................"));
+        assert!(lines[1].contains("10 11 12 13"));
     }
 }

@@ -270,6 +270,10 @@ pub fn push_entries(ui: &MainWindow, core: &AppCore) {
     }
 
     state.set_entries(ModelRc::new(VecModel::from(rows)));
+    // 选中计数：网格选中卡片据此决定是否展开完整名称（仅单选展开）
+    state.set_selected_count(
+        core.active_tab().selected.iter().filter(|&&s| s).count() as i32,
+    );
 
     // 导航到新目录后重置列表滚动位置到顶部（各列表视图监听此 token 变化归零 viewport-y）
     state.set_scroll_top_token(state.get_scroll_top_token() + 1);
@@ -364,17 +368,10 @@ fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: 
     let weak = ui.as_weak();
     let gen_ref = side.generation();
     std::thread::spawn(move || {
-        for (row, request) in jobs {
-            // 已切换目录：提前结束本批，省去无谓的图标提取
-            if gen_ref.load(Ordering::SeqCst) != generation {
-                break;
-            }
-            // 走带缓存的入口：按类型/文件提取一次并写入缓存，后续同类型条目同步命中
-            let icon = crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE);
-            let Some(icon) = icon else {
-                continue;
-            };
+        // 回 UI 线程把图标写回对应行（代数校验避免旧目录图标填到新目录）
+        let apply = |row: usize, icon: &std::sync::Arc<crate::fs::thumbnail::IconPixels>| {
             let weak2 = weak.clone();
+            let icon = icon.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 // 回到 UI 线程：代数校验 + 构建图像 + 就地写回
                 if gen_ref.load(Ordering::SeqCst) != generation {
@@ -399,6 +396,34 @@ fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: 
                     }
                 }
             });
+        };
+
+        let mut failed: Vec<IconJob> = Vec::new();
+        for (row, request) in jobs {
+            // 已切换目录：提前结束本批，省去无谓的图标提取
+            if gen_ref.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            // 走带缓存的入口：按类型/文件提取一次并写入缓存，后续同类型条目同步命中
+            match crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE) {
+                Some(icon) => apply(row, &icon),
+                // 提取失败（Shell/COM 未就绪、杀软占用等瞬时错误）：记下稍后重试
+                None => failed.push((row, request)),
+            }
+        }
+        // 失败行延迟重试一次：瞬时失败通常数百毫秒内恢复，
+        // 避免个别文件停留在内置矢量图（重试仍失败则由 stock 回退兼底）
+        if !failed.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            for (row, request) in failed {
+                if gen_ref.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                if let Some(icon) = crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE)
+                {
+                    apply(row, &icon);
+                }
+            }
         }
     });
 }
@@ -519,6 +544,7 @@ pub fn push_right(ui: &MainWindow, core: &AppCore) {
     }
 
     state.set_r_entries(ModelRc::new(VecModel::from(rows)));
+    state.set_r_selected_count(tab.selected.iter().filter(|&&s| s).count() as i32);
 
     // 导航到新目录后重置右面板滚动位置到顶部
     state.set_r_scroll_top_token(state.get_r_scroll_top_token() + 1);
@@ -570,6 +596,7 @@ pub fn refresh_right_selection(ui: &MainWindow, core: &AppCore) {
             }
         }
     }
+    state.set_r_selected_count(tab.selected.iter().filter(|&&s| s).count() as i32);
 }
 
 /// 构建面包屑链
@@ -764,6 +791,7 @@ pub fn refresh_selection(ui: &MainWindow, core: &AppCore) {
             }
         }
     }
+    state.set_selected_count(tab.selected.iter().filter(|&&s| s).count() as i32);
     update_status(ui, core);
     update_selection(ui, core);
 }
@@ -1545,8 +1573,14 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
             // 读取首部 64KB 文本，按扩展名做语法高亮分层（4 层字符对齐）。
             // quick_look.slint 用同一等宽字体把 base / 关键字 / 字符串 / 注释 4 层 Text
             // 原位叠加显示多色代码；base 层已把关键字等挖空为占位空格，叠加时互不遮盖。
-            let text = preview::read_text_head(path, 64 * 1024);
+            // docx 为 zip 容器：源码视图显示抽取的正文而非十六进制。
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let text = if ext == "docx" {
+                preview::office_text(path)
+                    .unwrap_or_else(|| preview::read_text_head(path, 64 * 1024))
+            } else {
+                preview::read_text_head(path, 64 * 1024)
+            };
             let layers = crate::fs::highlight::highlight(&text, ext);
             state.set_ql_text(layers.base.into());
             state.set_ql_code_kw(layers.keywords.into());
@@ -1581,18 +1615,20 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
         }
         PreviewKind::Info => {
             state.set_ql_subtitle(size_text.into());
-            state.set_ql_info(
-                format!(
-                    "{}\n位置：{}\n修改时间：{}",
-                    e.kind,
-                    Path::new(&e.path)
-                        .parent()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                    metadata::fmt_ts_full(e.modified_ts)
-                )
-                .into(),
+            let mut info = format!(
+                "{}\n位置：{}\n修改时间：{}",
+                e.kind,
+                Path::new(&e.path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                metadata::fmt_ts_full(e.modified_ts)
             );
+            // 可执行文件带版本资源时追加描述/公司/版本/产品（应用信息）
+            for (k, v) in preview::exe_version_info(path) {
+                info.push_str(&format!("\n{}：{}", k, v));
+            }
+            state.set_ql_info(info.into());
         }
     }
     true
