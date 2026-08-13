@@ -20,4 +20,4 @@
 /.codebase-memory/
 
 # Claude Code 临时文件
-/.claude/tmp/
+/.claude
