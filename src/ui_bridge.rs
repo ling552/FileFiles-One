@@ -9,9 +9,11 @@ use crate::{
 use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
 };
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 缩略图加载代数：每次重建 entries 模型自增，后台线程据此丢弃过期结果，
 /// 避免快速切换目录时旧目录的缩略图错填到新目录的行上。
@@ -106,17 +108,116 @@ pub(crate) fn image_from(ic: &crate::fs::thumbnail::IconPixels) -> Image {
     Image::from_rgba8(buf)
 }
 
+// ── 图标像素 → Slint Image 共享缓存（按 Arc 指针键）──
+// 同一图标（同类型/同路径/同 Stock）在全目录只保留一份像素缓冲，
+// N 行共享 1 份 Image，避免大目录下每行复制 64KB 缓冲导致内存暴涨
+// （500 项目录从 ~32MB 降到 ~几 MB）。Image Clone 共享底层缓冲，零拷贝。
+thread_local! {
+    static ICON_IMAGE_CACHE: RefCell<HashMap<usize, (Arc<crate::fs::thumbnail::IconPixels>, Image)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// 取共享的 Slint 图像（同一 IconPixels 实例全进程共享一份缓冲）。
+/// 必须在 UI 线程调用；缓存持有对应 Arc 防止地址复用误命中。
+pub(crate) fn image_cached(ic: &Arc<crate::fs::thumbnail::IconPixels>) -> Image {
+    let key = Arc::as_ptr(ic) as usize;
+    if let Some(img) = ICON_IMAGE_CACHE.with(|c| c.borrow().get(&key).map(|(_, i)| i.clone())) {
+        return img;
+    }
+    let img = image_from(ic);
+    ICON_IMAGE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        // 上限防无限增长：达 256 项（约 32MB）整体清空重建，图标种类通常远小于该值
+        if c.len() >= 256 {
+            c.clear();
+        }
+        c.insert(key, (ic.clone(), img.clone()));
+    });
+    img
+}
+
+// ── 侧栏图标异步加载：build_sidebar 只读缓存不阻塞 UI；未命中项记录到 ──
+// 待加载集合，构建结束后由后台线程提取，完成后回事件循环重建侧栏补上。
+thread_local! {
+    static SIDEBAR_UI_WEAK: RefCell<Option<slint::Weak<MainWindow>>> = const { RefCell::new(None) };
+    static SIDEBAR_PENDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn sidebar_attempted() -> &'static Mutex<HashSet<String>> {
+    static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 注册主窗口弱引用，供侧栏图标后台加载完成后触发重建（main 中调用一次）
+pub fn init_sidebar_warm(weak: slint::Weak<MainWindow>) {
+    SIDEBAR_UI_WEAK.with(|w| *w.borrow_mut() = Some(weak));
+}
+
+/// 记录侧栏缺失的图标（每进程每项只尝试一次，防失败重试循环）
+fn note_sidebar_icon_missing(key: String) {
+    if sidebar_attempted()
+        .lock()
+        .map(|mut s| s.insert(key.clone()))
+        .unwrap_or(false)
+    {
+        SIDEBAR_PENDING.with(|p| p.borrow_mut().push(key));
+    }
+}
+
+/// build_sidebar 结束时调用：有待加载项则派后台线程提取，完成后重建侧栏
+fn flush_sidebar_warm() {
+    let keys: Vec<String> = SIDEBAR_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    if keys.is_empty() {
+        return;
+    }
+    let Some(weak) = SIDEBAR_UI_WEAK.with(|w| w.borrow().clone()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        for key in &keys {
+            if let Some(path) = key.strip_prefix("special:") {
+                if let Some(arc) = crate::fs::thumbnail::special_dir_icon_cached(path, 128) {
+                    crate::fs::thumbnail::sidebar_icon_set(path, arc);
+                }
+            } else if key == "device:" {
+                if let Some(arc) = crate::fs::thumbnail::load_cached_request(
+                    &crate::fs::thumbnail::IconRequest::Device,
+                    128,
+                ) {
+                    crate::fs::thumbnail::sidebar_icon_set("__device__", arc);
+                }
+            } else if let Some(path) = key.strip_prefix("path:") {
+                if let Some(arc) = crate::fs::thumbnail::load_cached(path, true, 0, 128) {
+                    crate::fs::thumbnail::sidebar_icon_set(path, arc);
+                }
+            }
+        }
+        let _ = weak.upgrade_in_event_loop(|ui| {
+            ui.global::<AppState>().invoke_devices_changed();
+        });
+    });
+}
+
 /// 为侧边栏条目提取系统图标（仅在 icon-source=系统图标 时调用）。
-/// 在 UI 线程同步执行：文件夹图标走类型缓存（首次约 50ms，后续命中缓存为 0ms），
-/// 驱动器盘符走路径缓存（首次每个约 100ms）。侧栏条目少（通常 <20），短暂阻塞可接受。
-/// 虚拟路径（recycle:// / network:// / tag://）不取系统图标，返回 has-thumb=false。
+/// 只读缓存（不阻塞 UI 线程）：命中即显示系统图标；未命中回退内置 glyph、
+/// 并记录到待加载集合，由后台线程提取后重建侧栏补上。
 fn sidebar_icon(path: &str, is_dir: bool) -> (Image, bool) {
     if crate::fs::virtualfs::is_virtual(path) {
         return (Image::default(), false);
     }
-    match crate::fs::thumbnail::load_cached(path, is_dir, 0, THUMB_SIZE) {
-        Some(ic) => (image_from(&ic), true),
-        None => (Image::default(), false),
+    // 优先读永不淘汰的侧栏专用缓存，避免随主缓存清理回退为内置图标
+    if let Some(ic) = crate::fs::thumbnail::sidebar_icon_get(path) {
+        return (image_cached(&ic), true);
+    }
+    match crate::fs::thumbnail::cached(path, is_dir, 0) {
+        Some(ic) => {
+            crate::fs::thumbnail::sidebar_icon_set(path, ic.clone());
+            (image_cached(&ic), true)
+        }
+        None => {
+            note_sidebar_icon_missing(format!("path:{}", path));
+            (Image::default(), false)
+        }
     }
 }
 
@@ -228,7 +329,7 @@ pub fn push_entries(ui: &MainWindow, core: &AppCore) {
             let e = &tab.entries[ei];
             // 缓存命中：直接构建图像预填，否则留空由后台线程回填
             let (thumb, has_thumb) = match &cached_icons[fi] {
-                Some(ic) => (image_from(ic), true),
+                Some(ic) => (image_cached(ic), true),
                 None => (Image::default(), false),
             };
             let (disk_ratio, disk_info, disk_color) = disk_fields(e, cur_is_this_pc, &disks);
@@ -252,6 +353,7 @@ pub fn push_entries(ui: &MainWindow, core: &AppCore) {
                 git_status: SharedString::new(),
                 thumb,
                 has_thumb,
+                has_files: false,
                 disk_ratio,
                 disk_info,
                 disk_color,
@@ -282,6 +384,23 @@ pub fn push_entries(ui: &MainWindow, core: &AppCore) {
     let generation = THUMB_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     if !jobs.is_empty() {
         spawn_thumbnails(ui, jobs, generation, ThumbSide::Left);
+    }
+    // 内置图标模式：后台检测各文件夹是否含子项，回填 has-files 以显示「有文件的文件夹」图标
+    if !system_icons {
+        let dirs: Vec<(usize, String)> = tab
+            .filtered
+            .iter()
+            .enumerate()
+            .filter_map(|(fi, &ei)| {
+                let e = &tab.entries[ei];
+                if e.is_dir && !crate::fs::virtualfs::is_virtual(&e.path) {
+                    Some((fi, e.path.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        spawn_folder_hasfiles(ui, dirs, generation, ThumbSide::Left);
     }
 
     // 面包屑与标题：设置页固定显示「设置」（地址 setting）；虚拟路径使用友好名称
@@ -384,7 +503,7 @@ fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: 
                     ThumbSide::Right => state.get_r_entries(),
                 };
                 if let Some(mut entry) = model.row_data(row) {
-                    let img = image_from(&icon);
+                    let img = image_cached(&icon);
                     entry.thumb = img.clone();
                     entry.has_thumb = true;
                     let is_selected = entry.selected;
@@ -424,6 +543,53 @@ fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: 
                     apply(row, &icon);
                 }
             }
+        }
+    });
+}
+
+/// 后台检测各文件夹是否含子项，仅当含子项时回填 has-files=true（内置图标模式
+/// 用于显示「有文件的文件夹」图标）。逐项 read_dir 只取首项，开销极小；
+/// 代数校验避免旧目录结果填到新目录。
+fn spawn_folder_hasfiles(
+    ui: &MainWindow,
+    dirs: Vec<(usize, String)>,
+    generation: u64,
+    side: ThumbSide,
+) {
+    if dirs.is_empty() {
+        return;
+    }
+    let weak = ui.as_weak();
+    let gen_ref = side.generation();
+    std::thread::spawn(move || {
+        for (row, path) in dirs {
+            if gen_ref.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let has = std::fs::read_dir(&path)
+                .map(|mut rd| rd.next().is_some())
+                .unwrap_or(false);
+            if !has {
+                continue;
+            }
+            let weak2 = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if gen_ref.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                let Some(ui) = weak2.upgrade() else { return };
+                let state = ui.global::<AppState>();
+                let model = match side {
+                    ThumbSide::Left => state.get_entries(),
+                    ThumbSide::Right => state.get_r_entries(),
+                };
+                if let Some(mut entry) = model.row_data(row) {
+                    if !entry.has_files {
+                        entry.has_files = true;
+                        model.set_row_data(row, entry);
+                    }
+                }
+            });
         }
     });
 }
@@ -502,7 +668,7 @@ pub fn push_right(ui: &MainWindow, core: &AppCore) {
         .map(|(fi, &ei)| {
             let e = &tab.entries[ei];
             let (thumb, has_thumb) = match &cached_icons[fi] {
-                Some(ic) => (image_from(ic), true),
+                Some(ic) => (image_cached(ic), true),
                 None => (Image::default(), false),
             };
             FileEntry {
@@ -525,6 +691,7 @@ pub fn push_right(ui: &MainWindow, core: &AppCore) {
                 git_status: SharedString::new(),
                 thumb,
                 has_thumb,
+                has_files: false,
                 // 右面板不展示"此电脑"平铺视图，容量字段恒为默认
                 disk_ratio: 0.0,
                 disk_info: SharedString::new(),
@@ -552,6 +719,22 @@ pub fn push_right(ui: &MainWindow, core: &AppCore) {
     let generation = R_THUMB_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     if !jobs.is_empty() {
         spawn_thumbnails(ui, jobs, generation, ThumbSide::Right);
+    }
+    if !system_icons {
+        let dirs: Vec<(usize, String)> = tab
+            .filtered
+            .iter()
+            .enumerate()
+            .filter_map(|(fi, &ei)| {
+                let e = &tab.entries[ei];
+                if e.is_dir && !crate::fs::virtualfs::is_virtual(&e.path) {
+                    Some((fi, e.path.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        spawn_folder_hasfiles(ui, dirs, generation, ThumbSide::Right);
     }
 
     let cur = tab.history.current();
@@ -880,13 +1063,21 @@ pub fn build_sidebar(
         // - 内置图标模式：MDL2 字体 glyph（现有内置样式）
         let glyphize = |mut item: NavItem, glyph: &str| {
             if system_icons {
-                if let Some(ic) =
-                    crate::fs::thumbnail::special_dir_icon_cached(item.path.as_str(), THUMB_SIZE)
-                {
-                    item.thumb = image_from(&ic);
+                // 优先侧栏专用缓存，其次特殊目录缓存；命中即写入专用缓存持久化
+                let ic = crate::fs::thumbnail::sidebar_icon_get(item.path.as_str()).or_else(|| {
+                    crate::fs::thumbnail::special_dir_icon_cache_only(item.path.as_str())
+                        .map(|a| {
+                            crate::fs::thumbnail::sidebar_icon_set(item.path.as_str(), a.clone());
+                            a
+                        })
+                });
+                if let Some(ic) = ic {
+                    item.thumb = image_cached(&ic);
                     item.has_thumb = true;
                     return item;
                 }
+                // 未命中：记录待后台提取，完成后重建侧栏补上系统图标
+                note_sidebar_icon_missing(format!("special:{}", item.path.as_str()));
             }
             item.icon = glyph.into();
             item.icon_class = "qa-glyph".into();
@@ -1010,18 +1201,17 @@ pub fn build_sidebar(
         // 便携设备（手机 / 平板等）：同步显示在"此电脑"下
         for dev in crate::fs::devices::cached_devices() {
             let (device_thumb, device_has_thumb) = if system_icons {
-                match crate::fs::thumbnail::load_cached_request(
+                // 优先侧栏专用缓存；未命中回退内置图标并记录，由后台线程提取后重建补上
+                if let Some(ic) = crate::fs::thumbnail::sidebar_icon_get("__device__") {
+                    (image_cached(&ic), true)
+                } else if let Some(icon) = crate::fs::thumbnail::cached_request(
                     &crate::fs::thumbnail::IconRequest::Device,
-                    THUMB_SIZE,
                 ) {
-                    Some(icon) => {
-                        eprintln!("[icon-debug] sidebar device icon OK");
-                        (image_from(&icon), true)
-                    }
-                    None => {
-                        eprintln!("[icon-debug] sidebar device icon NONE");
-                        (Image::default(), false)
-                    }
+                    crate::fs::thumbnail::sidebar_icon_set("__device__", icon.clone());
+                    (image_cached(&icon), true)
+                } else {
+                    note_sidebar_icon_missing("device:".into());
+                    (Image::default(), false)
                 }
             } else {
                 (Image::default(), false)
@@ -1121,7 +1311,7 @@ pub fn build_sidebar(
             let mut item = mk(label, path.to_string(), "", "", active);
             match crate::fs::thumbnail::stock_icon_cached(stock, THUMB_SIZE) {
                 Some(icon) => {
-                    item.thumb = image_from(&icon);
+                    item.thumb = image_cached(&icon);
                     item.has_thumb = true;
                 }
                 None => {
@@ -1152,7 +1342,10 @@ pub fn build_sidebar(
         ));
     }
 
-    ModelRc::new(VecModel::from(items))
+    let rc = ModelRc::new(VecModel::from(items));
+    // 后台补齐本次构建中缺失的侧栏图标，完成后自动重建侧栏（此时命中缓存）
+    flush_sidebar_warm();
+    rc
 }
 
 /// 把已保存的网络位置推送到设置「云存储账号」页的列表模型

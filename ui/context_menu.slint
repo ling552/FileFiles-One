@@ -94,24 +94,30 @@ export component ContextMenu inherits Rectangle {
             // ── 背景菜单（空白处右键：无目标项）──
             if root.is-background: VerticalLayout {
                 spacing: 0px;
-                MenuRow {
+                // 此电脑视图无新建/粘贴操作（与资源管理器一致），隐藏这些项
+                if AppState.current-vpath != "this-pc://": MenuRow {
                     glyph: "\u{E8F4}"; label: "新建文件夹"; shortcut: "Ctrl+Shift+N";
                     clicked => { AppState.new-folder(); root.open = false; }
                 }
-                MenuRow {
+                if AppState.current-vpath != "this-pc://": MenuRow {
                     glyph: "\u{E8A5}"; label: "新建文件";
                     clicked => { AppState.new-file(); root.open = false; }
                 }
-                Rectangle { height: 11px;
+                if AppState.current-vpath != "this-pc://": Rectangle { height: 11px;
                     Rectangle { y: 5px; height: 1px; background: Theme.border; }
                 }
-                MenuRow {
+                if AppState.current-vpath != "this-pc://": MenuRow {
                     glyph: "\u{E77F}"; label: "粘贴"; shortcut: "Ctrl+V";
                     clicked => { AppState.paste-here(); root.open = false; }
                 }
                 MenuRow {
                     glyph: "\u{E72C}"; label: "刷新"; shortcut: "F5";
                     clicked => { AppState.refresh(); root.open = false; }
+                }
+                // 此电脑视图：打开系统信息（此电脑属性）
+                if AppState.current-vpath == "this-pc://": MenuRow {
+                    glyph: "\u{E946}"; label: "此电脑属性";
+                    clicked => { AppState.open-computer-properties(); root.open = false; }
                 }
             }
 

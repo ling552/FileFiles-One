@@ -34,6 +34,8 @@ export component InputOverlay inherits TouchArea {
     property <length> box-y1;
     // 跨面板拖拽状态
     property <bool> dragging: false;
+    // 单面板内部拖拽（可放到本视图文件夹上移动）；指针出界才升级 OLE 拖出
+    property <bool> same-drag: false;
     // 按下信息
     property <length> press-x;
     property <length> press-y;
@@ -184,8 +186,24 @@ export component InputOverlay inherits TouchArea {
                     : AppState.r-entries[root.press-idx].name;
                 AppState.pane-drag-active = true;
             } else if (root.press-idx >= 0) {
-                root.start-drag-out();
+                // 单面板：先进入内部拖拽（可放到本视图文件夹上移动）；
+                // 指针拖出视图边界才升级为 OLE 拖出到其他应用
+                root.same-drag = true;
+                root.dragging = true;
+                AppState.pane-drag-source = root.pane;
+                AppState.pane-drag-label = root.pane == "left"
+                    ? AppState.entries[root.press-idx].name
+                    : AppState.r-entries[root.press-idx].name;
+                AppState.pane-drag-active = true;
             }
+        }
+        // 内部拖拽中指针离开视图边界 → 升级为 OLE 拖出
+        if (root.same-drag && root.dragging
+            && (self.mouse-x < 0px || self.mouse-x > self.width
+                || self.mouse-y < 0px || self.mouse-y > self.height)) {
+            root.same-drag = false;
+            root.start-drag-out();
+            return;
         }
         if (root.box-active) {
             root.box-x1 = self.mouse-x;
@@ -217,10 +235,24 @@ export component InputOverlay inherits TouchArea {
             root.press-idx = root.hit-idx(self.mouse-x, self.mouse-y);
             root.press-empty = root.press-idx < 0;
             root.dragging = false;
+            root.same-drag = false;
             root.box-active = false;
         }
         if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
-            if (root.dragging) {
+            if (root.dragging && root.same-drag) {
+                // 单面板内部拖拽放下：落在「其它文件夹」上→请求询问移动；否则取消
+                let hit = root.hit-idx(self.mouse-x, self.mouse-y);
+                let is-dir = hit >= 0 && (root.pane == "left"
+                    ? AppState.entries[hit].is-dir
+                    : AppState.r-entries[hit].is-dir);
+                if (hit >= 0 && hit != root.press-idx && is-dir) {
+                    AppState.request-move-onto(root.pane, root.press-idx, hit);
+                }
+                root.same-drag = false;
+                root.dragging = false;
+                AppState.pane-drag-active = false;
+                AppState.pane-drag-source = "";
+            } else if (root.dragging) {
                 // 跨面板放下：源=左则落点须越过分隔线进入右面板，反之亦然
                 if (root.pane == "left"
                     && (self.absolute-position.x + self.mouse-x) > AppState.pane-split-x) {
@@ -266,6 +298,7 @@ export component InputOverlay inherits TouchArea {
                 }
             }
             root.dragging = false;
+            root.same-drag = false;
             root.box-active = false;
         }
         // 右键：选中并弹出菜单（仅左面板有上下文菜单）。

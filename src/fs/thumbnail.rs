@@ -33,6 +33,26 @@ fn path_cache() -> &'static Mutex<HashMap<String, Arc<IconPixels>>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 侧栏专用图标缓存（按真实路径/特殊键），**永不淘汰**。
+/// 侧栏条目少（~几十个），独立于会被清空的 type/path 缓存，
+/// 保证系统图标模式下侧栏图标不随主缓存清理而回退为内置图标。
+fn sidebar_cache() -> &'static Mutex<HashMap<String, Arc<IconPixels>>> {
+    static C: OnceLock<Mutex<HashMap<String, Arc<IconPixels>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 读侧栏专用缓存（不触发提取）
+pub fn sidebar_icon_get(key: &str) -> Option<Arc<IconPixels>> {
+    sidebar_cache().lock().ok()?.get(key).cloned()
+}
+
+/// 写侧栏专用缓存（后台预热线程提取成功后调用）
+pub fn sidebar_icon_set(key: &str, icon: Arc<IconPixels>) {
+    if let Ok(mut c) = sidebar_cache().lock() {
+        c.insert(key.to_string(), icon);
+    }
+}
+
 /// 文件夹在类型缓存中的特殊键（用控制字符避免与任何扩展名冲突）。
 const DIR_KEY: &str = "\u{0}<dir>";
 /// 无扩展名普通文件的类型缓存键，不能与文件夹共用空字符串。
@@ -293,6 +313,19 @@ pub fn special_dir_icon_cached(path: &str, size: u32) -> Option<Arc<IconPixels>>
 
 #[cfg(not(windows))]
 pub fn special_dir_icon_cached(_path: &str, _size: u32) -> Option<Arc<IconPixels>> {
+    None
+}
+
+/// 仅查缓存的特殊目录图标（不触发提取，供 UI 线程 build_sidebar 无阻塞调用）。
+/// 未命中返回 None，调用方回退内置 glyph；后台预热线程会填充缓存。
+#[cfg(windows)]
+pub fn special_dir_icon_cache_only(path: &str) -> Option<Arc<IconPixels>> {
+    let key = format!("{}|specialdir", path);
+    path_cache().lock().ok()?.get(&key).cloned()
+}
+
+#[cfg(not(windows))]
+pub fn special_dir_icon_cache_only(_path: &str) -> Option<Arc<IconPixels>> {
     None
 }
 

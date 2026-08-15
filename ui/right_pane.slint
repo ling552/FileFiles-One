@@ -41,6 +41,7 @@ component RightList inherits Rectangle {
                 label: entry.icon-label;
                 thumb: entry.thumb;
                 has-thumb: entry.has-thumb;
+                has-files: entry.has-files;
                 compact: true;
                 box: root.icon-box;
             }
@@ -179,6 +180,7 @@ component RightGrid inherits Rectangle {
                             label: card.entry.icon-label;
                             thumb: card.entry.thumb;
                             has-thumb: card.entry.has-thumb;
+                            has-files: card.entry.has-files;
                             box: root.icon-box;
                         }
                         if AppState.r-editing-index != cell.idx: name-area := Rectangle {
@@ -253,6 +255,7 @@ component RightGrid inherits Rectangle {
             label: entry.icon-label;
             thumb: entry.thumb;
             has-thumb: entry.has-thumb;
+            has-files: entry.has-files;
             box: root.icon-box;
         }
         selected-name-text := Text {
@@ -345,10 +348,10 @@ export component RightPane inherits Rectangle {
         padding: 6px;
         Rectangle {
             vertical-stretch: 1;
-            if AppState.view-mode == "grid": RightGrid {
+            if AppState.r-view-mode == "grid": RightGrid {
                 request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
             }
-            if AppState.view-mode != "grid": RightList {
+            if AppState.r-view-mode != "grid": RightList {
                 request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
             }
         }

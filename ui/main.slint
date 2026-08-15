@@ -427,11 +427,28 @@ export component MainWindow inherits Window {
                                         padding: 6px;
                                         ThisPcView {
                                             request-context-menu(idx, mx, my) => {
-                                                if (idx >= 0) {
-                                                    AppState.show-system-menu(idx, mx + AppState.sidebar-w + 7px + 6px, my + 40px + Theme.toolbar-h + 1px + Theme.actionbar-h + 6px);
+                                                let X = mx + AppState.sidebar-w + 7px + 6px;
+                                                let Y = my + 40px + Theme.toolbar-h + 1px + Theme.actionbar-h + 6px;
+                                                if (AppState.set-context-menu-system) {
+                                                    // 系统模式：驱动器用对象 Shell 菜单；空白用此电脑命名空间菜单（查看/排序/刷新/属性）
+                                                    if (idx >= 0) {
+                                                        AppState.show-system-menu(idx, X, Y);
+                                                    } else {
+                                                        AppState.show-system-menu-path("this-pc://", X, Y);
+                                                    }
                                                 } else {
-                                                    // 空白处：虚拟目录无 Shell 背景菜单，Rust 侧静默忽略
-                                                    AppState.show-system-background-menu(mx + AppState.sidebar-w + 7px + 6px, my + 40px + Theme.toolbar-h + 1px + Theme.actionbar-h + 6px);
+                                                    // 内置模式：自定义菜单；此电脑无新建操作（context_menu 内按 current-vpath 隐藏）
+                                                    ctxmenu.is-background = idx < 0;
+                                                    ctxmenu.target-index = idx;
+                                                    ctxmenu.menu-x = X;
+                                                    ctxmenu.menu-y = Y;
+                                                    if (idx >= 0) {
+                                                        ctxmenu.target-is-dir = AppState.entries[idx].is-dir;
+                                                        ctxmenu.target-important = AppState.entries[idx].tag-important;
+                                                        ctxmenu.target-archive = AppState.entries[idx].tag-archive;
+                                                        ctxmenu.target-done = AppState.entries[idx].tag-done;
+                                                    }
+                                                    ctxmenu.open = true;
                                                 }
                                             }
                                         }

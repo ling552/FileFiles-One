@@ -23,6 +23,8 @@ export struct FileEntry {
     // 缩略图/系统图标（异步加载后由 Rust 回填）
     thumb: image,
     has-thumb: bool,
+    // 文件夹是否含子项（内置图标模式下据此显示「有文件的文件夹」图标，后台异步回填）
+    has-files: bool,
     // ── "此电脑"平铺视图专用：驱动器容量信息（普通文件/文件夹为 0/空/透明）──
     disk-ratio: float,    // 已用比例 0..1，>0 时平铺视图绘制容量条
     disk-info: string,    // 容量副标题，如「可用 120 GB / 共 512 GB」
@@ -132,6 +134,8 @@ export global AppState {
     // 布局：仅 "grid" 网格 / "list" 详细信息两种，与是否双面板正交。
     // 进入双面板后两侧面板共用此布局；单面板时主区域使用此布局。
     in-out property <string> view-mode: "list";
+    // 右面板独立视图（双面板下与 view-mode 正交，可各自网格/列表）
+    in-out property <string> r-view-mode: "list";
     // 是否处于双面板模式（与 view-mode 正交：双面板下两侧仍按 view-mode 渲染）
     in-out property <bool> dual-pane: false;
     // 双面板左侧占比（0.15..0.85），由分隔条拖拽调整、设置项联动、Rust 持久化
@@ -472,6 +476,10 @@ export global AppState {
     // OLE 拖出：把选中文件拖到其他应用（参数：源面板 "left"/"right"、按下条目下标）。
     // Rust 端模态执行 DoDragDrop，返回后自行复位指针状态。
     callback drag-out(string, int);
+    // 单面板内部拖拽放到文件夹上：询问确认后移动 (pane, 源下标, 目标文件夹下标)
+    callback request-move-onto(string, int, int);
+    // 打开「此电脑」属性（系统信息页）
+    callback open-computer-properties();
     // 固定到快速访问（参数：目标下标；仅文件夹有效）
     callback pin-to-quick-access(int);
 

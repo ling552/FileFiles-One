@@ -87,6 +87,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let core = Rc::new(RefCell::new(AppCore::new(start.clone())));
     core.borrow_mut().config = startup_config;
 
+    // 注册侧栏图标后台加载完成后的重建入口（须在首次 build_sidebar 之前）
+    ui_bridge::init_sidebar_warm(ui.as_weak());
+
     // 首次加载
     load_current(&ui, &core);
     // 右侧独立面板首次加载（双面板视图用）
@@ -187,6 +190,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // 设备/驱动器热插拔定时轮询：插拔 U 盘/手机或挂载/卸载分区时自动刷新侧边栏与此电脑视图
     bind_device_polling(&ui, &core);
 
+    // 后台预热侧栏缓存（特殊目录系统图标 + 快速访问枚举），完成后重建侧栏，
+    // 避免 UI 线程在 build_sidebar 内同步做 COM 提取造成动画卡顿
+    warm_sidebar_caches(&ui);
+
     // 应用更新：关于页 GitHub 链接 + 检查更新 / 带进度下载 / 启动安装
     bind_update(&ui, &core);
 
@@ -224,6 +231,43 @@ fn warmup_preview_window(ui: &MainWindow) {
                 }
             },
         );
+    });
+}
+
+/// 后台预热侧栏缓存：特殊目录系统图标 + 快速访问枚举（均为阻塞 COM，
+/// 不能在 UI 线程跑）。完成后回事件循环触发 devices-changed 重建侧栏，
+/// 此时 build_sidebar 全部命中缓存，不再卡顿。
+fn warm_sidebar_caches(ui: &MainWindow) {
+    let w = ui.as_weak();
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            }
+            // 特殊目录系统图标（桌面/下载/文档/图片/音乐/视频）
+            for dir in [
+                dirs::desktop_dir(),
+                dirs::download_dir(),
+                dirs::document_dir(),
+                dirs::picture_dir(),
+                dirs::audio_dir(),
+                dirs::video_dir(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let p = dir.to_string_lossy().trim_end_matches('\\').to_string();
+                let _ = fs::thumbnail::special_dir_icon_cached(&p, 128);
+            }
+            // 快速访问枚举（填充 15s 缓存）
+            let _ = fs::quickaccess::list();
+        }
+        // 回主线程重建侧栏（此时全部命中缓存）
+        let _ = w.upgrade_in_event_loop(|ui| {
+            ui.global::<AppState>().invoke_devices_changed();
+        });
     });
 }
 
@@ -763,15 +807,16 @@ fn bind_layout(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     state.on_delete_permanent_selected(move || {
         if let Some(ui) = w.upgrade() {
             let paths = c.borrow().selected_paths();
-            let mut ok = 0;
-            for p in &paths {
-                if fs::recyclebin::delete_permanent(&p.to_string_lossy()).is_ok() {
-                    ok += 1;
-                }
+            if paths.is_empty() {
+                return;
             }
-            load_current(&ui, &c);
-            ui.global::<AppState>()
-                .set_status_text(format!("已彻底删除 {} 项", ok).into());
+            // 后台任务彻底删除（进度卡片反馈，不阻塞 UI）
+            c.borrow_mut().task_queue.push_back(fs::tasks::Job {
+                kind: fs::tasks::TaskKind::DeletePermanent,
+                srcs: paths,
+                dst: PathBuf::new(),
+            });
+            start_next_job(&ui, &c);
         }
     });
 
@@ -780,23 +825,24 @@ fn bind_layout(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     let c = core.clone();
     state.on_delete_permanent_all(move || {
         if let Some(ui) = w.upgrade() {
-            let paths: Vec<String> = {
+            let paths: Vec<PathBuf> = {
                 let core = c.borrow();
                 core.active_tab()
                     .entries
                     .iter()
-                    .map(|e| e.path.clone())
+                    .map(|e| PathBuf::from(&e.path))
                     .collect()
             };
-            let mut ok = 0;
-            for p in &paths {
-                if fs::recyclebin::delete_permanent(p).is_ok() {
-                    ok += 1;
-                }
+            if paths.is_empty() {
+                return;
             }
-            load_current(&ui, &c);
-            ui.global::<AppState>()
-                .set_status_text(format!("回收站已清空：彻底删除 {} 项", ok).into());
+            // 后台任务清空回收站（进度卡片反馈，不阻塞 UI）
+            c.borrow_mut().task_queue.push_back(fs::tasks::Job {
+                kind: fs::tasks::TaskKind::DeletePermanent,
+                srcs: paths,
+                dst: PathBuf::new(),
+            });
+            start_next_job(&ui, &c);
         }
     });
 }
@@ -2026,18 +2072,26 @@ fn folder_layout_for(config: &config::AppConfig, path: &Path) -> (&'static str, 
 }
 
 /// 应用当前目录已保存的视图。双面板状态属于左侧活动目录；右面板仅共享其子视图。
+/// 双面板已开启时：导航不退出双面板、不改变两侧视图（保持各面板当前/记录视图），
+/// 仅由调用方重载被导航的面板——修复「双面板下进入文件夹自动退出/切换视图」。
 fn apply_folder_layout(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     if core.borrow().active_tab().kind != app::TabKind::Files {
+        return;
+    }
+    let st = ui.global::<AppState>();
+    if st.get_dual_pane() {
+        // 双面板会话内导航：保持双面板与两侧视图不变
         return;
     }
     let (mode, dual) = {
         let c = core.borrow();
         folder_layout_for(&c.config, c.active_tab().history.current())
     };
-    let st = ui.global::<AppState>();
     st.set_view_mode(mode.into());
     st.set_dual_pane(dual);
     if dual {
+        // 开启双面板时右面板视图与左对齐，避免右侧残留旧视图
+        st.set_r_view_mode(st.get_view_mode());
         load_right(ui, core);
     } else {
         ui.invoke_clear_editing();
@@ -3167,7 +3221,6 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 .into_iter()
                 .filter(|p| !fs::devices::is_device_path(&p.to_string_lossy()))
                 .collect();
-            let n = paths.len();
             if paths.is_empty() {
                 if let Some(msg) = device_msg {
                     reload_active_pane(&ui, &c);
@@ -3176,63 +3229,25 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 }
                 return;
             }
-            // 本地项目移入回收站（可还原），与资源管理器一致
-            let msg = match fs::recyclebin::move_to_recycle_bin(&paths) {
-                Ok(_) => {
-                    // SHFileOperation 偶尔对受保护文件返回成功但实际未删除（静默失败）：
-                    // 若仍有目标存在，按权限失败处理，请求管理员提权（提权回收失败会回退永久删除）
-                    if paths.iter().any(|p| p.exists()) {
-                        let args: Vec<std::ffi::OsString> = paths
-                            .iter()
-                            .map(|path| path.as_os_str().to_os_string())
-                            .collect();
-                        if fs::elevated::retry_if_permission_denied(
-                            &std::io::Error::from_raw_os_error(5),
-                            fs::elevated::ElevatedOp::Recycle,
-                            &args,
-                        ) {
-                            "已请求管理员权限，操作完成后将自动刷新".to_string()
-                        } else {
-                            format!("删除失败：部分项目无法删除")
-                        }
-                    } else {
-                        c.borrow_mut().record_undo(app::UndoAction::Delete {
-                            paths: paths.clone(),
-                        });
-                        // 启用后台索引时从索引移除被删项（含目录子项）
-                        if c.borrow().config.settings.background_index {
-                            for p in &paths {
-                                fs::index::remove_path(p);
-                            }
-                        }
-                        format!("已将 {} 个项目移入回收站", n)
-                    }
+            // 记录撤销 + 索引移除（入队时即记，删除在后台执行）
+            c.borrow_mut()
+                .record_undo(app::UndoAction::Delete { paths: paths.clone() });
+            if c.borrow().config.settings.background_index {
+                for p in &paths {
+                    fs::index::remove_path(p);
                 }
-                Err(e) => {
-                    let args: Vec<std::ffi::OsString> = paths
-                        .iter()
-                        .map(|path| path.as_os_str().to_os_string())
-                        .collect();
-                    if fs::elevated::retry_if_permission_denied(
-                        &e,
-                        fs::elevated::ElevatedOp::Recycle,
-                        &args,
-                    ) {
-                        "已请求管理员权限，操作完成后将自动刷新".to_string()
-                    } else {
-                        format!("删除失败：{}", e)
-                    }
-                }
-            };
-            let msg = match device_msg {
-                Some(device_msg) => format!("{}；{}", device_msg, msg),
-                None => msg,
-            };
-            reload_active_pane(&ui, &c);
-            // 大文件夹的回收站移动由 Shell 异步收尾，立即 reload 可能仍读到旧目录项；
-            // 延迟补刷两次，确保被删条目从视图消失（无需用户手动刷新）
-            schedule_pane_reloads(&ui, &c, &[600, 2000]);
-            ui.global::<AppState>().set_status_text(msg.into());
+            }
+            // 后台任务执行删除：进度卡片与粘贴/复制一致，可暂停/取消，
+            // UI 线程不再被 Shell 删除阻塞（修复大文件夹删除无反馈/卡死）
+            c.borrow_mut().task_queue.push_back(fs::tasks::Job {
+                kind: fs::tasks::TaskKind::Delete,
+                srcs: paths,
+                dst: PathBuf::new(),
+            });
+            if let Some(msg) = device_msg {
+                ui.global::<AppState>().set_status_text(msg.into());
+            }
+            start_next_job(&ui, &c);
         }
     });
 
@@ -3989,6 +4004,68 @@ fn bind_context_menu_ext(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         }
     });
 
+    // 单面板内部拖拽放到文件夹上：询问确认后后台移动
+    let w = ui.as_weak();
+    let c = core.clone();
+    state.on_request_move_onto(move |pane, src_idx, dst_idx| {
+        if let Some(ui) = w.upgrade() {
+            let right = pane.as_str() == "right";
+            let (srcs, dst) = {
+                let core = c.borrow();
+                let tab = core.pane(right);
+                let dst = match tab.entry_at(dst_idx as usize) {
+                    Some(e) if e.is_dir => PathBuf::from(&e.path),
+                    _ => return,
+                };
+                let target_selected = tab.selected.get(src_idx as usize).copied().unwrap_or(false);
+                let srcs: Vec<PathBuf> = if target_selected {
+                    core.pane_selected_paths(right)
+                } else {
+                    tab.entry_at(src_idx as usize)
+                        .map(|e| vec![PathBuf::from(&e.path)])
+                        .unwrap_or_default()
+                };
+                (srcs, dst)
+            };
+            if srcs.is_empty() || srcs.iter().any(|s| s == &dst) {
+                return;
+            }
+            // 询问是否移动，确认后才执行
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    MessageBoxW, MB_ICONQUESTION, MB_YESNO, IDYES,
+                };
+                let text = windows::core::HSTRING::from(&format!(
+                    "将 {} 个项目移动到「{}」？",
+                    srcs.len(),
+                    dst.display()
+                ));
+                let cap = windows::core::HSTRING::from("移动");
+                let ans = unsafe { MessageBoxW(None, &text, &cap, MB_YESNO | MB_ICONQUESTION) };
+                if ans != IDYES {
+                    return;
+                }
+            }
+            {
+                let mut core = c.borrow_mut();
+                if !fs::devices::is_device_path(&dst.to_string_lossy()) {
+                    let pairs: Vec<(PathBuf, PathBuf)> = srcs
+                        .iter()
+                        .filter_map(|s| s.file_name().map(|n| (s.clone(), dst.join(n))))
+                        .collect();
+                    core.record_undo(app::UndoAction::Move { pairs });
+                }
+                core.task_queue.push_back(fs::tasks::Job {
+                    kind: fs::tasks::TaskKind::Move,
+                    srcs,
+                    dst,
+                });
+            }
+            start_next_job(&ui, &c);
+        }
+    });
+
     // 固定到快速访问：调用系统 pintohome 动词写入真实快速访问，并刷新侧边栏
     let w = ui.as_weak();
     let c = core.clone();
@@ -4640,7 +4717,13 @@ fn bind_view_and_search(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     let c = core.clone();
     state.on_set_view(move |mode| {
         if let Some(ui) = w.upgrade() {
-            ui.global::<AppState>().set_view_mode(mode);
+            let st = ui.global::<AppState>();
+            // 双面板下视图切换只作用于活动面板（左右独立），不统一切换
+            if st.get_dual_pane() && st.get_active_pane().as_str() == "right" {
+                st.set_r_view_mode(mode);
+            } else {
+                st.set_view_mode(mode);
+            }
             save_current_folder_layout(&ui, &c);
         }
     });
@@ -4653,6 +4736,10 @@ fn bind_view_and_search(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             let st = ui.global::<AppState>();
             let on = !st.get_dual_pane();
             st.set_dual_pane(on);
+            if on {
+                // 开启双面板时右面板视图初始与左一致
+                st.set_r_view_mode(st.get_view_mode());
+            }
             save_current_folder_layout(&ui, &c);
             if on {
                 load_right(&ui, &c);
@@ -4695,6 +4782,13 @@ fn bind_view_and_search(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             core.config.layout.dual_ratio = ratio.clamp(0.15, 0.85);
             core.config.save();
         }
+    });
+
+    // 打开「此电脑」属性（系统信息页）
+    state.on_open_computer_properties(move || {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg("ms-settings:about")
+            .spawn();
     });
 
     let w = ui.as_weak();

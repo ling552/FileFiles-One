@@ -34,13 +34,15 @@ pub fn invalidate() {
     }
 }
 
-/// 读取系统快速访问下的全部文件夹项（带 2 秒短缓存）
+/// 读取系统快速访问下的全部文件夹项（带 15 秒缓存）。
+/// 缓存拉长到 15s：COM 枚举约需数百毫秒，若每次侧栏重建都跑会阻塞 UI 线程
+/// 造成动画卡顿；固定/取消固定会调 invalidate() 强制刷新，保证一致性。
 #[cfg(windows)]
 pub fn list() -> Vec<QaItem> {
     // 命中新鲜缓存直接返回
     if let Ok(c) = cache().lock() {
         if let Some((ts, items)) = c.as_ref() {
-            if ts.elapsed() < Duration::from_secs(2) {
+            if ts.elapsed() < Duration::from_secs(15) {
                 return items.clone();
             }
         }
@@ -176,11 +178,14 @@ pub fn pin(path: &str) -> bool {
     ok
 }
 
-/// 从系统快速访问取消固定（预留接口：供侧边栏右键「取消固定」使用）
+/// 从系统快速访问取消固定。
+/// `unpinfromhome` 动词只在「快速访问」命名空间的上下文菜单中注册，
+/// 在真实文件夹路径的上下文菜单里不存在，故优先通过 QA 子项调用；
+/// 失败再回退到真实路径动词。
 #[cfg(windows)]
 #[allow(dead_code)]
 pub fn unpin(path: &str) -> bool {
-    let ok = invoke_verb(path, "unpinfromhome");
+    let ok = invoke_qa_verb(path, "unpinfromhome") || invoke_verb(path, "unpinfromhome");
     if ok {
         invalidate();
     }
@@ -195,21 +200,11 @@ pub fn unpin(path: &str) -> bool {
 /// 这是最可靠的方式（直接用动词名调用对部分处理器无效）。
 #[cfg(windows)]
 fn invoke_verb(path: &str, verb: &str) -> bool {
-    use windows::core::{PCSTR, PCWSTR, PSTR};
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{
-        IContextMenu, IShellFolder, SHBindToParent, SHParseDisplayName, CMINVOKECOMMANDINFO,
-        GCS_VERBW,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuItemID, SW_SHOWNORMAL,
-    };
-
-    const CMF_NORMAL: u32 = 0x0000_0000;
-    const ID_CMD_FIRST: u32 = 1;
-    const ID_CMD_LAST: u32 = 0x7FFF;
+    use windows::Win32::UI::Shell::{IContextMenu, IShellFolder, SHBindToParent, SHParseDisplayName};
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -243,71 +238,174 @@ fn invoke_verb(path: &str, verb: &str) -> bool {
             }
         };
 
-        let mut ok = false;
-        if let Ok(hmenu) = CreatePopupMenu() {
-            // 必须先 QueryContextMenu，处理器才会注册动词映射
-            let _ = ctx_menu.QueryContextMenu(hmenu, 0, ID_CMD_FIRST, ID_CMD_LAST, CMF_NORMAL);
-
-            // 遍历菜单项，匹配规范动词名 == verb 的菜单 ID
-            let mut matched_offset: Option<u32> = None;
-            let count = GetMenuItemCount(Some(hmenu));
-            for i in 0..count {
-                let id = GetMenuItemID(hmenu, i);
-                if id == 0 || id == u32::MAX {
-                    continue;
-                }
-                // 命令偏移量 = 菜单 ID - ID_CMD_FIRST
-                let offset = id - ID_CMD_FIRST;
-                let mut buf = [0u16; 128];
-                if ctx_menu
-                    .GetCommandString(
-                        offset as usize,
-                        GCS_VERBW,
-                        None,
-                        PSTR(buf.as_mut_ptr() as *mut u8),
-                        buf.len() as u32,
-                    )
-                    .is_ok()
-                {
-                    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                    let name = String::from_utf16_lossy(&buf[..len]);
-                    if name.eq_ignore_ascii_case(verb) {
-                        matched_offset = Some(offset);
-                        break;
-                    }
-                }
-            }
-
-            if let Some(offset) = matched_offset {
-                // 以命令偏移量调用（MAKEINTRESOURCE 约定：lpVerb 低位为命令偏移）
-                let mut info = CMINVOKECOMMANDINFO {
-                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
-                    hwnd: HWND::default(),
-                    lpVerb: PCSTR(offset as usize as *const u8),
-                    nShow: SW_SHOWNORMAL.0,
-                    ..Default::default()
-                };
-                ok = ctx_menu.InvokeCommand(&mut info).is_ok();
-            }
-
-            // 回退：直接用规范动词名调用（对部分处理器仍有效）
-            if !ok {
-                let verb_bytes: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
-                let mut info = CMINVOKECOMMANDINFO {
-                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
-                    hwnd: HWND::default(),
-                    lpVerb: PCSTR(verb_bytes.as_ptr()),
-                    nShow: SW_SHOWNORMAL.0,
-                    ..Default::default()
-                };
-                ok = ctx_menu.InvokeCommand(&mut info).is_ok();
-            }
-
-            let _ = DestroyMenu(hmenu);
-        }
+        let ok = invoke_verb_on_ctx(&ctx_menu, verb);
 
         CoTaskMemFree(Some(pidl as *const _));
         ok
+    }
+}
+
+/// 在已取得的 IContextMenu 上执行规范动词：先 QueryContextMenu 注册动词映射，
+/// 遍历菜单项用 GetCommandString(GCS_VERBW) 匹配动词名，以命令偏移量调用；
+/// 失败回退为直接以动词名调用。
+#[cfg(windows)]
+unsafe fn invoke_verb_on_ctx(
+    ctx_menu: &windows::Win32::UI::Shell::IContextMenu,
+    verb: &str,
+) -> bool {
+    use windows::core::{PCSTR, PSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::{CMINVOKECOMMANDINFO, GCS_VERBW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, DestroyMenu, GetMenuItemCount, GetMenuItemID, SW_SHOWNORMAL,
+    };
+    const CMF_NORMAL: u32 = 0x0000_0000;
+    const ID_CMD_FIRST: u32 = 1;
+    const ID_CMD_LAST: u32 = 0x7FFF;
+
+    let mut ok = false;
+    if let Ok(hmenu) = CreatePopupMenu() {
+        let _ = ctx_menu.QueryContextMenu(hmenu, 0, ID_CMD_FIRST, ID_CMD_LAST, CMF_NORMAL);
+        let mut matched_offset: Option<u32> = None;
+        let count = GetMenuItemCount(Some(hmenu));
+        for i in 0..count {
+            let id = GetMenuItemID(hmenu, i);
+            if id == 0 || id == u32::MAX {
+                continue;
+            }
+            let offset = id - ID_CMD_FIRST;
+            let mut buf = [0u16; 128];
+            if ctx_menu
+                .GetCommandString(
+                    offset as usize,
+                    GCS_VERBW,
+                    None,
+                    PSTR(buf.as_mut_ptr() as *mut u8),
+                    buf.len() as u32,
+                )
+                .is_ok()
+            {
+                let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                let name = String::from_utf16_lossy(&buf[..len]);
+                if name.eq_ignore_ascii_case(verb) {
+                    matched_offset = Some(offset);
+                    break;
+                }
+            }
+        }
+        if let Some(offset) = matched_offset {
+            let mut info = CMINVOKECOMMANDINFO {
+                cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                hwnd: HWND::default(),
+                lpVerb: PCSTR(offset as usize as *const u8),
+                nShow: SW_SHOWNORMAL.0,
+                ..Default::default()
+            };
+            ok = ctx_menu.InvokeCommand(&mut info).is_ok();
+        }
+        if !ok {
+            let verb_bytes: Vec<u8> = verb.bytes().chain(std::iter::once(0)).collect();
+            let mut info = CMINVOKECOMMANDINFO {
+                cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                hwnd: HWND::default(),
+                lpVerb: PCSTR(verb_bytes.as_ptr()),
+                nShow: SW_SHOWNORMAL.0,
+                ..Default::default()
+            };
+            ok = ctx_menu.InvokeCommand(&mut info).is_ok();
+        }
+        let _ = DestroyMenu(hmenu);
+    }
+    ok
+}
+
+/// 在「快速访问」命名空间内枚举子项，找到真实路径匹配的项并对其执行动词。
+/// unpinfromhome 只在该命名空间注册，故取消固定必须走这里。
+#[cfg(windows)]
+fn invoke_qa_verb(path: &str, verb: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        IEnumIDList, IShellFolder, SHGetDesktopFolder, SHParseDisplayName, SHCONTF_FOLDERS,
+        SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
+    };
+
+    const QUICK_ACCESS: &str = "shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}";
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let desktop: IShellFolder = match SHGetDesktopFolder() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let wide: Vec<u16> = QUICK_ACCESS.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut qa_pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        if SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut qa_pidl, 0, None).is_err()
+            || qa_pidl.is_null()
+        {
+            return false;
+        }
+        let qa_folder: IShellFolder = match desktop.BindToObject(qa_pidl, None) {
+            Ok(f) => f,
+            Err(_) => {
+                CoTaskMemFree(Some(qa_pidl as *const _));
+                return false;
+            }
+        };
+        CoTaskMemFree(Some(qa_pidl as *const _));
+
+        let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0 | SHCONTF_INCLUDEHIDDEN.0) as u32;
+        let mut enum_opt: Option<IEnumIDList> = None;
+        let _ = qa_folder.EnumObjects(HWND::default(), flags, &mut enum_opt);
+        let Some(enum_ids) = enum_opt else {
+            return false;
+        };
+
+        loop {
+            let mut child: [*mut ITEMIDLIST; 1] = [std::ptr::null_mut()];
+            let mut fetched: u32 = 0;
+            let hr = enum_ids.Next(&mut child, Some(&mut fetched));
+            if hr.is_err() || fetched == 0 || child[0].is_null() {
+                break;
+            }
+            let child_pidl = child[0];
+            let matched = qa_child_path(&qa_folder, child_pidl)
+                .map(|p| p.eq_ignore_ascii_case(path))
+                .unwrap_or(false);
+            if matched {
+                let children: [*const ITEMIDLIST; 1] = [child_pidl];
+                let ok = match qa_folder.GetUIObjectOf(HWND::default(), &children, None) {
+                    Ok(cm) => invoke_verb_on_ctx(&cm, verb),
+                    Err(_) => false,
+                };
+                CoTaskMemFree(Some(child_pidl as *const _));
+                return ok;
+            }
+            CoTaskMemFree(Some(child_pidl as *const _));
+        }
+        false
+    }
+}
+
+/// 取快速访问子项的真实解析路径
+#[cfg(windows)]
+unsafe fn qa_child_path(
+    folder: &windows::Win32::UI::Shell::IShellFolder,
+    child: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
+) -> Option<String> {
+    use windows::Win32::UI::Shell::Common::STRRET;
+    use windows::Win32::UI::Shell::{StrRetToBufW, SHGDN_FORPARSING};
+    let mut strret: STRRET = STRRET::default();
+    folder.GetDisplayNameOf(child, SHGDN_FORPARSING, &mut strret).ok()?;
+    let mut buf = [0u16; 260];
+    StrRetToBufW(&mut strret, Some(child), &mut buf).ok()?;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    if len == 0 {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&buf[..len]))
     }
 }
 

@@ -27,6 +27,10 @@ pub enum TaskKind {
     /// 压缩归档：srcs 为待压缩项，dst 为归档输出完整路径
     /// （入队时已避让重名，输出格式按 dst 扩展名识别）
     Compress,
+    /// 删除（移入回收站，可还原）：srcs 为待删项，dst 未用
+    Delete,
+    /// 永久删除（不可逆）：srcs 为待删项，dst 未用
+    DeletePermanent,
 }
 
 impl TaskKind {
@@ -36,6 +40,8 @@ impl TaskKind {
             TaskKind::Move => "移动文件",
             TaskKind::Extract => "解压文件",
             TaskKind::Compress => "压缩文件",
+            TaskKind::Delete => "删除文件",
+            TaskKind::DeletePermanent => "永久删除",
         }
     }
 }
@@ -171,6 +177,11 @@ pub fn run(
         return run_mtp(job, ctrl, report, ask);
     }
 
+    // 删除类任务：逐项执行并按项数上报进度（不走字节扫描/冲突流程）
+    if matches!(job.kind, TaskKind::Delete | TaskKind::DeletePermanent) {
+        return run_delete(job, ctrl, report);
+    }
+
     let op = job.kind.label();
     let target = job.dst.to_string_lossy().to_string();
     // 总量统计：解压按归档条目表（tar 系无法便宜预知，退化为压缩输入字节，
@@ -204,6 +215,10 @@ pub fn run(
         TaskKind::Extract => return runner.run_extract(&job),
         TaskKind::Compress => return runner.run_compress(&job),
         TaskKind::Copy | TaskKind::Move => {}
+        // 删除类在 runner 构建前已由 run_delete 处理，不会到达这里
+        TaskKind::Delete | TaskKind::DeletePermanent => {
+            unreachable!("delete handled before runner")
+        }
     }
 
     let mut ok = 0;
@@ -267,6 +282,75 @@ pub fn run(
         error,
         cancelled: false,
         completed_paths,
+    }
+}
+
+/// 删除类任务执行器：逐项删除（回收站或永久），按顶层项数上报进度。
+/// 在后台线程运行，UI 线程不再被 Shell 删除阻塞（修复大文件夹删除卡死）。
+fn run_delete(job: Job, ctrl: Arc<TaskControl>, report: impl Fn(Progress)) -> TaskResult {
+    let op = job.kind.label();
+    let permanent = job.kind == TaskKind::DeletePermanent;
+    let total = job.srcs.len() as i32;
+    let mut ok = 0i32;
+    let mut error = String::new();
+
+    let emit = |i: usize, name: &str, done: bool| {
+        report(Progress {
+            operation: op.to_string(),
+            current_file: name.to_string(),
+            target: String::new(),
+            completed: i as i32,
+            total,
+            fraction: if done {
+                1.0
+            } else if total > 0 {
+                (i as f32 / total as f32).clamp(0.0, 0.99)
+            } else {
+                0.0
+            },
+            speed: String::new(),
+            eta: String::new(),
+        });
+    };
+
+    emit(0, "准备中…", false);
+
+    for (i, src) in job.srcs.iter().enumerate() {
+        if ctrl.is_cancelled() {
+            return TaskResult {
+                ok,
+                skipped: 0,
+                error,
+                cancelled: true,
+                completed_paths: Vec::new(),
+            };
+        }
+        ctrl.wait_if_paused();
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        emit(i, &name, false);
+
+        let res = if permanent {
+            // 回收站视图的彻底删除：$R 内容 + 配对 $I 元数据
+            super::recyclebin::delete_permanent(&src.to_string_lossy())
+        } else {
+            super::recyclebin::move_to_recycle_bin(&[src.clone()])
+        };
+        match res {
+            Ok(()) => ok += 1,
+            Err(e) => error = e.to_string(),
+        }
+    }
+
+    emit(total as usize, "", true);
+    TaskResult {
+        ok,
+        skipped: 0,
+        error,
+        cancelled: false,
+        completed_paths: Vec::new(),
     }
 }
 

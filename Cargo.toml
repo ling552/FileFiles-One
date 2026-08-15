@@ -1,7 +1,7 @@
 # FileFiles One - Rust + Slint 现代文件管理器
 [package]
 name = "filefiles-one"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "现代化桌面文件管理器，Rust + Slint 实现"
 build = "build.rs"

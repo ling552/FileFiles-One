@@ -108,6 +108,8 @@ export component FileIcon inherits Rectangle {
     // 缩略图/系统图标位图：has-thumb 为真时直接渲染位图，覆盖矢量图形
     in property <image> thumb;
     in property <bool> has-thumb: false;
+    // 文件夹是否含子项：内置图标模式下显示「有文件的文件夹」（文件夹+露出的纸张）
+    in property <bool> has-files: false;
     // 仅真实内容缩略图（图片/视频首帧）裁成圆角；Shell 图标保留透明边缘，
     // 尤其是手机图标的顶部与底部，不能由外层 clip 截掉。
     property <bool> round-thumb: icon-class == "image" || icon-class == "video";
@@ -152,6 +154,15 @@ export component FileIcon inherits Rectangle {
         ? (Theme.dark ? #c7d4e1 : #5a6a7e)
         : #ffffff;
 
+    // 有文件的文件夹：先画露出的白色纸张（顶部），再叠文件夹主体遮住下半部
+    if !root.has-thumb && !root.compact && icon-class == "folder" && root.has-files: Path {
+        x: root.inner-off + root.inner-s * 0.34;
+        y: root.inner-off + root.inner-s * 0.02;
+        width: root.inner-s;
+        height: root.inner-s;
+        fill: #ffffff;
+        commands: "M8 0 H14 L17 3 V8 H8 Z";
+    }
     if !root.has-thumb && !root.compact && icon-class == "folder": FolderGlyph {
         x: root.inner-off; y: root.inner-off;
         width: root.inner-s; height: root.inner-s;
@@ -203,7 +214,14 @@ export component FileIcon inherits Rectangle {
     }
 
     // 紧凑模式：直接用主题文字色绘制，无背景
-    if !root.has-thumb && root.compact && icon-class == "folder": Glyph {
+    // 紧凑模式：有文件的文件夹（纸张+文件夹合并 path）
+    if !root.has-thumb && root.compact && icon-class == "folder" && root.has-files: Glyph {
+        x: 0; y: 0;
+        width: root.box; height: root.box;
+        d: "M9 2 H14 L16 4 V7 H9 Z M10 6 H4 C2.9 6 2 6.9 2 8 V18 C2 19.1 2.9 20 4 20 H20 C21.1 20 22 19.1 22 18 V10 C22 8.9 21.1 8 20 8 H12 L10 6 Z";
+        glyph-color: root.glyph-color;
+    }
+    if !root.has-thumb && root.compact && icon-class == "folder" && !root.has-files: Glyph {
         x: 0; y: 0;
         width: root.box; height: root.box;
         d: "M10 4 H4 C2.9 4 2 4.9 2 6 V18 C2 19.1 2.9 20 4 20 H20 C21.1 20 22 19.1 22 18 V8 C22 6.9 21.1 6 20 6 H12 L10 4 Z";
