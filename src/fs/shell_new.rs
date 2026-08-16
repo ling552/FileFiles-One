@@ -226,45 +226,60 @@ fn create_with_base(
     base_name: &str,
     item: &ShellNewItem,
 ) -> std::io::Result<PathBuf> {
-    // 去重文件名生成（与 operations::new_file 一致逻辑）
-    let mut final_name = format!("{}{}", base_name, &item.ext);
-    let mut target = parent.join(&final_name);
-    let mut n = 2;
-    while target.exists() {
-        final_name = format!("{} ({}){}", base_name, n, &item.ext);
-        target = parent.join(&final_name);
-        n += 1;
-        if n > 999 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "文件名冲突过多",
-            ));
-        }
-    }
+    // 以 create_new 独占创建并按序号避让：exists 检查与写入之间存在竞态，
+    // 并发场景会覆盖竞态窗口内刚出现的同名文件
+    let (mut file, target) = claim_new_file(parent, base_name, &item.ext)?;
 
-    // 按模板类型创建文件
+    // 按模板类型填充内容（NullFile 保持空文件即可）
+    use std::io::Write;
     match &item.kind {
-        ShellNewKind::NullFile => {
-            std::fs::write(&target, &[])?;
-        }
+        ShellNewKind::NullFile => {}
         ShellNewKind::FileName => {
             if let Some(template) = &item.template_path {
                 let tpl = PathBuf::from(template);
                 if tpl.exists() {
-                    std::fs::copy(&tpl, &target)?;
-                } else {
-                    // 模板文件不存在，回退到空文件
-                    std::fs::write(&target, &[])?;
+                    let mut src = std::fs::File::open(&tpl)?;
+                    std::io::copy(&mut src, &mut file)?;
                 }
-            } else {
-                std::fs::write(&target, &[])?;
+                // 模板文件不存在，回退到空文件（create_new 已创建空文件）
             }
         }
         ShellNewKind::Data => {
-            let bytes = item.data.as_deref().unwrap_or(&[]);
-            std::fs::write(&target, bytes)?;
+            file.write_all(item.data.as_deref().unwrap_or(&[]))?;
         }
     }
 
     Ok(target)
+}
+
+/// 独占创建 `base_name + 序号 + ext` 文件，重名时从 2 起追加 " (n)" 避让。
+/// 返回写入句柄与最终路径。
+fn claim_new_file(
+    parent: &std::path::Path,
+    base_name: &str,
+    ext: &str,
+) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let mut final_name = format!("{base_name}{ext}");
+    let mut n = 2;
+    loop {
+        let target = parent.join(&final_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(f) => return Ok((f, target)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if n > 999 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "文件名冲突过多",
+                    ));
+                }
+                final_name = format!("{base_name} ({n}){ext}");
+                n += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }

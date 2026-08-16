@@ -258,17 +258,24 @@ type IconJob = (usize, crate::fs::thumbnail::IconRequest);
 /// 把当前目录条目推送到 UI（entries / crumbs / 标题 / 状态栏）
 /// 解析 "#rrggbb" / "#aarrggbb" 为 Slint Color
 fn hex_to_color(hex: &str) -> slint::Color {
+    let default = slint::Color::from_rgb_u8(0, 120, 212);
     let h = hex.trim_start_matches('#');
-    let parse = |s: &str| u8::from_str_radix(s, 16).unwrap_or(0);
-    match h.len() {
-        6 => slint::Color::from_rgb_u8(parse(&h[0..2]), parse(&h[2..4]), parse(&h[4..6])),
+    // 按字节切片前先验证全为 ASCII 十六进制字符：配置可被篡改，
+    // 含多字节字符且总长恰为 6/8 时字节边界切片会 panic
+    if !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return default;
+    }
+    let b = h.as_bytes();
+    let parse = |s: &[u8]| u8::from_str_radix(std::str::from_utf8(s).unwrap_or("0"), 16).unwrap_or(0);
+    match b.len() {
+        6 => slint::Color::from_rgb_u8(parse(&b[0..2]), parse(&b[2..4]), parse(&b[4..6])),
         8 => slint::Color::from_argb_u8(
-            parse(&h[0..2]),
-            parse(&h[2..4]),
-            parse(&h[4..6]),
-            parse(&h[6..8]),
+            parse(&b[0..2]),
+            parse(&b[2..4]),
+            parse(&b[4..6]),
+            parse(&b[6..8]),
         ),
-        _ => slint::Color::from_rgb_u8(0, 120, 212),
+        _ => default,
     }
 }
 

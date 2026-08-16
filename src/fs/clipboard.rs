@@ -14,10 +14,13 @@ const DROPEFFECT_MOVE: u32 = 2;
 #[cfg(windows)]
 pub fn set_text(text: &str) -> bool {
     use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
 
     // CF_UNICODETEXT 标准剪贴板格式编号
     const CF_UNICODETEXT: u32 = 13;
@@ -39,14 +42,18 @@ pub fn set_text(text: &str) -> bool {
         }
         let dst = GlobalLock(hmem) as *mut u16;
         if dst.is_null() {
+            GlobalFree(hmem);
             CloseClipboard();
             return false;
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
         GlobalUnlock(hmem);
 
-        // 所有权移交给系统；成功后不可再释放 hmem
+        // 所有权移交给系统；成功后不可再释放 hmem，失败须释放防泄漏
         let ok = !SetClipboardData(CF_UNICODETEXT, hmem as *mut c_void).is_null();
+        if !ok {
+            GlobalFree(hmem);
+        }
         CloseClipboard();
         ok
     }
@@ -76,10 +83,13 @@ fn drop_effect_format() -> u32 {
 pub fn set_files(paths: &[std::path::PathBuf], cut: bool) -> bool {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
 
     // 构造 DROPFILES(20B) + 宽字符路径列表（每项以 \0 结尾，整体以 \0\0 结尾）
     let mut buf: Vec<u8> = Vec::new();
@@ -109,25 +119,33 @@ pub fn set_files(paths: &[std::path::PathBuf], cut: bool) -> bool {
         }
         let dst = GlobalLock(hmem) as *mut u8;
         if dst.is_null() {
+            GlobalFree(hmem);
             CloseClipboard();
             return false;
         }
         std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
         GlobalUnlock(hmem);
         let ok = !SetClipboardData(CF_HDROP, hmem as *mut c_void).is_null();
+        if !ok {
+            GlobalFree(hmem);
+        }
 
-        // Preferred DropEffect：DWORD 标记复制/剪切
+        // Preferred DropEffect：DWORD 标记复制/剪切（所有权仅在写入成功时移交）
         let effect = if cut { DROPEFFECT_MOVE } else { DROPEFFECT_COPY };
         let h2 = GlobalAlloc(GMEM_MOVEABLE, 4);
         if !h2.is_null() {
+            let mut owned = true;
             let d2 = GlobalLock(h2) as *mut u32;
             if !d2.is_null() {
                 *d2 = effect;
                 GlobalUnlock(h2);
                 let fmt = drop_effect_format();
-                if fmt != 0 {
-                    SetClipboardData(fmt, h2 as *mut c_void);
+                if fmt != 0 && !SetClipboardData(fmt, h2 as *mut c_void).is_null() {
+                    owned = false;
                 }
+            }
+            if owned {
+                GlobalFree(h2);
             }
         }
         CloseClipboard();
@@ -146,7 +164,7 @@ pub fn get_files() -> Option<(Vec<std::path::PathBuf>, bool)> {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, OpenClipboard,
     };
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
     unsafe {
@@ -177,12 +195,14 @@ pub fn get_files() -> Option<(Vec<std::path::PathBuf>, bool)> {
             }
         }
 
-        // Preferred DropEffect：判断剪切（含 MOVE 位）
+        // Preferred DropEffect：判断剪切（含 MOVE 位）。
+        // 剪贴板所有者可能是任意进程，数据块大小不可信：
+        // 不足 4 字节不按 u32 解引用（防越界读），GlobalSize 在锁定前查询即可
         let mut cut = false;
         let fmt = drop_effect_format();
         if fmt != 0 {
             let h = GetClipboardData(fmt);
-            if !h.is_null() {
+            if !h.is_null() && GlobalSize(h) >= std::mem::size_of::<u32>() {
                 let p = GlobalLock(h as *mut std::ffi::c_void) as *const u32;
                 if !p.is_null() {
                     cut = *p & DROPEFFECT_MOVE != 0;

@@ -275,9 +275,31 @@ mod windows_impl {
         secs.saturating_sub(EPOCH_DIFF) as i64
     }
 
+    /// 校验路径指向回收站内的 `$R` 条目：路径须含 `$Recycle.Bin` 组件、
+    /// 文件名以 `$R` 开头。防止调用方误传任意路径触发任意删除/移动。
+    fn validate_recycle_entry(r: &Path) -> std::io::Result<()> {
+        let in_bin = r.components().any(|c| {
+            matches!(c, std::path::Component::Normal(n)
+                if n.to_string_lossy().eq_ignore_ascii_case("$recycle.bin"))
+        });
+        let is_r = r
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("$R"))
+            .unwrap_or(false);
+        if in_bin && is_r {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "非回收站条目路径",
+            ))
+        }
+    }
+
     /// 还原：把 `$R` 移回 `$I` 记录的原路径，并删除配对的 `$I`。
     pub fn restore(r_path: &str) -> std::io::Result<()> {
         let r = PathBuf::from(r_path);
+        validate_recycle_entry(&r)?;
         let parent = r.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "无效回收站路径")
         })?;
@@ -286,7 +308,7 @@ mod windows_impl {
             .and_then(|n| n.to_str())
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "无效文件名"))?;
         // $R... -> $I...
-        let i_name = format!("$I{}", &r_name[2..]);
+        let i_name = format!("$I{}", r_name.get(2..).unwrap_or_default());
         let i_path = parent.join(&i_name);
         let (orig_path, _size, _ts) = parse_i_file(&i_path).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::Other, "无法解析回收站元数据")
@@ -357,6 +379,7 @@ mod windows_impl {
     /// 彻底删除：删除 `$R`（文件或目录）与配对的 `$I` 元数据。
     pub fn delete_permanent(r_path: &str) -> std::io::Result<()> {
         let r = PathBuf::from(r_path);
+        validate_recycle_entry(&r)?;
         let parent = r.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "无效回收站路径")
         })?;
@@ -371,7 +394,7 @@ mod windows_impl {
             std::fs::remove_file(&r)?;
         }
         // 删除配对的 $I 元数据
-        let i_name = format!("$I{}", &r_name[2..]);
+        let i_name = format!("$I{}", r_name.get(2..).unwrap_or_default());
         let i_path = parent.join(&i_name);
         let _ = std::fs::remove_file(&i_path);
         Ok(())

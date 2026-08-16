@@ -265,6 +265,8 @@ pub fn office_text(path: &Path) -> Option<String> {
     let mut raw = String::new();
     zip.by_name("word/document.xml")
         .ok()?
+        // 64MB 上限防 zip 炸弹：小体积 docx 可内藏超大的 document.xml，预览即 OOM
+        .take(64 * 1024 * 1024)
         .read_to_string(&mut raw)
         .ok()?;
     // 段落 / 换行 / 制表符标签 → 对应文本字符
@@ -498,11 +500,16 @@ pub fn read_archive_entries(path: &Path) -> Result<Vec<(String, u64, bool)>, Str
                     }
                 }
                 if pulled == 0 {
-                    // 普通 .gz 单文件：用解压后的原始文件名与解压大小
+                    // 普通 .gz 单文件：用解压后的原始文件名与解压大小。
+                    // 流式统计解压字节数（不落内存），64MB 上限防 gzip 解压炸弹
+                    // （高压缩比小文件可在预览时膨胀为数十 GB 导致 OOM）
                     let mut f2 = std::fs::File::open(path).map_err(|e| e.to_string())?;
-                    let mut dec = flate2::read::GzDecoder::new(&mut f2);
-                    let mut buf = Vec::new();
-                    let size = dec.read_to_end(&mut buf).unwrap_or(0) as u64;
+                    let dec = flate2::read::GzDecoder::new(&mut f2);
+                    let size = std::io::copy(
+                        &mut dec.take(64 * 1024 * 1024),
+                        &mut std::io::sink(),
+                    )
+                    .unwrap_or(0);
                     let stem = path
                         .file_name()
                         .map(|n| n.to_string_lossy().trim_end_matches(".gz").to_string())

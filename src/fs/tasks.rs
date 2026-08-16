@@ -461,11 +461,17 @@ fn archive_totals(srcs: &[PathBuf]) -> (i32, u64) {
 
 /// 清洗归档内条目的相对路径：仅保留普通组件，拒绝绝对路径、盘符与 `..`
 /// （路径穿越防护），空路径返回 None（该条目应被跳过）。
+/// 组件同时须满足 Windows 文件名规则（见 [`is_valid_windows_component`]）。
 fn sanitize_rel_path(p: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for comp in p.components() {
         match comp {
-            std::path::Component::Normal(c) => out.push(c),
+            std::path::Component::Normal(c) => {
+                if !is_valid_windows_component(&c.to_string_lossy()) {
+                    return None;
+                }
+                out.push(c)
+            }
             std::path::Component::CurDir => {}
             _ => return None,
         }
@@ -475,6 +481,44 @@ fn sanitize_rel_path(p: &Path) -> Option<PathBuf> {
     } else {
         Some(out)
     }
+}
+
+/// 已相对化的归档条目路径是否全部组件合法（ZIP 的 enclosed_name 路径复用）。
+fn rel_path_components_valid(p: &Path) -> bool {
+    p.components().all(|c| match c {
+        std::path::Component::Normal(name) => is_valid_windows_component(&name.to_string_lossy()),
+        std::path::Component::CurDir => true,
+        _ => false,
+    })
+}
+
+/// 归档条目单个路径组件是否为安全的 Windows 文件名：
+/// - 拒绝冒号（`C:` 盘符与 NTFS 备用数据流 `name:stream`）与其它非法字符；
+/// - 拒绝保留设备名（CON/NUL/COM1-9 等，含带扩展名形式 `CON.txt`）：
+///   CreateFileW 会将其解析为设备而非文件，解压结果静默丢失；
+/// - 拒绝尾部点/空格：Win32 路径归一化会剥离，实际创建的文件名与
+///   冲突询问看到的不一致，可借同名绕过覆盖确认。
+fn is_valid_windows_component(name: &str) -> bool {
+    if name.is_empty()
+        || name.ends_with('.')
+        || name.ends_with(' ')
+        || name.contains([':', '<', '>', '"', '|', '?', '*', '/', '\\'])
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or("");
+    let upper = stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return false;
+    }
+    for prefix in ["COM", "LPT"] {
+        if let Some(digit) = upper.strip_prefix(prefix) {
+            if matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// 压缩清单条目：目录（含空目录，携带磁盘路径供 tar 读元数据）或文件。
@@ -869,8 +913,9 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
             let mut entry = zip
                 .by_index(i)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            // 防路径穿越：仅接受能安全限定在目标目录内的相对路径
-            let rel = match entry.enclosed_name() {
+            // 防路径穿越：仅接受能安全限定在目标目录内的相对路径，
+            // 并复用 Windows 文件名合法性校验（保留名/ADS/尾点空格）
+            let rel = match entry.enclosed_name().filter(|p| rel_path_components_valid(p)) {
                 Some(p) => p,
                 None => continue,
             };
@@ -979,8 +1024,10 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
         }
     }
 
-    /// 逐条目解压 TAR / TAR.GZ：以压缩输入偏移作进度（解压后总大小不可预知），
-    /// entry.unpack_in 自带路径穿越防护。
+    /// 逐条目解压 TAR / TAR.GZ：以压缩输入偏移作进度（解压后总大小不可预知）。
+    /// 全部条目路径经 sanitize_rel_path 清洗；符号链接/硬链接条目跳过不创建
+    /// （tar-rs 对链接目标指向目录外不设防，且后续普通文件写入会跟随外指链接逃逸；
+    /// Windows 上创建符号链接本就需要特权，跳过与主流解压工具行为一致）。
     fn extract_tar(&mut self, archive: &Path, dst_dir: &Path, gzip: bool) -> io::Result<bool> {
         fs::create_dir_all(dst_dir)?;
         let file = fs::File::open(archive)?;
@@ -1001,9 +1048,17 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
                 return Ok(false);
             }
             let mut entry = entry?;
-            if !entry.header().entry_type().is_file() {
-                // 目录 / 链接等特殊条目：交给 unpack_in（自带路径穿越防护），不做冲突询问
-                entry.unpack_in(dst_dir)?;
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_dir() {
+                // 目录条目：清洗后建目录（不做冲突询问）
+                if let Some(rel) = entry.path().ok().and_then(|p| sanitize_rel_path(&p)) {
+                    fs::create_dir_all(dst_dir.join(rel))?;
+                }
+                self.done_bytes = read_pos.get();
+                continue;
+            }
+            if !entry_type.is_file() {
+                // 符号链接 / 硬链接 / 设备等特殊条目：跳过不创建（见函数注释）
                 self.done_bytes = read_pos.get();
                 continue;
             }
@@ -1948,6 +2003,79 @@ mod tests {
             sanitize_rel_path(Path::new("./a/b.txt")),
             Some(PathBuf::from("a").join("b.txt"))
         );
+    }
+
+    #[test]
+    fn test_sanitize_rel_path_rejects_windows_hostile_names() {
+        // 保留设备名（含带扩展名形式与小写）、NTFS 备用数据流冒号、
+        // 尾部点/空格均应拒绝：这些条目经 CreateFileW 会解析为设备/
+        // 写入 ADS/被 Win32 归一化改名，解压结果与预期不符
+        for bad in [
+            "NUL",
+            "CON",
+            "CON.txt",
+            "com1.dat",
+            "LPT9",
+            "aux",
+            "file.txt:ads",
+            "evil.txt.",
+            "evil.txt ",
+            "a/NUL",
+            "a/b.txt.",
+        ] {
+            assert!(sanitize_rel_path(Path::new(bad)).is_none(), "应拒绝：{bad}");
+        }
+        assert!(sanitize_rel_path(Path::new("正常/文件.txt")).is_some());
+        assert!(sanitize_rel_path(Path::new("a/b/c.bin")).is_some());
+        // 任何 .. 组件均拒绝（比 zip 的 enclosed_name 更严格）
+        assert!(sanitize_rel_path(Path::new("a/../b")).is_none());
+    }
+
+    /// 构造含「外指符号链接 + 跟随其后的普通文件」的恶意 tar：
+    /// 若解压创建了该链接，后续普通文件写入会跟随链接落到目标目录之外
+    fn make_symlink_tar(path: &Path) {
+        let f = fs::File::create(path).unwrap();
+        let mut tar = tar::Builder::new(f);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_link_name("../../escaped.txt").unwrap();
+        tar.append_data(&mut h, "sub", std::io::empty()).unwrap();
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_size(7);
+        h2.set_mode(0o644);
+        h2.set_entry_type(tar::EntryType::Regular);
+        tar.append_data(&mut h2, "sub/pwned.txt", &b"payload"[..])
+            .unwrap();
+        tar.finish().unwrap();
+    }
+
+    #[test]
+    fn test_extract_tar_skips_symlink_entries() {
+        let dir = temp_dir("tarsym");
+        let evil = dir.join("evil.tar");
+        make_symlink_tar(&evil);
+        let out = dir.join("解压结果");
+        let res = run_job(
+            Job {
+                kind: TaskKind::Extract,
+                srcs: vec![evil],
+                dst: out.clone(),
+            },
+            ConflictDecision::Skip,
+        );
+        // 符号链接条目应被跳过而非创建：解压不报错（无符号链接特权的
+        // 环境下旧实现会在此失败），sub 是真实目录、文件落在目标目录内
+        assert!(res.error.is_empty(), "解压失败: {}", res.error);
+        assert!(out.join("sub").is_dir(), "sub 应为真实目录而非链接");
+        assert_eq!(
+            fs::read(out.join("sub").join("pwned.txt")).unwrap(),
+            b"payload"
+        );
+        // 若链接被创建且文件经其写出，该路径将存在
+        assert!(!dir.join("escaped.txt").exists());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

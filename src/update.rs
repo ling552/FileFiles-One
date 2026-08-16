@@ -140,7 +140,14 @@ fn check_latest_via_web() -> Result<ReleaseInfo, String> {
         .unwrap_or_default()
         .trim()
         .to_string();
-    if tag.is_empty() || !tag.starts_with(['v', 'V']) {
+    // tag 限白名单字符：跳转头来自网络响应，混入路径分隔符/特殊字符
+    // 会进入后续构造的下载 URL
+    let valid = !tag.is_empty()
+        && tag.starts_with(['v', 'V'])
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !valid {
         return Err("无法从跳转地址解析版本号".to_string());
     }
     let version = tag.trim_start_matches(['v', 'V']).to_string();
@@ -164,6 +171,10 @@ pub fn download(
     cancel: &Arc<AtomicBool>,
     progress: impl Fn(u64, u64, f64),
 ) -> Result<PathBuf, String> {
+    // 下载地址必须走 HTTPS（地址来自 API 响应 JSON，属不可信输入）
+    if !info.asset_url.starts_with("https://") {
+        return Err("下载地址无效".to_string());
+    }
     let resp = ureq::get(&info.asset_url)
         .set("User-Agent", "FileFiles-One-Updater")
         .timeout(Duration::from_secs(3600))
@@ -176,7 +187,16 @@ pub fn download(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(info.asset_size);
 
-    let dest = std::env::temp_dir().join(&info.asset_name);
+    // 资产名来自远端 JSON：只保留文件名部分并替换非法字符，防止
+    // 路径分隔符把下载产物写到临时目录之外；附带进程号避免
+    // 同机进程预置同名文件在下载与执行之间做替换
+    let stem = Path::new(&info.asset_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.replace(['/', '\\', ':', '"', '<', '>', '|', '?', '*'], "_"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "FileFiles-One-Setup".to_string());
+    let dest = std::env::temp_dir().join(format!("{stem}.{}.exe", std::process::id()));
     let mut file = File::create(&dest).map_err(|e| format!("创建临时文件失败：{e}"))?;
 
     let mut reader = resp.into_reader();

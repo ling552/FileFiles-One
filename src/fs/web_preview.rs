@@ -121,7 +121,11 @@ pub fn url_for(content: &WebContent) -> Option<String> {
         let raw = std::fs::read_to_string(path).ok()?;
         format!(r#"<base href="{}">{}"#, base, raw)
     };
-    let tmp = std::env::temp_dir().join("filefiles-one_preview.html");
+    // 文件名带进程号：避免多实例/同机进程抢占同一固定路径（TOCTOU 替换预览内容）
+    let tmp = std::env::temp_dir().join(format!(
+        "filefiles-one_preview_{}.html",
+        std::process::id()
+    ));
     std::fs::write(&tmp, html).ok()?;
     Some(file_url(&tmp.to_string_lossy()))
 }
@@ -153,29 +157,58 @@ pub fn office_to_html(text: &str, dark: bool) -> String {
     )
 }
 
-/// Windows 路径 → file:/// URL（反斜杠转正斜杠，空格等交由 WebView2 处理）
+/// Windows 路径 → file:/// URL：反斜杠转正斜杠并做百分号编码
+/// （`#`、`?`、`%`、空格、非 ASCII 等不编码会破坏 URL 语义，
+/// 相对资源的 <base> 会被解析到错误目录）
 fn file_url(path: &str) -> String {
-    format!("file:///{}", path.replace('\\', "/"))
+    fn encode_into(out: &mut String, s: &str) {
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'!'
+                | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' | b':'
+                | b'/' | b'@' => out.push(b as char),
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+    }
+    let mut out = String::from("file:///");
+    encode_into(&mut out, &path.replace('\\', "/"));
+    out
+}
+
+/// html/htm 预览允许页面脚本（动态 HTML 渲染是功能需求）；
+/// md/docx 生成的 HTML 与 php 静态渲染一律禁用脚本——这些文件来源不可信
+/// （常见于网络下载），raw HTML（含 `<script>`、`<img onerror=...>`）会
+/// 原样进入 WebView2，禁脚本即阻断预览触发脚本执行的整条链路。
+fn allows_scripts(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    ext == "html" || ext == "htm"
 }
 
 #[cfg(windows)]
 mod win_impl {
-    use super::{url_for, WebContent};
+    use super::{allows_scripts, url_for, WebContent};
     use std::cell::RefCell;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2Controller,
+        CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
     };
     use webview2_com::{
-        CreateCoreWebView2ControllerCompletedHandler,
-        CreateCoreWebView2EnvironmentCompletedHandler,
+        take_pwstr, CreateCoreWebView2ControllerCompletedHandler,
+        CreateCoreWebView2EnvironmentCompletedHandler, NavigationStartingEventHandler,
+        NewWindowRequestedEventHandler,
     };
-    use windows::core::{HSTRING, PCWSTR};
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::System::WinRT::EventRegistrationToken;
 
     struct WebState {
         controller: Option<ICoreWebView2Controller>,
         /// 环境/控制器异步创建期间挂起的导航目标
-        pending: Option<((i32, i32, i32, i32), String)>,
+        pending: Option<((i32, i32, i32, i32), String, bool)>,
         /// 是否已在创建流程中（防重复发起）
         creating: bool,
         /// 运行时不可用（创建失败过，不再重试）
@@ -200,11 +233,69 @@ mod win_impl {
         }
     }
 
-    /// 应用矩形 + 导航 + 显示（控制器已就绪时）
-    fn apply(controller: &ICoreWebView2Controller, rect: (i32, i32, i32, i32), url: &str) {
+    /// 读取事件参数里的 Uri（CoTaskMem 内存由 take_pwstr 释放）
+    fn args_uri(uri: impl FnOnce(&mut PWSTR) -> windows::core::Result<()>) -> String {
+        let mut pw = PWSTR::null();
+        if uri(&mut pw).is_ok() {
+            take_pwstr(pw)
+        } else {
+            String::new()
+        }
+    }
+
+    /// 注册导航守卫（控制器创建成功后一次）：
+    /// - 远程 http(s) 导航一律取消并转交系统默认浏览器——预览视图保持
+    ///   file:// 上下文，页面内跳转/重定向无法把预览变成应用内钓鱼页；
+    /// - window.open 新窗口请求直接 Handled 不放行，远程目标转系统浏览器。
+    fn install_navigation_guard(webview: &ICoreWebView2) {
+        unsafe {
+            let nav = NavigationStartingEventHandler::create(Box::new(|_sender, args| {
+                if let Some(args) = args {
+                    let uri = args_uri(|pw| args.Uri(pw));
+                    if uri.starts_with("http://") || uri.starts_with("https://") {
+                        let _ = args.SetCancel(true);
+                        let _ = open::that(&uri);
+                    }
+                }
+                Ok(())
+            }));
+            let _ = webview.add_NavigationStarting(
+                &nav,
+                &mut EventRegistrationToken::default(),
+            );
+            let win = NewWindowRequestedEventHandler::create(Box::new(|_sender, args| {
+                if let Some(args) = args {
+                    let uri = args_uri(|pw| args.Uri(pw));
+                    if uri.starts_with("http://") || uri.starts_with("https://") {
+                        let _ = open::that(&uri);
+                    }
+                    let _ = args.SetHandled(true);
+                }
+                Ok(())
+            }));
+            let _ = webview.add_NewWindowRequested(
+                &win,
+                &mut EventRegistrationToken::default(),
+            );
+        }
+    }
+
+    /// 应用矩形 + 导航 + 显示（控制器已就绪时）。
+    /// `allow_scripts` 按源文件类型切换脚本执行（见 [`super::allows_scripts`]），
+    /// 并始终关闭 DevTools（预览视图非调试场景）。
+    fn apply(
+        controller: &ICoreWebView2Controller,
+        rect: (i32, i32, i32, i32),
+        url: &str,
+        allow_scripts: bool,
+    ) {
         unsafe {
             let _ = controller.SetBounds(to_rect(rect));
             if let Ok(webview) = controller.CoreWebView2() {
+                if let Ok(settings) = webview.Settings() {
+                    let _ = settings.SetIsScriptEnabled(allow_scripts);
+                    let _ = settings.SetAreDevToolsEnabled(false);
+                }
                 let _ = webview.Navigate(PCWSTR(HSTRING::from(url).as_ptr()));
             }
             let _ = controller.SetIsVisible(true);
@@ -215,17 +306,18 @@ mod win_impl {
         let Some(url) = url_for(&content) else {
             return false;
         };
+        let allow_scripts = allows_scripts(&content.path);
         let ready = STATE.with(|s| {
             let mut st = s.borrow_mut();
             if st.unavailable {
                 return Some(false);
             }
             if let Some(controller) = &st.controller {
-                apply(controller, rect, &url);
+                apply(controller, rect, &url, allow_scripts);
                 return Some(true);
             }
             // 创建尚未完成：挂起导航目标，就绪后统一应用
-            st.pending = Some((rect, url.clone()));
+            st.pending = Some((rect, url.clone(), allow_scripts));
             if st.creating {
                 return Some(true);
             }
@@ -267,9 +359,15 @@ mod win_impl {
                             st.creating = false;
                             match (result, controller) {
                                 (Ok(()), Some(controller)) => {
+                                    // 导航守卫先于首次导航注册
+                                    unsafe {
+                                        if let Ok(webview) = controller.CoreWebView2() {
+                                            install_navigation_guard(&webview);
+                                        }
+                                    }
                                     // 应用挂起的导航（预览可能已关闭：pending 为 None 则只驻留隐藏）
-                                    if let Some((rect, url)) = st.pending.take() {
-                                        apply(&controller, rect, &url);
+                                    if let Some((rect, url, allow_scripts)) = st.pending.take() {
+                                        apply(&controller, rect, &url, allow_scripts);
                                     } else {
                                         unsafe {
                                             let _ = controller.SetIsVisible(false);

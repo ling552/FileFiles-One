@@ -102,7 +102,10 @@ pub fn cert_chain(path: &Path) -> Vec<(String, String, String, String)> {
         None => return Vec::new(),
     };
     // 证书表是 WIN_CERTIFICATE 结构数组：dwLength(4) + wRevision(2) + wCertificateType(2) + bCertificate[]
-    let table = &data[cert_off..cert_off + cert_size];
+    let table = match cert_off.checked_add(cert_size).and_then(|end| data.get(cert_off..end)) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
     let mut out = Vec::new();
     let mut pos = 0;
     while pos + 8 <= table.len() {
@@ -132,17 +135,19 @@ fn locate_cert_table(data: &[u8]) -> Option<(usize, usize)> {
     if rd_u32(data, pe_off) != Some(0x0000_4550) {
         return None;
     }
-    let opt_off = pe_off + 24;
+    // 各偏移相加均用 checked_add：恶意 PE 的偏移字段接近 u32::MAX 时，
+    // 32 位目标上回绕会绕过下面的长度校验导致越界切片
+    let opt_off = pe_off.checked_add(24)?;
     let magic = rd_u16(data, opt_off)?;
     let dir_base = match magic {
-        0x10B => opt_off + 96,
-        0x20B => opt_off + 112,
+        0x10B => opt_off.checked_add(96)?,
+        0x20B => opt_off.checked_add(112)?,
         _ => return None,
     };
-    let sec_entry = dir_base + 4 * 8;
+    let sec_entry = dir_base.checked_add(4 * 8)?;
     let off = rd_u32(data, sec_entry)? as usize;
-    let size = rd_u32(data, sec_entry + 4)? as usize;
-    if off == 0 || size == 0 || off + size > data.len() {
+    let size = rd_u32(data, sec_entry.checked_add(4)?)? as usize;
+    if off == 0 || size == 0 || off.checked_add(size)? > data.len() {
         return None;
     }
     Some((off, size))

@@ -123,9 +123,12 @@ fn pwstr_read(p: *const u16) -> String {
     if p.is_null() {
         return String::new();
     }
+    // WPD 返回的字符串按约定以 NUL 结尾；异常设备/驱动返回未终结缓冲时
+    // 无界扫描会越过分配边界读。64K 字符上限兜底（远超真实设备名/对象名长度）
+    const MAX_CHARS: usize = 64 * 1024;
     let mut len = 0usize;
     unsafe {
-        while *p.add(len) != 0 {
+        while len < MAX_CHARS && *p.add(len) != 0 {
             len += 1;
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(p, len)).to_string()
@@ -468,13 +471,44 @@ fn copy_to_temp_win(vpath: &str) -> Result<std::path::PathBuf, String> {
 
     let dir = std::env::temp_dir().join("FileFiles One_mtp");
     let _ = std::fs::create_dir_all(&dir);
-    let out_path = dir.join(&fname);
-    let mut file = std::fs::File::create(&out_path)
+    // 独占创建（create_new，冲突时追加序号）：可预测的固定路径 + 截断式
+    // File::create 会被同机低权限进程预置同名文件/junction 抢占（TOCTOU 内容替换）
+    let (out_path, mut file) = create_exclusive(&dir, &fname)
         .map_err(|e| format!("创建临时文件失败: {e}"))?;
 
     let (stream, optimal) = open_read_stream(&s, &obj)?;
     drain_stream(&stream, optimal, &mut file, &mut NoSink)?;
     Ok(out_path)
+}
+
+/// 在 dir 下独占创建 fname（已存在则在扩展名前追加 .1/.2/… 序号避让），
+/// 返回最终路径与写入句柄。
+#[cfg(windows)]
+fn create_exclusive(
+    dir: &std::path::Path,
+    fname: &str,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    for i in 0u32.. {
+        let name = if i == 0 {
+            fname.to_string()
+        } else {
+            match fname.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() => format!("{stem}.{i}.{ext}"),
+                _ => format!("{fname}.{i}"),
+            }
+        };
+        let cand = dir.join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&cand)
+        {
+            Ok(f) => return Ok((cand, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("序号冲突循环必然在 u32 范围内找到可用文件名")
 }
 
 /// 清洗文件名中的非法字符；为空时用对象 ID 兜底。

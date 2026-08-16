@@ -141,12 +141,9 @@ pub fn classify(path: &Path, is_dir: bool) -> (String, String, String) {
     let label = if ext.is_empty() {
         "•".to_string()
     } else {
-        let up = ext.to_uppercase();
-        if up.len() > 3 {
-            up[..3].to_string()
-        } else {
-            up
-        }
+        // 按字符截取：扩展名可含多字节字符（如 "é"），字节切片会切在
+        // UTF-8 字符中间导致 panic（目录列表热路径，单个文件名即崩溃）
+        ext.to_uppercase().chars().take(3).collect()
     };
 
     (class.to_string(), label, kind)
