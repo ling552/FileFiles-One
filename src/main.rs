@@ -362,6 +362,31 @@ fn bind_device_polling(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     });
 }
 
+/// 距最近一次用户输入（键盘/鼠标）的毫秒数；查询失败返回 0
+/// （视为不空闲，跳过本轮自动检查）。
+#[cfg(windows)]
+fn user_idle_ms() -> u32 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe {
+        if GetLastInputInfo(&mut info) != 0 {
+            let now = windows_sys::Win32::System::SystemInformation::GetTickCount();
+            now.wrapping_sub(info.dwTime)
+        } else {
+            0
+        }
+    }
+}
+
+/// 非目标平台无空闲检测：恒返回 0（自动检查不触发，仅保留手动检查）
+#[cfg(not(windows))]
+fn user_idle_ms() -> u32 {
+    0
+}
+
 /// 绑定应用更新：关于页的 GitHub 链接、检查更新、带进度下载与安装启动。
 /// 网络请求在后台线程执行（ureq 阻塞式），进度经 `invoke_from_event_loop`
 /// 回主线程刷新 —— 与后台文件任务同一模式。
@@ -376,7 +401,11 @@ fn bind_update(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
 
     // 用系统默认浏览器打开链接（GitHub 仓库 / Issues）
     state.on_open_url(|url| {
-        let _ = open::that(url.as_str());
+        // 仅放行 https：防止未来调用方把文件内容派生的 URL 传入后
+        // 被诱导执行 file://、smb:// 等任意协议处理器
+        if url.starts_with("https://") {
+            let _ = open::that(url.as_str());
+        }
     });
 
     // 检查结果与下载产物：用 Arc<Mutex> 存放——工作线程回填结果的
@@ -516,6 +545,91 @@ fn bind_update(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 }
             }
         });
+    }
+
+    // —— 更新提示浮窗（右下角 toast）——
+    {
+        // toast 自动收起定时器：仅在事件循环线程创建/启停
+        thread_local! {
+            static TOAST_TIMER: std::cell::RefCell<Option<slint::Timer>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let w = ui.as_weak();
+        state.on_update_toast_dismiss(move || {
+            if let Some(ui) = w.upgrade() {
+                ui.global::<AppState>().set_update_toast_visible(false);
+            }
+        });
+        let w = ui.as_weak();
+        state.on_update_toast_view(move || {
+            if let Some(ui) = w.upgrade() {
+                let st = ui.global::<AppState>();
+                st.set_update_toast_visible(false);
+                // 直接定位到设置「关于」的软件更新区
+                st.set_settings_section("about".into());
+                st.invoke_open_settings_tab();
+            }
+        });
+
+        // —— 闲置自动检查：后台线程每 30s 探测一次用户输入空闲，
+        // 连续闲置 ≥3 分钟且距上次检查超过 24h 时请求 GitHub。
+        // 失败静默（不打扰）；发现新版且用户尚未手动检查过时弹出
+        // 右下角 toast，12s 无操作自动收起。
+        if core.borrow().config.settings.auto_update_check {
+            let w = ui.as_weak();
+            let latest = latest.clone();
+            std::thread::spawn(move || {
+                let mut last_check: Option<std::time::Instant> = None;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    let due = last_check
+                        .map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(24 * 3600));
+                    if !due || user_idle_ms() < 3 * 60_000 {
+                        continue;
+                    }
+                    last_check = Some(std::time::Instant::now());
+                    let Ok(info) = update::check_latest() else {
+                        continue; // 网络失败静默，24h 后再试
+                    };
+                    if !update::is_newer(&info.version, update::CURRENT_VERSION) {
+                        continue;
+                    }
+                    // 循环内闭包按轮克隆，供下轮继续使用
+                    let w = w.clone();
+                    let latest = latest.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(ui) = w.upgrade() else { return };
+                        let st = ui.global::<AppState>();
+                        // 用户已手动进入更新流程（发现/下载中/待安装）时不打扰，
+                        // 仅在空闲/已最新/出错态下补齐「发现新版」
+                        if !matches!(st.get_update_state(), 0 | 2 | 6) {
+                            return;
+                        }
+                        st.set_update_latest_version(info.version.as_str().into());
+                        st.set_update_notes(info.notes.as_str().into());
+                        st.set_update_state(3);
+                        st.set_update_toast_version(info.version.as_str().into());
+                        *latest.lock().unwrap() = Some(info);
+                        st.set_update_toast_visible(true);
+                        // 12 秒无操作自动收起（单次定时器；期间用户点击立即收起）
+                        let w2 = w.clone();
+                        TOAST_TIMER.with(|slot| {
+                            let mut guard = slot.borrow_mut();
+                            let timer = guard.get_or_insert_with(slint::Timer::default);
+                            timer.start(
+                                slint::TimerMode::SingleShot,
+                                std::time::Duration::from_secs(12),
+                                move || {
+                                    if let Some(ui) = w2.upgrade() {
+                                        ui.global::<AppState>().set_update_toast_visible(false);
+                                    }
+                                },
+                            );
+                        });
+                    });
+                }
+            });
+        }
     }
 }
 
@@ -4425,6 +4539,7 @@ fn push_settings(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     st.set_set_language(lang_disp(&s.language).into());
     st.set_set_startup_open(startup_disp(&s.startup_open).into());
     st.set_set_default_fm(s.default_file_manager);
+    st.set_set_auto_update_check(s.auto_update_check);
     st.set_set_icon_source(icon_disp(&s.icon_source).into());
     st.set_set_show_hidden(s.show_hidden);
     st.set_set_show_ext(s.show_extensions);
@@ -4502,6 +4617,7 @@ fn bind_settings(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     "case-sensitive" => s.case_sensitive = val,
                     "background-index" => s.background_index = val,
                     "context-menu-system" => s.context_menu_system = val,
+                    "auto-update-check" => s.auto_update_check = val,
                     "translucent" => s.translucent = val,
                     "compact" => s.compact_mode = val,
                     _ => {}
@@ -4569,6 +4685,7 @@ fn bind_settings(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 "case-sensitive" => st.set_set_case_sensitive(val),
                 "background-index" => st.set_set_background_index(val),
                 "context-menu-system" => st.set_set_context_menu_system(val),
+                "auto-update-check" => st.set_set_auto_update_check(val),
                 _ => {}
             }
             if reload {

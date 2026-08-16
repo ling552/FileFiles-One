@@ -1,0 +1,141 @@
+// 应用更新提示浮窗：闲置自动检查发现新版本时从右下角滑入。
+// 颜色全部取自 Theme 令牌，深浅主题与自定义主题色自动适配。
+// 显示 12 秒无操作后由 Rust 侧单次定时器收起；点击任一按钮立即收起。
+import { Theme } from "theme.slint";
+import { AppState } from "globals.slint";
+
+export component UpdateToast inherits Rectangle {
+    width: 100%;
+    height: 100%;
+
+    property <bool> shown: AppState.update-toast-visible;
+
+    card := Rectangle {
+        // 淡出结束后不再参与渲染与命中测试
+        visible: card.opacity > 0.01;
+        width: 344px;
+        height: 128px;
+        // 右下角锚定（48px 让开状态栏）；任务进度卡片显示时上移避让
+        x: parent.width - card.width - 16px + (root.shown ? 0px : 36px);
+        y: parent.height - card.height - 48px
+            - (AppState.task-active ? 192px : 0px)
+            + (root.shown ? 0px : 36px);
+        opacity: root.shown ? 1 : 0;
+        border-radius: Theme.radius-dialog;
+        background: Theme.dark ? #222b38f2 : #fffffffa;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 58px;
+        drop-shadow-color: Theme.dark ? rgba(0, 0, 0, 0.45) : rgba(33, 55, 80, 0.22);
+        animate opacity { duration: 180ms; easing: ease; }
+        animate x { duration: 240ms; easing: ease-out; }
+        animate y { duration: 240ms; easing: ease-out; }
+
+        VerticalLayout {
+            padding: 14px;
+            spacing: 10px;
+
+            HorizontalLayout {
+                spacing: 12px;
+                // 更新图标（主题色底）
+                Rectangle {
+                    width: 38px; height: 38px;
+                    border-radius: 10px;
+                    background: Theme.primary-soft;
+                    Text {
+                        text: "\u{E72C}";
+                        font-family: "Segoe MDL2 Assets";
+                        font-size: 18px;
+                        color: Theme.primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "发现新版本";
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: "v" + AppState.update-toast-version + " 已发布，当前 v" + AppState.app-version;
+                        font-size: 12px;
+                        color: Theme.muted;
+                        overflow: elide;
+                    }
+                }
+                // 关闭按钮
+                Rectangle {
+                    width: 26px; height: 26px;
+                    border-radius: 6px;
+                    background: close-ta.has-hover
+                        ? (Theme.dark ? rgba(255, 255, 255, 0.08) : rgba(0, 0, 0, 0.06))
+                        : transparent;
+                    close-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { AppState.update-toast-dismiss(); }
+                    }
+                    Text {
+                        text: "\u{E711}";
+                        font-family: "Segoe MDL2 Assets";
+                        font-size: 10px;
+                        color: Theme.muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                // 暂不更新（描边次按钮）
+                Rectangle {
+                    height: 30px;
+                    border-radius: Theme.radius-btn;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: later-ta.has-hover
+                        ? (Theme.dark ? rgba(255, 255, 255, 0.06) : rgba(0, 0, 0, 0.04))
+                        : transparent;
+                    HorizontalLayout {
+                        padding-left: 14px; padding-right: 14px;
+                        Text {
+                            text: "暂不更新";
+                            font-size: 12px;
+                            color: Theme.muted;
+                            vertical-alignment: center;
+                        }
+                    }
+                    later-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { AppState.update-toast-dismiss(); }
+                    }
+                }
+                // 查看详情（主题色主按钮；高亮度主题色用深色文字保证对比度）
+                Rectangle {
+                    height: 30px;
+                    border-radius: Theme.radius-btn;
+                    background: view-ta.has-hover ? Theme.primary.with-alpha(0.85) : Theme.primary;
+                    HorizontalLayout {
+                        padding-left: 14px; padding-right: 14px;
+                        Text {
+                            text: "查看详情";
+                            font-size: 12px;
+                            color: Theme.accent-key == "orange" ? #1a1a1a : #ffffff;
+                            vertical-alignment: center;
+                        }
+                    }
+                    view-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { AppState.update-toast-view(); }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -160,6 +160,9 @@ pub struct Settings {
     pub default_file_manager: bool,
     #[serde(default = "d_language")]
     pub language: String,
+    /// 应用闲置时在后台自动检查更新（发现新版时右下角 toast 提示）
+    #[serde(default = "d_true")]
+    pub auto_update_check: bool,
 
     // ── 外观 ──
     #[serde(default = "d_theme_mode")]
@@ -247,6 +250,7 @@ impl Default for Settings {
             click_to_rename: true,
             default_file_manager: false,
             language: d_language(),
+            auto_update_check: true,
             theme_mode: d_theme_mode(),
             accent: d_accent(),
             accent_custom: d_accent_custom(),
@@ -337,14 +341,20 @@ impl AppConfig {
         }
     }
 
-    /// 序列化写回磁盘（自动创建父目录）
+    /// 序列化写回磁盘（自动创建父目录）。
+    /// 先写临时文件再原子替换：直接截断写时崩溃/断电会损坏文件，
+    /// load() 会静默丢弃全部用户设置（标签、布局、网络位置）
     pub fn save(&self) {
         let Some(path) = config_path() else { return };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(text) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(&path, text);
+            let tmp = path.with_extension("toml.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                // std::fs::rename 在 Windows 上带 REPLACE_EXISTING，可覆盖旧配置
+                let _ = std::fs::rename(&tmp, &path);
+            }
         }
     }
 

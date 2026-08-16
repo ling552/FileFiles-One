@@ -17,6 +17,7 @@ import { ContextMenu } from "context_menu.slint";
 import { SettingsPanel } from "settings_panel.slint";
 import { VSplitter } from "splitter.slint";
 import { ActionBar } from "action_bar.slint";
+import { UpdateToast } from "update_toast.slint";
 
 export { AppState, Theme }
 // 独立预览窗口：与主窗口同一编译单元导出，Rust 侧经 include_modules! 取得
@@ -363,8 +364,11 @@ export component MainWindow inherits Window {
             // 主体三栏
             Rectangle {
                 vertical-stretch: 1;
-                // 设置界面（作为独立标签页，全窗口覆盖）
-                if AppState.active-view == "settings": SettingsPanel {}
+                // 设置界面（作为独立标签页，全窗口覆盖）；
+                // 当前分区与全局双向同步，供「查看更新详情」等入口直接定位
+                if AppState.active-view == "settings": SettingsPanel {
+                    current-section <=> AppState.settings-section;
+                }
                 // 文件浏览（三栏布局，可拖拽调整栏宽）
                 if AppState.active-view == "files": HorizontalLayout {
                     spacing: 0px;
@@ -719,6 +723,12 @@ export component MainWindow inherits Window {
         paused: AppState.task-paused;
         pause-clicked => { AppState.task-pause(); }
         cancel-clicked => { AppState.task-cancel(); }
+    }
+
+    // 浮层：更新提示 toast（右下角；任务进度卡片显示时自动上移避让）
+    UpdateToast {
+        width: 100%;
+        height: 100%;
     }
 
     // 浮层：同名冲突解决对话框（复制 / 移动遇到目标已存在同名项）

@@ -634,6 +634,17 @@ export global AppState {
     callback install-update();    // 启动已下载的安装程序并退出应用
     callback open-url(string);    // 用系统默认浏览器打开链接
 
+    // ── 更新提示浮窗（闲置自动检查发现新版时右下角弹出）──
+    in-out property <bool> update-toast-visible: false;
+    in-out property <string> update-toast-version;   // 新版本号
+    callback update-toast-view();    // 「查看详情」：跳转设置「关于」的软件更新区
+    callback update-toast-dismiss(); // 「暂不更新」/关闭浮窗
+    // 设置「软件更新」：应用闲置时在后台自动检查新版本
+    in-out property <bool> set-auto-update-check: true;
+    // 设置页当前分区（"general"|"appearance"|…|"about"）：
+    // 供「查看详情」等入口直接定位到目标分区后打开设置
+    in-out property <string> settings-section: "general";
+
     // ════════ 文件名索引（设置「搜索与索引」：重建进度 / 深层搜索加速）════════
     // 索引状态：0 空闲 / 1 重建中
     in-out property <int> index-state: 0;

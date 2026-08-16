@@ -1,7 +1,7 @@
 ; FileFiles One Windows 安装程序脚本(Inno Setup 6)
 ; CI 中通过 /DAppVersion=x.y.z 传入版本号;本地手动编译时使用下方默认值
 #ifndef AppVersion
-  #define AppVersion "0.5.2"
+  #define AppVersion "0.5.3"
 #endif
 
 [Setup]

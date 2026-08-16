@@ -1029,6 +1029,14 @@ export component SettingsPanel inherits Rectangle {
                         Card {
                             title: "软件更新";
                             SettingRow {
+                                name: "自动检查更新";
+                                desc: "应用闲置时在后台检查新版本，发现更新在右下角提示";
+                                VerticalLayout { alignment: center; Switch {
+                                    checked: AppState.set-auto-update-check;
+                                    toggled(val) => { AppState.set-bool("auto-update-check", val); }
+                                } }
+                            }
+                            SettingRow {
                                 name: AppState.update-state == 3 ? "发现新版本 v" + AppState.update-latest-version
                                     : AppState.update-state == 5 ? "新版本 v" + AppState.update-latest-version + " 已就绪"
                                     : "检查更新";
