@@ -391,7 +391,17 @@ fn scan(srcs: &[PathBuf]) -> (i32, u64) {
     (files, bytes)
 }
 
+fn is_task_forbidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| super::operations::is_forbidden_target(n))
+        .unwrap_or(false)
+}
+
 fn scan_one(path: &Path, files: &mut i32, bytes: &mut u64) {
+    if is_task_forbidden(path) {
+        return;
+    }
     if path.is_dir() {
         if let Ok(rd) = fs::read_dir(path) {
             for ent in rd.flatten() {
@@ -528,14 +538,20 @@ enum PackItem {
     File(PathBuf, String),
 }
 
-/// 展开待压缩源为归档条目清单（目录递归，保留相对结构）
+/// 展开待压缩源为归档条目清单（目录递归，保留相对结构，跳过受保护文件）
 fn walk_pack(srcs: &[PathBuf]) -> Vec<PackItem> {
     let mut out = Vec::new();
     for s in srcs {
+        if is_task_forbidden(s) {
+            continue;
+        }
         let base = match s.file_name() {
             Some(n) => n.to_string_lossy().to_string(),
             None => continue,
         };
+        if super::operations::is_forbidden_target(&base) {
+            continue;
+        }
         if s.is_dir() {
             walk_pack_dir(s, &base, &mut out);
         } else {
@@ -550,7 +566,11 @@ fn walk_pack_dir(dir: &Path, prefix: &str, out: &mut Vec<PackItem>) {
     if let Ok(rd) = fs::read_dir(dir) {
         for ent in rd.flatten() {
             let p = ent.path();
-            let rel = format!("{}/{}", prefix, ent.file_name().to_string_lossy());
+            let fname = ent.file_name().to_string_lossy().to_string();
+            if super::operations::is_forbidden_target(&fname) || is_task_forbidden(&p) {
+                continue;
+            }
+            let rel = format!("{}/{}", prefix, fname);
             if p.is_dir() {
                 walk_pack_dir(&p, &rel, out);
             } else {
@@ -1534,8 +1554,11 @@ fn run_mtp(
     run.current = "统计中…".to_string();
     run.emit(true);
 
-    // 总量统计：设备侧要逐层枚举（慢），本地侧沿用普通扫描
+    // 总量统计：设备侧要逐层枚举（慢），本地侧沿用普通扫描（跳过受保护文件）
     for src in &job.srcs {
+        if is_task_forbidden(src) {
+            continue;
+        }
         if ctrl.is_cancelled() {
             return TaskResult {
                 ok: 0,
@@ -1564,6 +1587,9 @@ fn run_mtp(
     let mut remembered: Option<ConflictDecision> = None;
 
     for src in &job.srcs {
+        if is_task_forbidden(src) {
+            continue;
+        }
         if ctrl.is_cancelled() {
             return TaskResult {
                 ok,
@@ -1584,7 +1610,7 @@ fn run_mtp(
         } else {
             name_of(src)
         };
-        if name.trim().is_empty() {
+        if name.trim().is_empty() || super::operations::is_forbidden_target(&name) {
             continue;
         }
 

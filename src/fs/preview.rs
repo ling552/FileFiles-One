@@ -14,8 +14,10 @@ pub enum PreviewKind {
     Text,
     /// 文件夹：统计顶层项数与大小
     Folder,
-    /// 视频：内嵌播放（Media Foundation 子窗口渲染，含音频）
+    /// 视频：内嵌播放（Media Foundation 子窗口渲染）
     Video,
+    /// 音频：显示封面与播放控制（Media Foundation 音频播放）
+    Audio,
     /// 归档：列出压缩包内文件（内容区复用文本面板显示清单）
     Archive,
     /// 其它：仅展示图标与基础信息
@@ -23,9 +25,7 @@ pub enum PreviewKind {
 }
 
 impl PreviewKind {
-    /// 传给 Slint 的整型编码（与 preview_window.slint / quick_look.slint 约定一致）
-    /// 0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频 / 5 归档树。
-    /// 归档改为可展开/折叠的树形列表，单独占用编码 5。
+    /// 0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频 / 5 归档树 / 6 音频。
     pub fn code(self) -> i32 {
         match self {
             PreviewKind::Info => 0,
@@ -34,6 +34,7 @@ impl PreviewKind {
             PreviewKind::Folder => 3,
             PreviewKind::Video => 4,
             PreviewKind::Archive => 5,
+            PreviewKind::Audio => 6,
         }
     }
 }
@@ -63,6 +64,9 @@ const IMAGE_EXTS: &[&str] = &[
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "mov", "avi", "mkv", "wmv", "m4v", "webm", "mpg", "mpeg",
 ];
+
+/// 可由 Media Foundation 直接播放的音频扩展名。
+const AUDIO_EXTS: &[&str] = &["mp3", "wav", "flac", "m4a", "aac", "wma", "ogg"];
 
 /// 可作为纯文本预览的扩展名（含常见源码 / 配置 / 文档）
 /// 注意：kind_of 已对非图片/视频/归档/二进制文件统一兜底为文本预览，本表仅供 renderable_web
@@ -129,13 +133,15 @@ const TEXT_EXTS: &[&str] = &[
 
 /// 二进制/可执行/容器类扩展名：预览时显示应用/文件基本信息（含版本资源）。
 /// 注意：bin/dat 等无明确类型归属的不在其内——它们走文本通道的十六进制预览。
+/// Office 新旧格式（doc/docx/xls/xlsx/ppt/pptx）一律走 Office 高保真预览，
+/// 不在此列；PDF 走 Edge 原生渲染，同样不在此列。
 const BINARY_EXTS: &[&str] = &[
     // 可执行/系统二进制
     "exe", "msi", "dll", "sys", "com", "scr",
-    // 磁盘映像/安装包/容器
-    "iso", "img", "vhd", "vhdx", "cab", "msu", "dmp", "pdb", "deb", "rpm", "appimage", "dmg", "pkg",
-    // 旧版 Office / PDF：无轻量解析路径，显示文件信息
-    "doc", "xls", "xlsx", "ppt", "pptx", "pdf",
+    // 磁盘映像/非 ZIP 容器：无解包支持（cab 为 MSCF、iso 为 ISO9660、vhd 为
+    // 虚拟磁盘、rar 为专有格式），强行按 ZIP/7z 解析必然报错，按信息展示
+    "iso", "img", "vhd", "vhdx", "cab", "rar",
+    "msu", "dmp", "pdb", "deb", "rpm", "appimage", "dmg", "pkg",
 ];
 
 fn ext_of(path: &Path) -> String {
@@ -145,13 +151,16 @@ fn ext_of(path: &Path) -> String {
         .to_lowercase()
 }
 
-/// 是否支持「渲染视图」（WebView2 显示网页效果，与源码视图可切换）：
+/// 是否支持「渲染视图」（WebView2 显示高保真效果，与源码视图可切换）：
 /// Markdown 转 HTML 渲染；HTML/HTM 直接渲染；PHP 渲染其中的静态 HTML 部分；
-/// DOCX 抽取正文后转 HTML 渲染。
+/// DOCX/XLSX/PPTX/PDF 走 Office/Edge 高保真渲染；旧版 DOC/XLS/PPT 同样经由
+/// 本机 Office 转 PDF 后渲染（未安装 Office 时回退文本抽取）。
 pub fn renderable_web(path: &Path) -> bool {
     matches!(
         ext_of(path).as_str(),
-        "md" | "markdown" | "html" | "htm" | "php" | "docx"
+        "md" | "markdown"
+            | "html" | "htm" | "php"
+            | "docx" | "doc" | "xlsx" | "xls" | "pptx" | "ppt" | "pdf"
     )
 }
 
@@ -165,10 +174,12 @@ pub fn kind_of(path: &Path, is_dir: bool) -> PreviewKind {
         PreviewKind::Image
     } else if VIDEO_EXTS.contains(&ext.as_str()) {
         PreviewKind::Video
+    } else if AUDIO_EXTS.contains(&ext.as_str()) {
+        PreviewKind::Audio
     } else if is_archive_kind(&ext, path) {
         PreviewKind::Archive
     } else if is_binary_kind(&ext) {
-        // EXE/MSI/Office/PDF 等已知类型二进制：显示应用/文件基本信息（含版本资源）
+        // 旧版 Office/未知容器显示基础信息；可解析格式已在前面进入文本预览
         PreviewKind::Info
     } else {
         // 兜底用文本预览：文本文件显示内容，二进制文件由 read_text_head 的
@@ -183,8 +194,24 @@ fn is_binary_kind(ext: &str) -> bool {
 }
 
 /// 是否作为归档预览（与 operations::is_archive 一致的格式集合）
+/// ZIP 系容器扩展（msix/appx 等本质为 ZIP）同样进入归档树预览；
+/// cab/iso/vhd/rar 无对应解析器，不走归档预览（按二进制信息展示）
 fn is_archive_kind(ext: &str, _path: &Path) -> bool {
-    matches!(ext, "zip" | "7z" | "tar" | "gz" | "tgz")
+    matches!(
+        ext,
+        "zip"
+            | "7z"
+            | "tar"
+            | "gz"
+            | "tgz"
+            | "msix"
+            | "msixbundle"
+            | "appx"
+            | "appxbundle"
+            | "apk"
+            | "aab"
+            | "ipa"
+    )
 }
 
 /// 读取文本文件首部，最多 `max_bytes` 字节，按编码检测解码：
@@ -255,45 +282,64 @@ fn hex_dump(buf: &[u8]) -> String {
     out
 }
 
-/// 抽取 Word 文档（.docx）正文：zip 容器读 word/document.xml，
-/// 段落/换行标签转行、剥离其余 XML 标签、解码常见实体。
+/// 抽取 Word 文档（.docx）正文：使用 docx-rs 解析，提取段落文本。
 /// 读取失败返回 None（调用方回退其它预览方式）。
 pub fn office_text(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let f = std::fs::File::open(path).ok()?;
-    let mut zip = zip::ZipArchive::new(f).ok()?;
-    let mut raw = String::new();
-    zip.by_name("word/document.xml")
-        .ok()?
-        // 64MB 上限防 zip 炸弹：小体积 docx 可内藏超大的 document.xml，预览即 OOM
-        .take(64 * 1024 * 1024)
-        .read_to_string(&mut raw)
-        .ok()?;
-    // 段落 / 换行 / 制表符标签 → 对应文本字符
-    let raw = raw
-        .replace("</w:p>", "\n")
-        .replace("<w:br/>", "\n")
-        .replace("<w:tab/>", "\t");
-    // 剥离剩余 XML 标签
-    let mut text = String::with_capacity(raw.len());
-    let mut in_tag = false;
-    for c in raw.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => text.push(c),
-            _ => {}
+    let ext = ext_of(path);
+    match ext.as_str() {
+        "docx" => extract_docx(path),
+        "xlsx" => extract_xlsx(path),
+        "pdf" => extract_pdf(path),
+        _ => None,
+    }
+}
+
+/// 从 .docx 文件提取文本
+fn extract_docx(path: &Path) -> Option<String> {
+    use docx_rs::*;
+    let data = std::fs::read(path).ok()?;
+    let docx = read_docx(&data).ok()?;
+    let mut text = String::new();
+    for child in &docx.document.children {
+        if let DocumentChild::Paragraph(p) = child {
+            for run in &p.children {
+                if let ParagraphChild::Run(r) = run {
+                    for c in &r.children {
+                        if let RunChild::Text(t) = c {
+                            text.push_str(&t.text);
+                        }
+                    }
+                }
+            }
+            text.push('\n');
         }
     }
-    // 解码常见 XML 实体
-    let text = text
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#160;", " ")
-        .replace("&amp;", "&");
     Some(text)
+}
+
+/// 从 .xlsx 文件提取文本（所有工作表的单元格内容）
+fn extract_xlsx(path: &Path) -> Option<String> {
+    use calamine::{open_workbook, Reader, Xlsx};
+    let mut workbook: Xlsx<_> = open_workbook(path).ok()?;
+    let mut text = String::new();
+    for sheet_name in workbook.sheet_names() {
+        text.push_str(&format!("=== {} ===\n\n", sheet_name));
+        if let Ok(range) = workbook.worksheet_range(&sheet_name) {
+            for row in range.rows() {
+                let line: Vec<String> = row.iter().map(|cell| format!("{}", cell)).collect();
+                text.push_str(&line.join("\t"));
+                text.push('\n');
+            }
+        }
+        text.push('\n');
+    }
+    Some(text)
+}
+
+/// 从 PDF 文件提取文本
+fn extract_pdf(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    pdf_extract::extract_text_from_mem(&bytes).ok()
 }
 
 /// 读取 PE 版本资源中的描述/公司/版本/产品（常见代码页试探）。
@@ -428,7 +474,172 @@ fn system_ansi_encoding() -> &'static encoding_rs::Encoding {
     encoding_rs::WINDOWS_1252
 }
 
-/// 读取归档原始条目 (名, 大小, 是否目录)。按格式读取条目名/大小/是否目录，
+/// 按扩展名抽取可读文档内容，供源码视图和 WebView2 渲染视图共用。
+/// 新旧版 Office 共用同一高保真通道：渲染视图走 Office 转 PDF；
+/// 源码视图为旧版同样尝试从缓存 PDF 抽取文本（快），无缓存时走 OLE 容器
+/// 轻量抽取而非占位提示，避免截图中的“渲染/源码切换提示”占位。
+pub fn document_text(path: &Path) -> Result<String, String> {
+    match ext_of(path).as_str() {
+        "pdf" => pdf_text(path),
+        "docx" | "doc" => office_text(path)
+            .or_else(|| legacy_office_raw_text(path))
+            .ok_or_else(|| "无法读取 Word 文档内容".to_string()),
+        "xlsx" | "xls" => xlsx_text(path).or_else(|_| {
+            legacy_office_raw_text(path).ok_or_else(|| "无法读取 Excel 内容".to_string())
+        }),
+        "pptx" | "ppt" => pptx_text(path).or_else(|_| {
+            legacy_office_raw_text(path).ok_or_else(|| "无法读取演示文稿内容".to_string())
+        }),
+        _ => Err("不支持的文档格式".to_string()),
+    }
+}
+
+/// 旧版 Office 轻量文本兜底：优先从已缓存的 PDF 抽取（与渲染一致），
+/// 否则尝试 OLE 容器原始文本抽取，彻底消除占位提示。
+fn legacy_office_raw_text(path: &Path) -> Option<String> {
+    if let Some(pdf) = super::office_preview::cached_pdf_if_fresh(path) {
+        if let Ok(t) = pdf_extract::extract_text(&pdf) {
+            if !t.trim().is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    // OLE 旧版容器内文本碎片（尽力抽取可读片段）
+    ole_text_fallback(path)
+}
+
+/// OLE 旧版文档(.doc/.xls/.ppt)极简文本抽取：扫描文件字节中连续可读片段。
+/// 质量不如 Office 转 PDF，但用于源码视图兜底已足够，避免空白/占位。
+fn ole_text_fallback(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    // 提取连续 >=4 的可打印 ASCII/中文 GBK 片段，过滤控制字符
+    let mut out = String::new();
+    let mut cur = String::new();
+    for &b in &buf {
+        if (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
+            cur.push(b as char);
+            if cur.len() > 200 {
+                out.push_str(&cur);
+                out.push('\n');
+                cur.clear();
+            }
+        } else if b >= 0x80 {
+            // 可能的 GBK 中文片段，保留但限制长度
+            cur.push('·');
+        } else {
+            if cur.trim().len() >= 4 {
+                // 过滤纯二进制噪点：需含字母/中文/数字
+                if cur.chars().any(|c| c.is_alphanumeric()) {
+                    out.push_str(cur.trim());
+                    out.push('\n');
+                }
+            }
+            cur.clear();
+        }
+    }
+    if cur.trim().len() >= 4 && cur.chars().any(|c| c.is_alphanumeric()) {
+        out.push_str(cur.trim());
+    }
+    let t = out.trim().to_string();
+    if t.len() >= 8 { Some(t) } else { None }
+}
+
+fn read_zip_xml(path: &Path, name: &str) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("无法打开文档：{}", e))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("无法读取文档容器：{}", e))?;
+    let entry = zip.by_name(name).map_err(|_| format!("文档缺少 {}", name))?;
+    let mut raw = String::new();
+    entry
+        .take(16 * 1024 * 1024)
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("读取文档内容失败：{}", e))?;
+    Ok(raw)
+}
+
+fn xml_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in raw.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn xlsx_text(path: &Path) -> Result<String, String> {
+    let shared = read_zip_xml(path, "xl/sharedStrings.xml").unwrap_or_default();
+    let shared_values: Vec<String> = shared
+        .split("<si")
+        .skip(1)
+        .map(|s| xml_text(s.split("</si>").next().unwrap_or(s)))
+        .collect();
+    let mut out = String::new();
+    let mut sheets = Vec::new();
+    for i in 1..=100 {
+        let name = format!("xl/worksheets/sheet{}.xml", i);
+        let Ok(raw) = read_zip_xml(path, &name) else { break };
+        sheets.push((i, raw));
+    }
+    if sheets.is_empty() {
+        return Err("Excel 文档没有可读取的工作表".to_string());
+    }
+    for (index, raw) in sheets {
+        out.push_str(&format!("工作表 {}\n", index));
+        for row in raw.split("<row").skip(1) {
+            let row = row.split("</row>").next().unwrap_or(row);
+            let mut cells = Vec::new();
+            for cell in row.split("<c").skip(1) {
+                let kind_shared = cell.contains("t=\"s\"");
+                let value = xml_text(cell.split("<v>").nth(1).unwrap_or("").split("</v>").next().unwrap_or(""));
+                let value = if kind_shared {
+                    value.parse::<usize>().ok().and_then(|i| shared_values.get(i).cloned()).unwrap_or(value)
+                } else { value };
+                cells.push(value);
+            }
+            if !cells.is_empty() { out.push_str(&format!("{}\n", cells.join("\t"))); }
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn pptx_text(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("无法打开 PPT：{}", e))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("无法读取 PPT 容器：{}", e))?;
+    let mut out = String::new();
+    let mut count = 0;
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_string();
+        if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+            let mut raw = String::new();
+            entry.take(4 * 1024 * 1024).read_to_string(&mut raw).map_err(|e| e.to_string())?;
+            count += 1;
+            out.push_str(&format!("幻灯片 {}\n{}\n\n", count, xml_text(&raw)));
+        }
+    }
+    if count == 0 { Err("PowerPoint 文档没有可读取的幻灯片".to_string()) } else { Ok(out) }
+}
+
+fn pdf_text(path: &Path) -> Result<String, String> {
+    let text = pdf_extract::extract_text(path).map_err(|e| format!("PDF 文本抽取失败：{}", e))?;
+    if text.trim().is_empty() { Err("PDF 不包含可抽取的文本（可能是扫描图片）".to_string()) } else { Ok(text) }
+}
+
 /// 上限 2000 项防超大归档卡顿。复用 tasks.rs 已验证的读取路径
 /// （zip::ZipArchive / sevenz_rust::SevenZReader / tar::Archive）。
 pub fn read_archive_entries(path: &Path) -> Result<Vec<(String, u64, bool)>, String> {
@@ -438,7 +649,15 @@ pub fn read_archive_entries(path: &Path) -> Result<Vec<(String, u64, bool)>, Str
     let result: Result<Vec<(String, u64, bool)>, String> = (|| {
         let mut items: Vec<(String, u64, bool)> = Vec::new();
         match ext.as_str() {
-            "zip" => {
+            // ZIP 系容器（msix/appx/apk 等本质为 ZIP，按 ZIP 分支列目录）
+            "zip"
+            | "msix"
+            | "msixbundle"
+            | "appx"
+            | "appxbundle"
+            | "apk"
+            | "aab"
+            | "ipa" => {
                 let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
                 let mut zip = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
                 for i in 0..zip.len() {
@@ -690,8 +909,11 @@ mod tests {
         // 已知二进制/磁盘映像走文本通道生成十六进制预览，而非仅显示基础信息。
         assert_eq!(kind_of(Path::new("a.bin"), false), PreviewKind::Text);
         assert_eq!(kind_of(Path::new("a.zip"), false), PreviewKind::Archive);
-        assert_eq!(kind_of(Path::new("a.7z"), false), PreviewKind::Archive);
-        assert_eq!(kind_of(Path::new("anything"), true), PreviewKind::Folder);
+        assert_eq!(kind_of(Path::new("a.mp3"), false), PreviewKind::Audio);
+        assert_eq!(kind_of(Path::new("a.mp4"), false), PreviewKind::Video);
+        assert_eq!(kind_of(Path::new("a.pdf"), false), PreviewKind::Text);
+        assert_eq!(kind_of(Path::new("a.xlsx"), false), PreviewKind::Text);
+        assert_eq!(kind_of(Path::new("a.pptx"), false), PreviewKind::Text);
         // 大小写不敏感
         assert_eq!(kind_of(Path::new("A.PNG"), false), PreviewKind::Image);
     }

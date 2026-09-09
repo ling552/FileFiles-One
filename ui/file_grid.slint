@@ -149,15 +149,15 @@ export component FileGrid inherits Rectangle {
                                 spacing: 3px;
                                 if card.entry.tag-important: Rectangle {
                                     width: 9px; height: 9px; border-radius: 4.5px;
-                                    background: #d13438; border-width: 2px; border-color: white;
+                                    background: #ff3b30; border-width: 2px; border-color: white;
                                 }
                                 if card.entry.tag-archive: Rectangle {
                                     width: 9px; height: 9px; border-radius: 4.5px;
-                                    background: #ff8c00; border-width: 2px; border-color: white;
+                                    background: #ff9500; border-width: 2px; border-color: white;
                                 }
                                 if card.entry.tag-done: Rectangle {
                                     width: 9px; height: 9px; border-radius: 4.5px;
-                                    background: #107c10; border-width: 2px; border-color: white;
+                                    background: #34c759; border-width: 2px; border-color: white;
                                 }
                             }
                         }
@@ -171,10 +171,10 @@ export component FileGrid inherits Rectangle {
                             border-radius: 5px;
                             border-width: 2px;
                             border-color: white;
-                            background: card.entry.git-status == "?" ? #8a99aa
-                                : card.entry.git-status == "!" ? #d13438
-                                : card.entry.git-status == "A" ? #107c10
-                                : #ff8c00;
+                            background: card.entry.git-status == "?" ? #8e8e93
+                                : card.entry.git-status == "!" ? #ff3b30
+                                : card.entry.git-status == "A" ? #34c759
+                                : #ff9500;
                             Text {
                                 text: card.entry.git-status;
                                 color: white;
@@ -268,15 +268,15 @@ export component FileGrid inherits Rectangle {
                 spacing: 3px;
                 if entry.tag-important: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
-                    background: #d13438; border-width: 2px; border-color: Theme.selection-bg;
+                    background: #ff3b30; border-width: 2px; border-color: Theme.selection-bg;
                 }
                 if entry.tag-archive: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
-                    background: #ff8c00; border-width: 2px; border-color: Theme.selection-bg;
+                    background: #ff9500; border-width: 2px; border-color: Theme.selection-bg;
                 }
                 if entry.tag-done: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
-                    background: #107c10; border-width: 2px; border-color: Theme.selection-bg;
+                    background: #34c759; border-width: 2px; border-color: Theme.selection-bg;
                 }
             }
         }
@@ -288,10 +288,10 @@ export component FileGrid inherits Rectangle {
             border-radius: 5px;
             border-width: 2px;
             border-color: Theme.selection-bg;
-            background: entry.git-status == "?" ? #8a99aa
-                : entry.git-status == "!" ? #d13438
-                : entry.git-status == "A" ? #107c10
-                : #ff8c00;
+            background: entry.git-status == "?" ? #8e8e93
+                : entry.git-status == "!" ? #ff3b30
+                : entry.git-status == "A" ? #34c759
+                : #ff9500;
             Text {
                 text: entry.git-status;
                 color: white;

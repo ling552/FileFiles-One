@@ -111,8 +111,9 @@ export struct ShellNewEntry {
 // 已保存的网络位置（设置「云存储账号」页展示）
 export struct NetAccount {
     name: string,    // 显示名
-    server: string,  // 服务器地址（\\server\share）
+    server: string,  // 服务器地址（\\server\share 或 ftp/webdav/sftp 的友好地址）
     drive: string,   // 已挂载盘符（如 "Z:"，未挂载为空串）
+    kind: string,    // smb | ftp | webdav | sftp
 }
 
 // 用户自定义标签定义（工具栏「标记」下拉与侧栏同步显示）
@@ -247,10 +248,15 @@ export global AppState {
     in-out property <bool> omni-cmd-mode: false;
     in-out property <int> omni-cmd-selected: 0;
     callback request-path-completion(string);
-    // ── 网络位置：添加 SMB 连接对话框 ──
+    // ── 网络位置：添加 SMB/FTP/WebDAV/SFTP 对话框 ──
     in-out property <bool> netloc-dialog-open: false;
+    in-out property <string> netloc-kind: "smb"; // smb | ftp | webdav | sftp
     in-out property <string> netloc-name;
-    in-out property <string> netloc-server;
+    in-out property <string> netloc-server; // SMB 用
+    in-out property <string> netloc-host;
+    in-out property <string> netloc-remote-path;
+    in-out property <int> netloc-port: 0;
+    in-out property <bool> netloc-use-tls: false;
     in-out property <string> netloc-user;
     in-out property <string> netloc-pass;
     callback add-network-location();
@@ -379,6 +385,11 @@ export global AppState {
     in-out property <bool> ql-can-render: false;
     // 当前处于渲染模式（WebView2 原生子窗口覆盖内容区显示网页）
     in-out property <bool> ql-web-mode: false;
+    // Office 文档：恒为真（Word/Excel/PPT 新旧格式），渲染视图为本机 Office
+    // 排版的高保真版，右上角不显示「渲染/源码」切换。
+    in-out property <bool> ql-office-doc: false;
+    // Office 高保真版尚未就绪（后台转换中）：渲染区显示加载条而非文本内容。
+    in-out property <bool> ql-office-pending: false;
     // 视频预览无边框显示器全屏；Esc 优先退出全屏，再关闭预览。
     in-out property <bool> ql-video-fullscreen: false;
     callback ql-toggle-video-fullscreen();

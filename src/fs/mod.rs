@@ -20,6 +20,8 @@ pub mod openwith;
 pub mod operations;
 // 空格键 Quick Look 预览内容计算（图片/文本/文件夹/其它归类）
 pub mod preview;
+// Office 高保真预览：调用本机 Office 转 PDF 后由 WebView2 渲染
+pub mod office_preview;
 // Quick Look 网页渲染视图：WebView2 渲染 HTML/PHP/Markdown（源码/渲染切换）
 pub mod recyclebin;
 pub mod web_preview;
@@ -42,6 +44,8 @@ pub mod default_app;
 pub mod devices;
 pub mod quickaccess;
 pub mod virtualfs;
+// 云存储虚拟文件系统：FTP / WebDAV / SFTP
+pub mod cloud;
 
 use std::path::PathBuf;
 

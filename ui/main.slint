@@ -197,14 +197,14 @@ export component MainWindow inherits Window {
                     spacing: 0px;
                     // 左侧留白
                     Rectangle { width: 8px; }
-                    // 品牌图标（显示 icon.png；双击最大化；拖动由底层标题栏拖动层统一处理）
+                    // 品牌图标（Apple 式圆角渐变蓝；双击最大化；拖动由底层标题栏拖动层统一处理）
                     Rectangle {
                         width: 26px; height: 26px;
                         y: (parent.height - 26px)/2;
                         border-radius: 8px;
-                        background: @linear-gradient(135deg, #0078d4, #35b8ff);
+                        background: @linear-gradient(135deg, #0a84ff, #5ac8fa);
                         drop-shadow-blur: 10px;
-                        drop-shadow-color: rgba(0, 120, 212, 0.28);
+                        drop-shadow-color: rgba(10, 132, 255, 0.30);
                         clip: true;
                         Image {
                             width: 100%; height: 100%;
@@ -227,7 +227,7 @@ export component MainWindow inherits Window {
                         horizontal-stretch: 1;
                         padding-left: 8px;
                         alignment: start;
-                        // 渲染全部标签页（点击切换 / 拖动重排 / 关闭）
+                        // 渲染全部标签页（Apple 胶囊式活动态 + 按压即时反馈，点击切换 / 拖动重排 / 关闭）
                         for tab[i] in AppState.tabs: Rectangle {
                             y: (parent.height - 30px)/2;
                             height: 30px;
@@ -239,10 +239,12 @@ export component MainWindow inherits Window {
                             max-width: 188px;
                             border-radius: 10px;
                             background: tab.active
-                                ? rgba(255, 255, 255, 0.92)
-                                : (tab-touch.has-hover ? rgba(255, 255, 255, 0.5) : transparent);
-                            drop-shadow-blur: tab.active ? 4px : 0px;
-                            drop-shadow-color: rgba(0, 0, 0, 0.06);
+                                ? Theme.surface
+                                : (tab-touch.pressed ? Theme.primary-pressed
+                                    : tab-touch.has-hover ? Theme.primary-hover : transparent);
+                            animate background { duration: 120ms; easing: ease-out; }
+                            drop-shadow-blur: tab.active ? 8px : 0px;
+                            drop-shadow-color: rgba(0, 0, 0, 0.08);
 
                             // 底层：切换 + 拖动重排（声明在内容之前，置于下层；关闭按钮在上层优先响应）
                             tab-touch := TouchArea {

@@ -87,6 +87,20 @@ fn icon_request_for_entry(
             is_dir: e.is_dir,
         });
     }
+    if e.path.starts_with("cloud://") {
+        if !system_icons {
+            return None;
+        }
+        let extension = Path::new(&e.name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(IconRequest::Type {
+            extension,
+            is_dir: e.is_dir,
+        });
+    }
     if crate::fs::virtualfs::is_virtual(&e.path) {
         return None;
     }
@@ -127,13 +141,20 @@ pub(crate) fn image_cached(ic: &Arc<crate::fs::thumbnail::IconPixels>) -> Image 
     let img = image_from(ic);
     ICON_IMAGE_CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        // 上限防无限增长：达 256 项（约 32MB）整体清空重建，图标种类通常远小于该值
-        if c.len() >= 256 {
+        // 上限防无限增长：达 128 项整体清空重建，图标种类通常远小于该值
+        if c.len() >= 128 {
             c.clear();
         }
         c.insert(key, (ic.clone(), img.clone()));
     });
     img
+}
+
+/// 清空图标像素 → Slint 图像共享缓存（必须在 UI 线程调用）。
+/// 图标缓存失效（更改默认应用/切换图标来源）后同步调用，否则旧像素的 Arc
+/// 被此处持有，旧图标继续显示且内存不释放。
+pub(crate) fn clear_icon_image_cache() {
+    ICON_IMAGE_CACHE.with(|c| c.borrow_mut().clear());
 }
 
 // ── 侧栏图标异步加载：build_sidebar 只读缓存不阻塞 UI；未命中项记录到 ──
@@ -482,24 +503,33 @@ pub fn push_entries(ui: &MainWindow, core: &AppCore) {
     update_selection_pane(ui, core, right_active);
 }
 
-/// 后台异步加载缩略图/系统图标，逐个回填到 entries 模型。
+/// 后台异步加载缩略图/系统图标，批量回填到 entries 模型。
 ///
-/// 设计：
-/// - 单后台线程串行调用 thumbnail::extract（COM 在该线程初始化一次），逐条出图；
-/// - 每出一张就通过 upgrade_in_event_loop 回到 UI 线程，由 UI 线程构建
-///   SharedPixelBuffer→Image 并就地写回对应行（SharedPixelBuffer 非 Send）；
+/// 设计（两阶段 + 批量，降低“占位图标 → 正确图标”的等待感）：
+/// - 类型图标（扩展名/文件夹/设备）先行：按类型共享，一次提取全目录同类行
+///   受益，通常百毫秒内完成首绘；
+/// - 具体文件缩略图（图片/视频/exe）随后：仍串行提取（COM 单线程），但每攒
+///   一批统一回一次事件循环，避免每行一次跨线程往返的开销；
 /// - 回到 UI 线程后先比对 generation：与当前全局代数不一致说明目录已切换，
 ///   直接丢弃，避免旧目录缩略图错填到新目录。
 fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: ThumbSide) {
+    // 类型任务优先：同类型共享缓存，首次提取后同类行均为缓存命中
+    let (type_jobs, path_jobs): (Vec<IconJob>, Vec<IconJob>) = jobs
+        .into_iter()
+        .partition(|(_, req)| crate::fs::thumbnail::request_is_shared_type(req));
     let weak = ui.as_weak();
     let gen_ref = side.generation();
     std::thread::spawn(move || {
-        // 回 UI 线程把图标写回对应行（代数校验避免旧目录图标填到新目录）
-        let apply = |row: usize, icon: &std::sync::Arc<crate::fs::thumbnail::IconPixels>| {
+        // 批量回 UI 线程把图标写回对应行（代数校验避免旧目录图标填到新目录）
+        let flush = |batch: Vec<(usize, std::sync::Arc<crate::fs::thumbnail::IconPixels>)>| {
+            if batch.is_empty() {
+                return;
+            }
+            if gen_ref.load(Ordering::SeqCst) != generation {
+                return;
+            }
             let weak2 = weak.clone();
-            let icon = icon.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                // 回到 UI 线程：代数校验 + 构建图像 + 就地写回
                 if gen_ref.load(Ordering::SeqCst) != generation {
                     return;
                 }
@@ -509,34 +539,65 @@ fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: 
                     ThumbSide::Left => state.get_entries(),
                     ThumbSide::Right => state.get_r_entries(),
                 };
-                if let Some(mut entry) = model.row_data(row) {
-                    let img = image_cached(&icon);
-                    entry.thumb = img.clone();
-                    entry.has_thumb = true;
-                    let is_selected = entry.selected;
-                    model.set_row_data(row, entry);
-                    // 左侧：若该行正是当前选中项，同步刷新右侧详情面板预览
-                    if side == ThumbSide::Left && is_selected {
-                        state.set_sel_thumb(img);
-                        state.set_sel_has_thumb(true);
+                let mut sel_img: Option<Image> = None;
+                for (row, icon) in &batch {
+                    if let Some(mut entry) = model.row_data(*row) {
+                        let img = image_cached(icon);
+                        entry.thumb = img.clone();
+                        entry.has_thumb = true;
+                        let is_selected = entry.selected;
+                        model.set_row_data(*row, entry);
+                        // 左侧：若该行正是当前选中项，同步刷新右侧详情面板预览
+                        if side == ThumbSide::Left && is_selected {
+                            sel_img = Some(img);
+                        }
                     }
+                }
+                if let Some(img) = sel_img {
+                    state.set_sel_thumb(img);
+                    state.set_sel_has_thumb(true);
                 }
             });
         };
 
+        // 阶段一：类型图标（快，批量 16 行一刷，首绘最快）
+        let mut batch: Vec<(usize, std::sync::Arc<crate::fs::thumbnail::IconPixels>)> = Vec::new();
         let mut failed: Vec<IconJob> = Vec::new();
-        for (row, request) in jobs {
-            // 已切换目录：提前结束本批，省去无谓的图标提取
+        for (row, request) in type_jobs {
             if gen_ref.load(Ordering::SeqCst) != generation {
                 return;
             }
-            // 走带缓存的入口：按类型/文件提取一次并写入缓存，后续同类型条目同步命中
+            // 走带缓存的入口：命中同类型缓存即零提取
             match crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE) {
-                Some(icon) => apply(row, &icon),
+                Some(icon) => {
+                    batch.push((row, icon));
+                    if batch.len() >= 16 {
+                        flush(std::mem::take(&mut batch));
+                    }
+                }
                 // 提取失败（Shell/COM 未就绪、杀软占用等瞬时错误）：记下稍后重试
                 None => failed.push((row, request)),
             }
         }
+        flush(std::mem::take(&mut batch));
+
+        // 阶段二：具体文件缩略图（慢，批量 4 行一刷，渐进呈现）
+        for (row, request) in path_jobs {
+            // 已切换目录：提前结束本批，省去无谓的图标提取
+            if gen_ref.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            match crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE) {
+                Some(icon) => {
+                    batch.push((row, icon));
+                    if batch.len() >= 4 {
+                        flush(std::mem::take(&mut batch));
+                    }
+                }
+                None => failed.push((row, request)),
+            }
+        }
+        flush(std::mem::take(&mut batch));
         // 失败行延迟重试一次：瞬时失败通常数百毫秒内恢复，
         // 避免个别文件停留在内置矢量图（重试仍失败则由 stock 回退兼底）
         if !failed.is_empty() {
@@ -547,9 +608,13 @@ fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: 
                 }
                 if let Some(icon) = crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE)
                 {
-                    apply(row, &icon);
+                    batch.push((row, icon));
+                    if batch.len() >= 8 {
+                        flush(std::mem::take(&mut batch));
+                    }
                 }
             }
+            flush(std::mem::take(&mut batch));
         }
     });
 }
@@ -1241,6 +1306,43 @@ pub fn build_sidebar(
                 has_thumb: device_has_thumb,
             });
         }
+        // 云存储（FTP/WebDAV/SFTP）：在“此电脑”展开时一并列出，便于直达
+        for loc in &config.network_locations {
+            if !matches!(loc.kind.as_str(), "ftp" | "webdav" | "sftp") {
+                continue;
+            }
+            let vpath = loc.cloud_path();
+            let glyph = match loc.kind.as_str() {
+                "ftp" => "\u{E968}",   // Network
+                "sftp" => "\u{E8B7}",  // Folder
+                "webdav" => "\u{E753}", // Cloud
+                _ => "\u{E753}",
+            };
+            // 云图标：按系统图标或内置图标
+            let (cloud_thumb, cloud_has_thumb) = if system_icons {
+                // 尝试取侧栏缓存，未命中则用内置字形的 glyph
+                (Image::default(), false)
+            } else {
+                (Image::default(), false)
+            };
+            items.push(NavItem {
+                label: loc.name.clone().into(),
+                path: vpath.clone().into(),
+                icon: glyph.into(),
+                icon_class: "".into(),
+                badge: "".into(),
+                is_header: false,
+                is_disk: false,
+                disk_ratio: 0.0,
+                disk_info: loc.display_server().into(),
+                disk_color: slint::Brush::SolidColor(slint::Color::from_rgb_u8(0x00, 0x78, 0xd4)),
+                active: active_str == vpath,
+                collapsed: false,
+                is_tree: false,
+                thumb: cloud_thumb,
+                has_thumb: cloud_has_thumb,
+            });
+        }
     }
 
     // 标签（真实计数 + tag:// 虚拟路径）
@@ -1363,8 +1465,9 @@ pub fn push_network_locations(ui: &MainWindow, core: &AppCore) {
         .iter()
         .map(|l| NetAccount {
             name: l.name.clone().into(),
-            server: l.server.clone().into(),
+            server: if !l.host.is_empty() { l.display_server().into() } else { l.server.clone().into() },
             drive: l.drive.clone().unwrap_or_default().into(),
+            kind: l.kind.clone().into(),
         })
         .collect();
     ui.global::<AppState>()
@@ -1707,7 +1810,14 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
         return false;
     };
 
-    let path = Path::new(&e.path);
+    // 云端文件：预览内容取自本地缓存（调用方 open_cloud_quicklook 已后台下载完成，
+    // 此处秒级命中；未命中时同步下载为兜底）。云目录不下载，按虚拟文件夹统计展示
+    let prepared_path = if e.path.starts_with("cloud://") && !e.is_dir {
+        crate::fs::cloud::download_webdav_file(&e.path, &core.config).unwrap_or_else(|_| PathBuf::from(&e.path))
+    } else {
+        PathBuf::from(&e.path)
+    };
+    let path = prepared_path.as_path();
     let kind = preview::kind_of(path, e.is_dir);
     state.set_ql_kind(kind.code());
     state.set_ql_name(e.name.clone().into());
@@ -1724,9 +1834,11 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
     state.set_ql_code_str("".into());
     state.set_ql_code_cmt("".into());
     state.set_ql_info("".into());
-    // 渲染/源码切换状态复位（Markdown/HTML/PHP 在 Text 分支重新置位）
+    // 渲染/源码切换状态复位（Markdown/HTML/PHP/Office/PDF 在 Text 分支重新置位）
     state.set_ql_can_render(false);
     state.set_ql_web_mode(false);
+    state.set_ql_office_doc(false);
+    state.set_ql_office_pending(false);
     // 条目的真实缩略图/系统图标（取对应面板列表模型已生成的位图），头部与大图标优先显示
     let model = if right {
         state.get_r_entries()
@@ -1764,44 +1876,84 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
         }
         PreviewKind::Text => {
             state.set_ql_subtitle(size_text.into());
-            // Markdown/HTML/PHP：支持渲染视图，默认以渲染模式打开
-            // （WebView2 子窗口由 main.rs 在浮层打开后启动；源码层照常填充备切换）
+            // Markdown/HTML/PHP/Office/PDF：支持渲染视图，默认以渲染模式打开
             if preview::renderable_web(path) {
                 state.set_ql_can_render(true);
                 state.set_ql_web_mode(true);
             }
-            // 读取首部 64KB 文本，按扩展名做语法高亮分层（4 层字符对齐）。
-            // quick_look.slint 用同一等宽字体把 base / 关键字 / 字符串 / 注释 4 层 Text
-            // 原位叠加显示多色代码；base 层已把关键字等挖空为占位空格，叠加时互不遮盖。
-            // docx 为 zip 容器：源码视图显示抽取的正文而非十六进制。
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let text = if ext == "docx" {
-                preview::office_text(path)
-                    .unwrap_or_else(|| preview::read_text_head(path, 64 * 1024))
+            // 文档源码视图也显示抽取出的可读内容；抽取失败时保留明确错误，而不是十六进制乱码。
+            // Office（含旧版 doc/xls/ppt）与 PDF 走 document_text 高保真通道。
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            // Office 文档：标记高保真模式（隐藏渲染/源码切换）。缓存未命中且本机
+            // 装有对应 Office 时挂起显示加载条，文本仅预填供转换失败回退用。
+            if crate::fs::office_preview::is_office_doc(path) {
+                state.set_ql_office_doc(true);
+                let fresh = crate::fs::office_preview::cached_pdf_if_fresh(path).is_some();
+                let installed = crate::fs::office_preview::office_app_for_ext(&ext)
+                    .map(|a| crate::fs::office_preview::is_office_installed(a))
+                    .unwrap_or(false);
+                state.set_ql_office_pending(!fresh && installed);
+            }
+            let is_office = crate::fs::office_preview::is_office_doc(path);
+            let text = if is_office || ext == "pdf" {
+                preview::document_text(path).unwrap_or_else(|e| format!("文档内容暂时无法预览：{}", e))
             } else {
                 preview::read_text_head(path, 64 * 1024)
             };
-            let layers = crate::fs::highlight::highlight(&text, ext);
+            let layers = crate::fs::highlight::highlight(&text, &ext);
             state.set_ql_text(layers.base.into());
             state.set_ql_code_kw(layers.keywords.into());
             state.set_ql_code_str(layers.strings.into());
             state.set_ql_code_cmt(layers.comments.into());
         }
         PreviewKind::Video => {
-            // 视频：画面由 Media Foundation 子窗口渲染（main.rs 打开预览时启动）。
-            // 分辨率先经 Shell 属性处理器同步探测，使窗口一次性按正确宽高比打开；
-            // 探测不到（罕见容器/网络路径）才清零，退回「媒体就绪后再调尺寸」。
-            // 清零很重要：残留上一个视频的宽高比会让首帧子窗口按旧比例定位。
-            let probed = crate::fs::video_preview::probe_display_size(&e.path);
-            let (vw, vh) = probed.unwrap_or((0, 0));
-            state.set_ql_img_w(vw as i32);
-            state.set_ql_img_h(vh as i32);
-            state.set_ql_loading(true);
-            state.set_ql_subtitle(if vw > 0 && vh > 0 {
-                format!("{}×{} 像素 · {}", vw, vh, size_text).into()
-            } else {
-                size_text.into()
-            });
+            // 视频：画面由 Media Foundation 子窗口处理
+            state.set_ql_subtitle(size_text.into());
+        }
+        PreviewKind::Audio => {
+            // 音频：提取元数据与封面，显示专用音频播放器 UI
+            let mut subtitle = size_text.clone();
+            use lofty::file::{AudioFile, TaggedFileExt};
+            if let Ok(tf) = lofty::probe::read_from_path(path) {
+                let duration = tf.properties().duration();
+                let time_str = format!("{}:{:02}", duration.as_secs() / 60, duration.as_secs() % 60);
+
+                // 提取标签信息与封面
+                let mut meta_parts = Vec::new();
+                if let Some(tag) = tf.primary_tag() {
+                    if let Some(title) = tag.get_string(&lofty::tag::ItemKey::TrackTitle) {
+                        meta_parts.push(format!("标题：{}", title));
+                    }
+                    if let Some(artist) = tag.get_string(&lofty::tag::ItemKey::TrackArtist) {
+                        meta_parts.push(format!("艺术家：{}", artist));
+                    }
+                    if let Some(album) = tag.get_string(&lofty::tag::ItemKey::AlbumTitle) {
+                        meta_parts.push(format!("专辑：{}", album));
+                    }
+
+                    // 提取内嵌封面图片
+                    let pictures = tag.pictures();
+                    if let Some(pic) = pictures.first() {
+                        if let Ok(img) = image::load_from_memory(pic.data()) {
+                            let rgba = img.to_rgba8();
+                            let (w, h) = (rgba.width(), rgba.height());
+                            let pixels: Vec<u8> = rgba.into_raw();
+                            let slint_img = slint::Image::from_rgba8(
+                                slint::SharedPixelBuffer::clone_from_slice(&pixels, w, h)
+                            );
+                            state.set_ql_thumb(slint_img);
+                            state.set_ql_has_thumb(true);
+                        }
+                    }
+                }
+
+                subtitle = if meta_parts.is_empty() {
+                    format!("音频 · {} · {}", time_str, size_text)
+                } else {
+                    format!("{} · 音频 · {} · {}", meta_parts.join(" · "), time_str, size_text)
+                };
+            }
+            state.set_ql_subtitle(subtitle.into());
         }
         PreviewKind::Archive => {
             // 归档：内容为可展开/折叠的树（kind==5），由 preview_host 读取归档并

@@ -120,6 +120,8 @@ pub fn push_content(main: &MainWindow, win: &PreviewWindow, path: &str) {
     dst.set_info(src.get_ql_info());
     dst.set_can_render(src.get_ql_can_render());
     dst.set_web_mode(src.get_ql_web_mode());
+    dst.set_office_doc(src.get_ql_office_doc());
+    dst.set_office_pending(src.get_ql_office_pending());
     dst.set_video_fullscreen(src.get_ql_video_fullscreen());
 
     if kind == 5 {
@@ -248,9 +250,21 @@ fn visible_nodes(nodes: &[ArchiveTreeNode], expanded: &HashSet<String>) -> Vec<A
     out
 }
 
-/// 关闭预览窗口（隐藏并清理归档状态）
+/// 关闭预览窗口（隐藏并清理归档状态与大内存占用）。
+/// PreviewWindow 常驻隐藏复用，不清内容的话大图位图与文本层会一直驻留。
 pub fn hide() {
     if let Some(w) = window() {
+        let st = w.global::<PreviewState>();
+        st.set_loading(false);
+        st.set_office_pending(false);
+        st.set_has_image(false);
+        st.set_preview_image(slint::Image::default());
+        st.set_text_content("".into());
+        st.set_code_kw("".into());
+        st.set_code_str("".into());
+        st.set_code_cmt("".into());
+        st.set_has_thumb(false);
+        st.set_thumb(slint::Image::default());
         let _ = w.hide();
     }
     ARCHIVE.with(|a| *a.borrow_mut() = ArchiveView::default());

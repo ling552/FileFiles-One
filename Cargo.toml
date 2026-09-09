@@ -1,7 +1,7 @@
 # FileFiles One - Rust + Slint 现代文件管理器
 [package]
 name = "filefiles-one"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "现代化桌面文件管理器，Rust + Slint 实现"
 build = "build.rs"
@@ -57,6 +57,17 @@ serde_json = "1"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 # 文本编码检测/解码：空格预览非 UTF-8 文件（GBK/Big5/Shift_JIS/UTF-16 等）时按系统 ANSI 码页解码，避免乱码
 encoding_rs = "0.8"
+# PDF 文本抽取：离线 Quick Look 内容预览
+pdf-extract = "0.7"
+# Office 文档解析：Word (docx) 文本提取
+docx-rs = "0.4"
+# Excel 文件解析：xlsx/xls 读取
+calamine = "0.26"
+# 云存储：FTP / WebDAV / SFTP（SFTP 后端为纯 stub，无额外系统依赖）
+suppaftp = "7.0"
+quick-xml = "0.37"
+url = "2"
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 # Windows 磁盘剩余空间查询、驱动器类型、DWM 窗口圆角；
@@ -81,6 +92,8 @@ png = "0.17"
 winit = "0.30"
 # 读取常见图片格式的像素尺寸（仅解析文件头，不解码；预览显示真实分辨率用）
 imagesize = "0.13"
+# image：解码音频封面等图片数据
+image = "0.25"
 
 [build-dependencies]
 slint-build = "1.16"

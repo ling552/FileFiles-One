@@ -3,7 +3,7 @@
 import { Theme } from "theme.slint";
 import { LineEdit } from "std-widgets.slint";
 
-// 导航小圆按钮（Segoe MDL2 字形）
+// 导航小圆按钮（Apple 工具栏按钮：MDL2 字形 + 按压即时反馈）
 component NavBtn inherits Rectangle {
     in property <string> glyph;
     in property <string> tooltip;
@@ -12,7 +12,11 @@ component NavBtn inherits Rectangle {
     width: 30px;
     height: 30px;
     border-radius: 8px;
-    background: touch.has-hover && root.enabled ? Theme.primary-soft : transparent;
+    background: !root.enabled ? transparent
+        : touch.pressed ? Theme.primary-pressed
+        : touch.has-hover ? Theme.primary-soft : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
+    opacity: root.enabled ? 1.0 : 0.35;
     Text {
         text: root.glyph;
         font-family: "Segoe MDL2 Assets";

@@ -234,7 +234,7 @@ fn warmup_preview_window(ui: &MainWindow) {
     });
 }
 
-/// 后台预热侧栏缓存：特殊目录系统图标 + 快速访问枚举（均为阻塞 COM，
+/// 后台预热侧栏缓存：特殊目录系统图标 + 快速访问枚举 + 磁盘图标（均为阻塞 COM，
 /// 不能在 UI 线程跑）。完成后回事件循环触发 devices-changed 重建侧栏，
 /// 此时 build_sidebar 全部命中缓存，不再卡顿。
 fn warm_sidebar_caches(ui: &MainWindow) {
@@ -260,6 +260,12 @@ fn warm_sidebar_caches(ui: &MainWindow) {
             {
                 let p = dir.to_string_lossy().trim_end_matches('\\').to_string();
                 let _ = fs::thumbnail::special_dir_icon_cached(&p, 128);
+            }
+            // 磁盘图标预热：提取每个盘符的系统图标到侧栏缓存
+            for disk in fs::disk::list_disks() {
+                if let Some(icon) = fs::thumbnail::load_cached(&disk.root, true, 0, 128) {
+                    fs::thumbnail::sidebar_icon_set(&disk.root, icon);
+                }
             }
             // 快速访问枚举（填充 15s 缓存）
             let _ = fs::quickaccess::list();
@@ -2256,15 +2262,8 @@ fn load_right(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     ui.global::<AppState>().set_pane_drag_active(false);
     ui.invoke_clear_editing();
     let path = core.borrow().right_pane.history.current().clone();
-    // 虚拟路径（this-pc:// 等）无法作为右面板目录读取——启动目录为「此电脑」时
-    // 右面板与主面板同起点会落到虚拟路径，导致右面板空白并报错。回退到用户主目录。
-    let path = if fs::virtualfs::is_virtual(&path.to_string_lossy()) {
-        let home = home_start_path();
-        core.borrow_mut().right_pane.history.navigate(home.clone());
-        home
-    } else {
-        path
-    };
+    let path_str = path.to_string_lossy().to_string();
+    let is_virtual = fs::virtualfs::is_virtual(&path_str);
     let (show_hidden, show_protected, folders_first) = {
         let c = core.borrow();
         (
@@ -2273,7 +2272,16 @@ fn load_right(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             c.config.settings.folders_first,
         )
     };
-    match ops::read_dir(&path, show_hidden, show_protected) {
+    let result = if is_virtual {
+        let entries = {
+            let mut c = core.borrow_mut();
+            fs::virtualfs::resolve(&path_str, &mut c.config).unwrap_or_default()
+        };
+        Ok(entries)
+    } else {
+        ops::read_dir(&path, show_hidden, show_protected)
+    };
+    match result {
         Ok(entries) => {
             let mut c = core.borrow_mut();
             let prev = selected_path_set(&c.right_pane);
@@ -2298,9 +2306,9 @@ fn load_right(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     }
 }
 
-/// 右侧面板跳转到指定目录（仅限真实目录）
 fn navigate_right(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, target: PathBuf) {
-    if !target.is_dir() {
+    let target_str = target.to_string_lossy().to_string();
+    if !fs::virtualfs::is_virtual(&target_str) && !target.is_dir() {
         return;
     }
     core.borrow_mut().right_pane.history.navigate(target);
@@ -2524,17 +2532,72 @@ fn open_with_cwd(path: &str) {
     }
 }
 
-/// 非 Windows 平台回退到默认打开方式（不强制设置工作目录）。
-#[cfg(not(windows))]
-fn open_with_cwd(path: &str) {
-    let _ = open::that(path);
+fn open_cloud_file(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, vpath: &str) {
+    ui.global::<AppState>().set_status_text("正在下载云端文件…".into());
+    let weak = ui.as_weak();
+    let vpath = vpath.to_string();
+    let config = core.borrow().config.clone();
+    std::thread::spawn(move || {
+        let result = fs::cloud::download_webdav_file(&vpath, &config);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            match result {
+                Ok(path) => {
+                    ui.global::<AppState>().set_status_text("已打开云端文件".into());
+                    open_with_cwd(&path.to_string_lossy());
+                }
+                Err(e) => ui.global::<AppState>().set_status_text(format!("无法打开云端文件：{}", e).into()),
+            }
+        });
+    });
 }
 
-/// 求上一级路径：device:// 走 WPD 父对象逻辑，普通路径用 Path::parent。
+/// 当前 Quick Look 目标（活动面板选中项）是否为文件。云目录不下载预览。
+fn quicklook_selection_is_file(core: &Rc<RefCell<AppCore>>, right: bool) -> bool {
+    let c = core.borrow();
+    c.pane(right)
+        .first_selected()
+        .and_then(|fi| c.pane(right).entry_at(fi))
+        .map(|e| !e.is_dir)
+        .unwrap_or(false)
+}
+
+/// 云端文件的 Quick Look：先在后台线程下载到本地缓存，完成后重新触发
+/// 打开回调——此时 fill_quicklook 内 download_webdav_file 命中缓存立即
+/// 返回，UI 全程不阻塞。下载期间选择已变化则丢弃；失败仅状态栏提示。
+fn open_cloud_quicklook(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, vpath: &str) {
+    ui.global::<AppState>()
+        .set_status_text("正在下载云端文件…".into());
+    let config = core.borrow().config.clone();
+    let vpath = vpath.to_string();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = fs::cloud::download_webdav_file(&vpath, &config);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let st = ui.global::<AppState>();
+            match result {
+                // 期间用户未改变选择才重新打开（回调内会再取当前选中项）
+                Ok(_) if st.get_sel_path() == vpath.as_str() => {
+                    st.invoke_open_quicklook();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    st.set_status_text(format!("无法预览云端文件：{}", e).into())
+                }
+            }
+        });
+    });
+}
+
+/// 求上一级路径：device:// 走 WPD 父对象逻辑，cloud:// 走云存储父路径，普通路径用 Path::parent。
 fn parent_of(cur: &Path) -> Option<PathBuf> {
     let s = cur.to_string_lossy();
     if s.starts_with("device://") {
         return fs::devices::parent_path(&s).map(PathBuf::from);
+    }
+    if s.starts_with("cloud://") {
+        return fs::cloud::parent_cloud_path(&s).map(PathBuf::from);
     }
     cur.parent().map(|p| p.to_path_buf())
 }
@@ -2625,51 +2688,122 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         }
     });
 
-    // 添加网络位置（SMB 挂载到空闲盘符）：读对话框输入 -> 挂载 -> 存配置 -> 导航
+    // 添加网络位置：支持 SMB / FTP / WebDAV / SFTP
     let w = ui.as_weak();
     let c = core.clone();
     state.on_add_network_location(move || {
         if let Some(ui) = w.upgrade() {
             let st = ui.global::<AppState>();
+            let kind = st.get_netloc_kind().to_string();
             let name = st.get_netloc_name().to_string();
             let server = st.get_netloc_server().to_string();
+            let host = st.get_netloc_host().to_string();
+            let remote_path = st.get_netloc_remote_path().to_string();
+            let port = st.get_netloc_port() as u16;
+            let use_tls = st.get_netloc_use_tls();
             let user = st.get_netloc_user().to_string();
             let pass = st.get_netloc_pass().to_string();
-            if server.is_empty() {
-                st.set_status_text("请输入服务器地址（如 \\\\server\\share）".into());
-                return;
-            }
-            let disp_name = if name.is_empty() {
-                server.clone()
-            } else {
-                name
-            };
-            match crate::fs::network::mount_smb(&server, &user, &pass) {
-                Some(drive) => {
-                    {
-                        let mut core = c.borrow_mut();
-                        core.config
-                            .network_locations
-                            .push(crate::config::NetworkLocation {
+
+            if kind == "smb" {
+                if server.is_empty() {
+                    st.set_status_text("请输入服务器地址（如 \\\\server\\share）".into());
+                    return;
+                }
+                let disp_name = if name.is_empty() { server.clone() } else { name };
+                match crate::fs::network::mount_smb(&server, &user, &pass) {
+                    Some(drive) => {
+                        {
+                            let mut core = c.borrow_mut();
+                            core.config.network_locations.push(crate::config::NetworkLocation {
                                 name: disp_name.clone(),
-                                server,
+                                server: server.clone(),
                                 kind: "smb".into(),
                                 drive: Some(drive.clone()),
+                                host: String::new(),
+                                port: 0,
+                                remote_path: String::new(),
+                                username: String::new(),
+                                password: String::new(),
+                                use_tls: false,
+                                passive: false,
                             });
-                        core.config.save();
+                            core.config.save();
+                        }
+                        st.set_netloc_dialog_open(false);
+                        st.set_netloc_name("".into());
+                        st.set_netloc_server("".into());
+                        st.set_netloc_host("".into());
+                        st.set_netloc_remote_path("".into());
+                        st.set_netloc_port(0);
+                        st.set_netloc_user("".into());
+                        st.set_netloc_pass("".into());
+                        ui_bridge::push_network_locations(&ui, &c.borrow());
+                        navigate_to(&ui, &c, PathBuf::from(drive));
                     }
-                    st.set_netloc_dialog_open(false);
-                    st.set_netloc_name("".into());
-                    st.set_netloc_server("".into());
-                    st.set_netloc_user("".into());
-                    st.set_netloc_pass("".into());
-                    // 刷新设置「云存储账号」页的已保存列表
-                    ui_bridge::push_network_locations(&ui, &c.borrow());
-                    navigate_to(&ui, &c, PathBuf::from(drive));
+                    None => {
+                        st.set_status_text("挂载失败，请检查地址和凭据".into());
+                    }
                 }
-                None => {
-                    st.set_status_text("挂载失败，请检查地址和凭据".into());
+            } else {
+                // FTP / WebDAV / SFTP：以虚拟路径 cloud://kind/name 呈现，无需挂载盘符
+                if host.is_empty() {
+                    st.set_status_text("请输入主机地址".into());
+                    return;
                 }
+                if name.is_empty() {
+                    st.set_status_text("请输入显示名称".into());
+                    return;
+                }
+                // 重名检查
+                {
+                    let core = c.borrow();
+                    if core.config.network_locations.iter().any(|l| l.name == name) {
+                        st.set_status_text("名称已存在，请更换显示名称".into());
+                        return;
+                    }
+                }
+                let mut loc = crate::config::NetworkLocation {
+                    name: name.clone(),
+                    server: String::new(),
+                    kind: kind.clone(),
+                    drive: None,
+                    host: host.clone(),
+                    port,
+                    remote_path: if remote_path.is_empty() { "/".into() } else { remote_path.clone() },
+                    username: user.clone(),
+                    password: pass.clone(),
+                    use_tls,
+                    passive: true,
+                };
+                loc.server = loc.display_server();
+                {
+                    let mut core = c.borrow_mut();
+                    core.config.network_locations.push(loc.clone());
+                    core.config.save();
+                }
+                st.set_netloc_dialog_open(false);
+                st.set_netloc_name("".into());
+                st.set_netloc_server("".into());
+                st.set_netloc_host("".into());
+                st.set_netloc_remote_path("".into());
+                st.set_netloc_port(0);
+                st.set_netloc_user("".into());
+                st.set_netloc_pass("".into());
+                st.set_netloc_use_tls(false);
+                ui_bridge::push_network_locations(&ui, &c.borrow());
+                // 刷新 此电脑 与 侧栏（新增云存储即时可见）
+                {
+                    let core = c.borrow();
+                    ui.global::<AppState>().set_nav_items(ui_bridge::build_sidebar(
+                        core.active_tab().history.current(),
+                        &core.collapsed_sections,
+                        &core.config,
+                    ));
+                }
+                load_current(&ui, &c);
+                // 跳转到新建的云存储根
+                navigate_to(&ui, &c, PathBuf::from(loc.cloud_path()));
+                st.set_status_text(format!("已添加 {}：{}", kind.to_uppercase(), name).into());
             }
         }
     });
@@ -2727,6 +2861,8 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     }
                 } else if path.starts_with("device://") {
                     open_device_file(&ui, &path);
+                } else if path.starts_with("cloud://") {
+                    open_cloud_file(&ui, &c, &path);
                 } else {
                     open_with_cwd(&path);
                 }
@@ -3331,15 +3467,41 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     Err(e) => format!("设备删除失败：{}", e),
                 })
             };
+            let cloud_paths: Vec<String> = paths
+                .iter()
+                .filter(|p| p.to_string_lossy().starts_with("cloud://"))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let cloud_msg = if cloud_paths.is_empty() {
+                None
+            } else {
+                let cfg = c.borrow().config.clone();
+                let mut ok = 0;
+                let mut err = String::new();
+                for cp in &cloud_paths {
+                    match fs::cloud::delete_cloud(cp, &cfg) {
+                        Ok(()) => ok += 1,
+                        Err(e) => err = e,
+                    }
+                }
+                Some(if err.is_empty() {
+                    format!("已从云存储删除 {} 个项目", ok)
+                } else {
+                    format!("云存储删除失败：{}", err)
+                })
+            };
             let paths: Vec<PathBuf> = paths
                 .into_iter()
-                .filter(|p| !fs::devices::is_device_path(&p.to_string_lossy()))
+                .filter(|p| !fs::devices::is_device_path(&p.to_string_lossy()) && !p.to_string_lossy().starts_with("cloud://"))
                 .collect();
             if paths.is_empty() {
-                if let Some(msg) = device_msg {
+                let mut msgs: Vec<String> = Vec::new();
+                if let Some(m) = device_msg { msgs.push(m); }
+                if let Some(m) = cloud_msg { msgs.push(m); }
+                if !msgs.is_empty() {
                     reload_active_pane(&ui, &c);
                     schedule_pane_reloads(&ui, &c, &[600, 2000]);
-                    ui.global::<AppState>().set_status_text(msg.into());
+                    ui.global::<AppState>().set_status_text(msgs.join("；").into());
                 }
                 return;
             }
@@ -3358,8 +3520,11 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 srcs: paths,
                 dst: PathBuf::new(),
             });
-            if let Some(msg) = device_msg {
-                ui.global::<AppState>().set_status_text(msg.into());
+            let mut msgs: Vec<String> = Vec::new();
+            if let Some(m) = device_msg { msgs.push(m); }
+            if let Some(m) = cloud_msg { msgs.push(m); }
+            if !msgs.is_empty() {
+                ui.global::<AppState>().set_status_text(msgs.join("；").into());
             }
             start_next_job(&ui, &c);
         }
@@ -3391,6 +3556,23 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             let dst = c.borrow().pane(right).history.current().clone();
             // 便携设备目录：std::fs 不可用，改走 WPD 新建
             let dst_str = dst.to_string_lossy().to_string();
+            if fs::cloud::is_cloud_path(&dst_str) {
+                let name = "新建文件夹".to_string();
+                let cfg = c.borrow().config.clone();
+                match fs::cloud::create_dir(&dst_str, &name, &cfg) {
+                    Ok(path) => {
+                        ui.global::<AppState>().set_status_text("已在云存储新建文件夹".into());
+                        reload_active_pane(&ui, &c);
+                        select_created_and_edit(&ui, &c, right, &path);
+                        return;
+                    }
+                    Err(e) => {
+                        ui.global::<AppState>().set_status_text(format!("云存储新建失败：{}", e).into());
+                    }
+                }
+                reload_active_pane(&ui, &c);
+                return;
+            }
             if fs::devices::is_device_path(&dst_str) {
                 let name = unique_device_name(&dst_str, "新建文件夹");
                 match fs::devices::create_folder(&dst_str, &name) {
@@ -3971,6 +4153,7 @@ fn bind_context_menu_ext(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             let invoked = show_system_context_menu(&ui, &paths, mx, my);
             if invoked {
                 fs::thumbnail::clear_all_caches();
+                ui_bridge::clear_icon_image_cache();
                 reload_active_pane(&ui, &c);
                 // Shell 命令（删除/粘贴等）异步执行：延迟补刷确保结果反映到视图
                 schedule_pane_reloads(&ui, &c, &[600, 2000]);
@@ -4054,6 +4237,7 @@ fn bind_context_menu_ext(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 // 菜单命令可能改变侧栏内容（取消固定/弹出设备/重命名卷标/清空回收站），
                 // 也可能删除了当前面板所在目录：重建侧栏 + 刷新 + 延迟补刷
                 fs::thumbnail::clear_all_caches();
+                ui_bridge::clear_icon_image_cache();
                 reload_active_pane(&ui, &c);
                 {
                     let c2 = c.borrow();
@@ -4732,9 +4916,11 @@ fn bind_settings(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 "index-location" => st.set_set_index_location(val),
                 _ => {}
             }
-            // 图标来源切换：重载当前目录以按新策略重新拉取系统图标/缩略图，
-            // 并重建侧边栏导航模型——否则侧边栏图标（快速访问/驱动器等）要等下次导航才会更新
+            // 图标来源切换：先清 Slint 图像共享缓存再重载，否则旧像素的 Arc
+            // 被图像缓存持有，首帧仍显示旧来源图标；并重建侧边栏导航模型——
+            // 否则侧边栏图标（快速访问/驱动器等）要等下次导航才会更新
             if key.as_str() == "icon-source" {
+                ui_bridge::clear_icon_image_cache();
                 load_current(&ui, &c);
                 let c2 = c.borrow();
                 let path = c2.active_tab().history.current().clone();
@@ -5071,13 +5257,17 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 // open_with_dialog 内部已广播 SHCNE_ASSOCCHANGED 通知 Shell 刷新关联图标。
                 // 立即清缓存+重载一次；再延迟补刷一次--Shell 处理关联广播有一定延迟，
                 // 首次重提取可能仍取到旧图标，延迟重载确保新图标实时显示（无需重开文件夹）。
+                // 延迟补刷仅清类型缓存：图片/视频真实缩略图不受关联变化影响，
+                // 保留路径缓存使第二次重载秒完成，只有类型图标重新提取。
                 fs::thumbnail::clear_all_caches();
+                ui_bridge::clear_icon_image_cache();
                 reload_active_pane(&ui, &c);
                 let w2 = ui.as_weak();
                 let c2 = c.clone();
                 slint::Timer::single_shot(std::time::Duration::from_millis(450), move || {
                     if let Some(ui) = w2.upgrade() {
-                        fs::thumbnail::clear_all_caches();
+                        fs::thumbnail::clear_type_cache();
+                        ui_bridge::clear_icon_image_cache();
                         reload_active_pane(&ui, &c2);
                         // 详情栏「打开方式」程序名也随之刷新
                         ui_bridge::update_selection(&ui, &c2.borrow());
@@ -5093,6 +5283,13 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     state.on_open_quicklook(move || {
         if let Some(ui) = w.upgrade() {
             let right = toolbar_routes_right(&ui);
+            // 云端文件先异步下载再打开预览：同步下载最长 60 秒会冻结整个 UI。
+            // 下载完成后重新触发本回调，fill_quicklook 内部命中缓存秒开
+            let sel_now = ui.global::<AppState>().get_sel_path().to_string();
+            if fs::cloud::is_cloud_path(&sel_now) && quicklook_selection_is_file(&c, right) {
+                open_cloud_quicklook(&ui, &c, &sel_now);
+                return;
+            }
             if ui_bridge::fill_quicklook(&ui, &c.borrow(), right) {
                 let preview_generation = next_preview_generation();
                 let st = ui.global::<AppState>();
@@ -5104,17 +5301,20 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     st.set_quicklook_open(false);
                     return;
                 }
-                if st.get_ql_kind() == 4 {
-                    // 视频：在预览内容区之上启动 Media Foundation 子窗口播放（含音频）
+                if st.get_ql_kind() == 4 || st.get_ql_kind() == 6 {
+                    // 视频(4)/音频(6)：在预览内容区之上启动 Media Foundation 子窗口播放
                     fs::web_preview::stop();
                     if !path.is_empty() {
                         start_video_preview(&ui, &path);
                     }
                 } else if st.get_ql_can_render() && st.get_ql_web_mode() {
-                    // Markdown/HTML/PHP：默认渲染视图（WebView2 子窗口覆盖内容区）
+                    // Markdown/HTML/PHP/Office/PDF：默认渲染视图（WebView2 子窗口覆盖内容区）
                     fs::video_preview::stop();
                     if !path.is_empty() {
                         start_web_preview(&ui, &path);
+                        // Office 文档后台升级：缓存未命中时先显示文本排版，
+                        // 后台调用本机 Office 转 PDF，完成后导航到高保真版。
+                        maybe_upgrade_office_preview(&ui, &path, preview_generation);
                     }
                 } else {
                     fs::video_preview::stop();
@@ -5168,9 +5368,21 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             }
             st.set_ql_video_fullscreen(false);
             st.set_quicklook_open(false);
+            // 释放预览大内存：大图位图（1600px 约 10MB）与文本染色层在关闭后即无用，
+            // 下次打开由 fill_quicklook 重新填充；缩略图句柄只是共享引用，置空即释放。
+            st.set_ql_has_image(false);
+            st.set_ql_image(slint::Image::default());
+            st.set_ql_text("".into());
+            st.set_ql_code_kw("".into());
+            st.set_ql_code_str("".into());
+            st.set_ql_code_cmt("".into());
+            st.set_ql_has_thumb(false);
+            st.set_ql_thumb(slint::Image::default());
+            st.set_ql_office_pending(false);
             #[cfg(windows)]
             clear_preview_window_icon();
             preview_host::hide();
+            fs::cloud::cleanup_cloud_cache();
         }
     });
 
@@ -5180,7 +5392,7 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     state.on_ql_toggle_video_fullscreen(move || {
         if let Some(ui) = w_fs.upgrade() {
             let st = ui.global::<AppState>();
-            if !st.get_quicklook_open() || st.get_ql_kind() != 4 {
+            if !st.get_quicklook_open() || (st.get_ql_kind() != 4 && st.get_ql_kind() != 6) {
                 return;
             }
             let fullscreen = !st.get_ql_video_fullscreen();
@@ -5265,6 +5477,9 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 let path = st.get_sel_path().to_string();
                 if !path.is_empty() {
                     start_web_preview(&ui, &path);
+                    // 切回渲染视图时若 Office 缓存刚好就绪（或仍在转），同样尝试后台升级
+                    let gen = current_preview_generation();
+                    maybe_upgrade_office_preview(&ui, &path, gen);
                 }
             } else {
                 fs::web_preview::stop();
@@ -5293,10 +5508,11 @@ fn preview_content_rect_phys(ui: &MainWindow) -> Option<(i32, i32, i32, i32)> {
         let mut y = header;
         let mut width = win_w;
         let mut height = content_h;
-        if st.get_ql_kind() == 4 {
+        if st.get_ql_kind() == 4 || st.get_ql_kind() == 6 {
             let vw = st.get_ql_img_w().max(0) as f32;
             let vh = st.get_ql_img_h().max(0) as f32;
-            // 分辨率已知：等比适配并在内容区内居中，避免画面被拉伸。
+            // 视频分辨率已知：等比适配并在内容区内居中，避免画面被拉伸。
+            // 音频不设置宽高，播放器窗口占满整个内容区。
             if vw > 0.0 && vh > 0.0 {
                 let fit = (win_w / vw).min(content_h / vh);
                 width = vw * fit;
@@ -5624,6 +5840,10 @@ fn next_preview_generation() -> u64 {
 
 fn preview_generation_is_current(generation: u64) -> bool {
     PREVIEW_GENERATION.with(|current| current.get() == generation)
+}
+
+fn current_preview_generation() -> u64 {
+    PREVIEW_GENERATION.with(|current| current.get())
 }
 
 /// 图片后台解码：大图解码可能耗时数百毫秒，放后台线程避免卡住空格键。
@@ -6145,7 +6365,7 @@ fn start_video_preview(_ui: &MainWindow, _path: &str) {}
 fn on_video_size_ready(ui: &MainWindow, vw: u32, vh: u32) {
     let st = ui.global::<AppState>();
     // 预览可能已被关闭或切换到其它内容：忽略迟到的分辨率
-    if !st.get_quicklook_open() || st.get_ql_kind() != 4 {
+    if !st.get_quicklook_open() || (st.get_ql_kind() != 4 && st.get_ql_kind() != 6) {
         return;
     }
 
@@ -6182,7 +6402,7 @@ fn on_video_size_ready(ui: &MainWindow, vw: u32, vh: u32) {
     }
 }
 
-/// 启动网页渲染视图（Markdown/HTML/PHP）：WebView2 子层对齐内容区异步创建；
+/// 启动网页渲染视图（Markdown/HTML/PHP/Office/PDF）：WebView2 子层对齐内容区异步创建；
 /// 运行时不可用时回退源码视图并提示。
 #[cfg(windows)]
 fn start_web_preview(ui: &MainWindow, path: &str) {
@@ -6216,6 +6436,93 @@ fn start_web_preview(ui: &MainWindow, path: &str) {
 
 #[cfg(not(windows))]
 fn start_web_preview(_ui: &MainWindow, _path: &str) {}
+
+/// Office 文档后台升级：无缓存时渲染区先显示加载条，后台调用本机 Office
+/// 转 PDF，完成后导航到高保真版并更新副标题。调用方在 start_web_preview 后调用。
+/// generation 用于防串台（预览已切换文件时丢弃旧转换结果）。
+/// 转换失败时清除挂起态并导航到文本回退版，避免加载条永久悬挂。
+#[cfg(windows)]
+fn maybe_upgrade_office_preview(ui: &MainWindow, path: &str, generation: u64) {
+    let office_src = Path::new(path);
+    if !crate::fs::office_preview::is_office_doc(office_src)
+        || crate::fs::office_preview::cached_pdf_if_fresh(office_src).is_some()
+    {
+        return;
+    }
+    // 未安装对应 Office：url_for 已直接回退文本版，无需后台任务
+    let installed = office_src
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::fs::office_preview::office_app_for_ext)
+        .map(crate::fs::office_preview::is_office_installed)
+        .unwrap_or(false);
+    if !installed {
+        return;
+    }
+    let ql_path = path.to_string();
+    let dark = ui.global::<Theme>().get_dark();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let pdf =
+            crate::fs::office_preview::convert_to_pdf_blocking(Path::new(&ql_path));
+        // 成功：PDF 的 file:// URL（导航前复验魔数，防清理线程误删/残留 partial）；
+        // 失败：文本回退版 HTML（保证渲染区有内容）
+        let (url, success) = match &pdf {
+            Some(p) if crate::fs::office_preview::is_valid_pdf(p) => (
+                crate::fs::web_preview::file_url(&p.to_string_lossy()),
+                true,
+            ),
+            // 转换失败或 PDF 复验未通过：文本回退版 HTML（保证渲染区有内容）
+            _ => {
+                let text = crate::fs::preview::document_text(Path::new(&ql_path))
+                    .unwrap_or_else(|_| "文档内容暂时无法预览".to_string());
+                let html = crate::fs::web_preview::office_to_html(&text, dark);
+                // 回退页同样按源指纹唯一命名，避免与其它文件的回退页串片
+                (
+                    crate::fs::web_preview::temp_html_url(&html, Path::new(&ql_path)),
+                    false,
+                )
+            }
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if !preview_generation_is_current(generation) {
+                return;
+            }
+            if let Some(ui) = weak.upgrade() {
+                let state = ui.global::<AppState>();
+                // 仍在预览同一文件、仍处于渲染模式才升级，避免串台
+                if state.get_quicklook_open()
+                    && state.get_sel_path() == ql_path.as_str()
+                    && state.get_ql_kind() == 2
+                    && state.get_ql_web_mode()
+                {
+                    // 挂起态解除（成功与失败都要清，否则加载条永久悬挂）
+                    state.set_ql_office_pending(false);
+                    if let Some(pw) = preview_host::window() {
+                        pw.global::<PreviewState>().set_office_pending(false);
+                    }
+                    if crate::fs::web_preview::navigate(&url) && success {
+                        let cur = state.get_ql_subtitle().to_string();
+                        if !cur.contains("Office") {
+                            let next = if cur.is_empty() {
+                                "Office 高保真预览".to_string()
+                            } else {
+                                format!("{} · Office 高保真预览", cur)
+                            };
+                            state.set_ql_subtitle(next.clone().into());
+                            if let Some(pw) = preview_host::window() {
+                                preview_host::set_subtitle(&pw, &next);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
+#[cfg(not(windows))]
+fn maybe_upgrade_office_preview(_ui: &MainWindow, _path: &str, _generation: u64) {}
 
 /// 弹出系统「打开方式」对话框（取宿主 HWND 后调用 SHOpenWithDialog）。
 #[cfg(windows)]

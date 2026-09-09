@@ -1,10 +1,8 @@
-//! 文件图标：用 SVG Path 绘制的矢量图形，替代"圆角矩形+文字"的旧实现。
-//!
-//! 设计要点：
-//! 1. 每个分类（folder/image/code/archive/audio/video/pdf/default）都有专属图形
-//! 2. 大图标（box=58px）：彩色背景 + 白色/深色实心 path
-//! 3. 行内紧凑模式（compact=true，box≤22px）：背景透明 + 跟随主题文字色
-//!    这样无需背景填充也能在浅色/深色背景下清晰呈现
+//! 文件图标：Apple Finder 风格矢量图标。
+//! 设计要点（向 macOS 靠拢，但保持几何与 API 完全不变以防偏移/错乱）：
+//! 1. 文件夹改为 Finder 蓝（浅蓝底 + 深蓝形），圆角更大、带顶部高光描边
+//! 2. 大图标带柔和投影与细描边，紧凑行内模式保持单色、无背景（防透字）
+//! 3. 所有 Path 指令与包围盒保持原值，仅调颜色/材质，不动坐标
 
 import { Theme } from "theme.slint";
 
@@ -117,9 +115,14 @@ export component FileIcon inherits Rectangle {
     height: box;
     border-radius: root.has-thumb ? (root.round-thumb ? radius : 0px) : radius;
     border-width: 1px;
+    // Apple 式细描边：浅色用黑 8%，深色用白 14%，紧凑模式透明
     border-color: root.has-thumb ? transparent
-        : root.compact ? transparent : (Theme.dark ? #00000033 : #005aa01f);
+        : root.compact ? transparent : (Theme.dark ? #ffffff24 : #00000014);
     clip: !root.has-thumb || root.round-thumb;
+    // 大图标柔光投影（Apple 层级感），紧凑/缩略图模式关闭以免糊
+    drop-shadow-blur: root.has-thumb || root.compact ? 0px : 8px;
+    drop-shadow-color: root.has-thumb || root.compact ? transparent : rgba(0, 0, 0, 0.12);
+    drop-shadow-offset-y: root.has-thumb || root.compact ? 0px : 1px;
 
     // 缩略图层：Shell 图标使用完整容器绘制，配合无裁剪保留透明边缘。
     if root.has-thumb: Image {
@@ -131,27 +134,28 @@ export component FileIcon inherits Rectangle {
         image-fit: contain;
     }
 
-    // 背景：大图标有彩色填充，紧凑模式或有缩略图时透明
+    // 背景：Apple Finder pastel——扁平底色（渐变由上层卡片统一承担，此处保持纯色以防条纹错乱）
+    // 文件夹 Finder 蓝、图片浅蓝、音频橙、视频青、PDF 红灰，驱动器深蓝、设备青绿
     background: root.has-thumb ? transparent
         : root.compact ? transparent
         : icon-class == "folder" ? Theme.folder-bg
         : icon-class == "image" ? Theme.image-bg
         : icon-class == "code" ? Theme.code-bg
         : icon-class == "archive" ? Theme.archive-bg
-        : icon-class == "audio" ? Theme.icon-default-bg
-        : icon-class == "video" ? Theme.icon-default-bg
-        : icon-class == "pdf" ? Theme.icon-default-bg
-        : icon-class == "drive" ? #3a6fb5
-        : icon-class == "device" ? #2a9d8f
+        : icon-class == "audio" ? (Theme.dark ? #5a3d16 : #ffe4b8)
+        : icon-class == "video" ? (Theme.dark ? #2c4a5e : #c8e9ff)
+        : icon-class == "pdf" ? (Theme.dark ? #5e2f2e : #ffdad6)
+        : icon-class == "drive" ? (Theme.dark ? #2f5b96 : #3a7bd5)
+        : icon-class == "device" ? (Theme.dark ? #236b6b : #b8e8e8)
         : Theme.icon-default-bg;
 
     // 内部图形尺寸：大图标占 60%，紧凑模式占 100%
     property <length> inner-s: root.compact ? root.box : root.box * 0.62;
     property <length> inner-off: (root.box - root.inner-s) / 2;
 
-    // 紧凑模式下的图形颜色：跟随主题文字色（暗色感知）
+    // 紧凑模式下的图形颜色：Apple 侧栏单色——浅色深灰蓝、深色浅灰，不过度着色
     property <brush> glyph-color: root.compact
-        ? (Theme.dark ? #c7d4e1 : #5a6a7e)
+        ? (Theme.dark ? #b8c2cf : #5b6b7f)
         : #ffffff;
 
     // 有文件的文件夹：先画露出的白色纸张（顶部），再叠文件夹主体遮住下半部

@@ -1,7 +1,30 @@
-// 添加网络位置对话框（SMB 挂载）
+// 添加网络位置对话框（SMB / FTP / WebDAV / SFTP）
 import { Theme } from "theme.slint";
 import { AppState } from "globals.slint";
 import { LineEdit } from "std-widgets.slint";
+
+component KindChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked;
+    height: 28px;
+    border-radius: 8px;
+    background: selected ? Theme.primary : (chip-touch.has-hover ? Theme.primary-hover : Theme.surface-2);
+    border-width: 1px;
+    border-color: selected ? Theme.primary : Theme.border;
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 12px;
+        Text {
+            text: root.label;
+            font-size: 12px;
+            font-weight: selected ? 700 : 400;
+            color: selected ? #ffffff : Theme.text;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+    chip-touch := TouchArea { clicked => { root.clicked(); } }
+}
 
 export component NetworkLocationDialog inherits Rectangle {
     visible: AppState.netloc-dialog-open;
@@ -12,8 +35,8 @@ export component NetworkLocationDialog inherits Rectangle {
         TouchArea { clicked => { AppState.netloc-dialog-open = false; } }
 
         Rectangle {
-            width: 420px;
-            height: 350px;
+            width: 520px;
+            height: 560px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             border-radius: Theme.radius-dialog;
@@ -30,39 +53,117 @@ export component NetworkLocationDialog inherits Rectangle {
                 spacing: 12px;
 
                 Text {
-                    text: "添加网络位置 (SMB)";
+                    text: "添加网络位置";
                     font-size: 16px;
                     font-weight: 700;
                     color: Theme.text;
                 }
-
-                VerticalLayout {
-                    spacing: 6px;
-                    Text { text: "显示名称"; font-size: 12px; color: Theme.muted; }
-                    LineEdit {
-                        text <=> AppState.netloc-name;
-                        placeholder-text: "如: 共享文档 (可空)";
-                        changed has-focus => { AppState.input-active = self.has-focus; }
-                    }
-                    Text { text: "服务器地址"; font-size: 12px; color: Theme.muted; }
-                    LineEdit {
-                        text <=> AppState.netloc-server;
-                        placeholder-text: "\\\\server\\share";
-                        changed has-focus => { AppState.input-active = self.has-focus; }
-                    }
-                    Text { text: "用户名 (可空)"; font-size: 12px; color: Theme.muted; }
-                    LineEdit {
-                        text <=> AppState.netloc-user;
-                        changed has-focus => { AppState.input-active = self.has-focus; }
-                    }
-                    Text { text: "密码 (可空)"; font-size: 12px; color: Theme.muted; }
-                    LineEdit {
-                        text <=> AppState.netloc-pass;
-                        changed has-focus => { AppState.input-active = self.has-focus; }
-                    }
+                // 类型选择
+                HorizontalLayout {
+                    spacing: 8px;
+                    KindChip { label: "SMB"; selected: AppState.netloc-kind == "smb"; clicked => { AppState.netloc-kind = "smb"; } }
+                    KindChip { label: "FTP"; selected: AppState.netloc-kind == "ftp"; clicked => { AppState.netloc-kind = "ftp"; } }
+                    KindChip { label: "SFTP"; selected: AppState.netloc-kind == "sftp"; clicked => { AppState.netloc-kind = "sftp"; } }
+                    KindChip { label: "WebDAV"; selected: AppState.netloc-kind == "webdav"; clicked => { AppState.netloc-kind = "webdav"; } }
+                }
+                Text {
+                    text: AppState.netloc-kind == "smb" ? "SMB 共享 (\\\\server\\share) 将挂载为驱动器"
+                        : AppState.netloc-kind == "ftp" ? "FTP 默认端口 21，支持被动模式与 FTPS"
+                        : AppState.netloc-kind == "sftp" ? "SFTP 默认端口 22，基于 SSH"
+                        : "WebDAV 默认 http:80 / https:443，支持 Basic 认证";
+                    font-size: 11px; color: Theme.muted; wrap: word-wrap;
                 }
 
-                Rectangle { vertical-stretch: 1; }
+                Flickable {
+                    vertical-stretch: 1;
+                    viewport-height: form.preferred-height;
+                    form := VerticalLayout {
+                        spacing: 6px;
+                        Text { text: "显示名称"; font-size: 12px; color: Theme.muted; }
+                        LineEdit {
+                            text <=> AppState.netloc-name;
+                            placeholder-text: "如: 我的云盘 (可空)";
+                            changed has-focus => { AppState.input-active = self.has-focus; }
+                        }
+                        if AppState.netloc-kind == "smb": VerticalLayout {
+                            spacing: 6px;
+                            Text { text: "服务器地址"; font-size: 12px; color: Theme.muted; }
+                            LineEdit {
+                                text <=> AppState.netloc-server;
+                                placeholder-text: "\\\\server\\share";
+                                changed has-focus => { AppState.input-active = self.has-focus; }
+                            }
+                        }
+                        if AppState.netloc-kind != "smb": VerticalLayout {
+                            spacing: 6px;
+                            Text { text: "主机地址"; font-size: 12px; color: Theme.muted; }
+                            LineEdit {
+                                text <=> AppState.netloc-host;
+                                placeholder-text: AppState.netloc-kind == "ftp" ? "ftp.example.com" : AppState.netloc-kind == "sftp" ? "sftp.example.com" : "dav.example.com";
+                                changed has-focus => { AppState.input-active = self.has-focus; }
+                            }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 6px;
+                                    Text { text: "端口 (0=默认)"; font-size: 12px; color: Theme.muted; }
+                                    LineEdit {
+                                        text: AppState.netloc-port == 0 ? "" : AppState.netloc-port;
+                                        placeholder-text: AppState.netloc-kind == "ftp" ? "21" : AppState.netloc-kind == "sftp" ? "22" : "80/443";
+                                        input-type: InputType.number;
+                                        changed has-focus => { AppState.input-active = self.has-focus; }
+                                        edited => {
+                                            // 简单解析，忽略错误
+                                            AppState.netloc-port = self.text.to-float();
+                                        }
+                                    }
+                                }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 6px;
+                                    Text { text: "远程路径"; font-size: 12px; color: Theme.muted; }
+                                    LineEdit {
+                                        text <=> AppState.netloc-remote-path;
+                                        placeholder-text: "/";
+                                        changed has-focus => { AppState.input-active = self.has-focus; }
+                                    }
+                                }
+                            }
+                            if AppState.netloc-kind == "ftp" || AppState.netloc-kind == "webdav": Rectangle {
+                                height: 28px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Text { text: AppState.netloc-kind == "ftp" ? "FTPS (TLS)" : "HTTPS"; font-size: 12px; color: Theme.text; vertical-alignment: center; }
+                                    Rectangle {
+                                        width: 44px; height: 24px; border-radius: 12px;
+                                        background: AppState.netloc-use-tls ? Theme.primary : Theme.border;
+                                        Rectangle {
+                                            width: 18px; height: 18px; border-radius: 9px; background: white;
+                                            x: AppState.netloc-use-tls ? parent.width - 21px : 3px; y: 3px;
+                                            animate x { duration: 120ms; easing: ease-out; }
+                                        }
+                                        TouchArea { clicked => { AppState.netloc-use-tls = !AppState.netloc-use-tls; } }
+                                    }
+                                }
+                            }
+                        }
+                        Text { text: "用户名"; font-size: 12px; color: Theme.muted; }
+                        LineEdit {
+                            text <=> AppState.netloc-user;
+                            placeholder-text: "可空，匿名请留空";
+                            changed has-focus => { AppState.input-active = self.has-focus; }
+                        }
+                        Text { text: "密码"; font-size: 12px; color: Theme.muted; }
+                        LineEdit {
+                            text <=> AppState.netloc-pass;
+                            placeholder-text: "可空";
+                            input-type: InputType.password;
+                            changed has-focus => { AppState.input-active = self.has-focus; }
+                        }
+                    }
+                }
 
                 HorizontalLayout {
                     spacing: 10px;
@@ -76,9 +177,9 @@ export component NetworkLocationDialog inherits Rectangle {
                         cancel-touch := TouchArea { clicked => { AppState.netloc-dialog-open = false; AppState.input-active = false; } }
                     }
                     Rectangle {
-                        width: 80px; height: 34px; border-radius: 6px;
-                        background: ok-touch.has-hover ? Theme.primary-hover : Theme.primary;
-                        Text { text: "连接"; color: white; horizontal-alignment: center; vertical-alignment: center; }
+                        width: 100px; height: 34px; border-radius: 6px;
+                        background: ok-touch.has-hover ? #1a86e0 : Theme.primary;
+                        Text { text: "添加并连接"; color: white; horizontal-alignment: center; vertical-alignment: center; }
                         ok-touch := TouchArea { clicked => { AppState.add-network-location(); } }
                     }
                 }

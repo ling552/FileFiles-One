@@ -1,14 +1,16 @@
-// 主题：颜色与排版变量中枢。
+// 主题：Apple 风格材质与排版变量中枢（Finder / macOS Sequoia 取向）。
 // 由 Rust 在启动时按用户设置写入下列 in-out 控制项，其余 token 均据此动态派生：
 //   theme-mode  亮/暗/跟随系统     accent-key 主题色键
 //   translucent 是否启用半透明      opacity-level 半透明不透明度
 //   blur-level  磨砂模糊强度        compact 紧凑模式
+// Apple 设计要点：半透明分层（侧栏更透、内容更实）、大连续圆角、
+// Apple 蓝主色、细分隔线、高对比 vibrancy 文字。
 
 export global Theme {
     // ── 控制项（Rust 写入）──
     in-out property <string> theme-mode: "system"; // system | light | dark
     in-out property <string> accent-key: "blue";   // blue | purple | green | red | orange | custom
-    in-out property <color> accent-custom: #0078d4; // accent-key=="custom" 时使用的自定义颜色
+    in-out property <color> accent-custom: #0a84ff; // accent-key=="custom" 时使用的自定义颜色
     in-out property <bool> translucent: false;
     in-out property <float> opacity-level: 0.85;    // 0.30..1.0
     in-out property <float> blur-level: 0.0;        // 0..30，磨砂模糊强度
@@ -28,37 +30,43 @@ export global Theme {
         : 1.0;
     // 各面板"实心表面"的不透明度：半透明时归零（仅保留统一的根底层毛玻璃），否则不透明
     out property <float> panel-alpha: translucent ? 0.0 : 1.0;
-    // 卡片/输入框等需保持可辨识的表面：半透明时给一点微弱填充
-    out property <float> card-alpha: translucent ? (dark ? 0.18 : 0.20) : 1.0;
+    // 卡片/输入框等需保持可辨识的表面：Apple  vibrancy 逻辑——
+    // 半透明时保留较多填充以保证在壁纸上的可读性（浅色更实、深色稍透），
+    // 避免「浅色毛玻璃上白字看不清」与「深色卡片糊成一片」。
+    out property <float> card-alpha: translucent ? (dark ? 0.42 : 0.62) : 1.0;
 
-    // ── 主题色 ──
+    // ── 主题色（Apple 系统色板）──
     out property <brush> accent: accent-key == "custom" ? accent-custom
-        : accent-key == "purple" ? #7442bd
-        : accent-key == "green" ? #107c10
-        : accent-key == "red" ? #d13438
-        : accent-key == "orange" ? #ff8c00
-        : #0078d4;
+        : accent-key == "purple" ? #af52de
+        : accent-key == "green" ? #34c759
+        : accent-key == "red" ? #ff3b30
+        : accent-key == "orange" ? #ff9500
+        : #0a84ff;
 
-    // ── 背景与表面（暗色感知）──
-    out property <brush> bg: dark ? #161d28 : #edf3f9;
-    out property <brush> shell: dark ? #1f2734 : #f7fafd;          // 标题栏/工具栏/状态栏
-    out property <brush> surface: dark ? #2a3340 : #ffffff;        // 卡片/列表/输入
-    out property <brush> surface-2: dark ? #232b38 : #f5f9fd;      // 侧栏/详情/表头等次级面板
-    out property <brush> surface-translucent: dark ? #2a3340d2 : #ffffffd2;
+    // ── 背景与表面（Apple Finder 感知：浅色暖灰、深色纯黑灰）──
+    out property <brush> bg: dark ? #1c1c1e : #f5f5f7;
+    out property <brush> shell: dark ? #2c2c2e : #f5f5f7;          // 标题栏/工具栏/状态栏
+    out property <brush> surface: dark ? #2c2c2e : #ffffff;        // 卡片/列表/输入
+    out property <brush> surface-2: dark ? #232326 : #ececf0;      // 侧栏/详情/表头等次级面板
+    out property <brush> surface-translucent: dark ? #2c2c2ed2 : #ffffffd2;
     // 列表奇偶行条纹：半透明时大幅减淡（避免白条压在壁纸上突兀），深色主题用白色微透
     out property <brush> row-stripe: translucent
         ? (dark ? #ffffff0d : #ffffff26)
         : (dark ? #ffffff0a : #f8fbfeb8);
-    out property <brush> border: dark ? #ffffff1f : #23374721;
-    // ── 文字 ──
-    out property <brush> text: dark ? #e7edf5 : #152536;
-    out property <brush> muted: dark ? #9aa8ba : #607186;
-    out property <brush> subtle: dark ? #6f7e91 : #8a99aa;
-    // ── 主色与强调（随主题色联动）──
+    out property <brush> border: dark ? #ffffff24 : #3c3c431f;
+    // Apple 细分隔线（比边框更淡，用于行间/组间）
+    out property <brush> separator: dark ? #ffffff1a : #3c3c4314;
+    // ── 文字（Apple vibrancy：深色纯白系、浅色墨黑系，加粗而非加灰来强调）──
+    out property <brush> text: dark ? #f5f5f7 : #1d1d1f;
+    out property <brush> muted: dark ? #aeaeb2 : #6e6e73;
+    out property <brush> subtle: dark ? #636366 : #86868b;
+    // ── 主色与强调（随主题色联动，Apple 式淡 tint + 按压态）──
     out property <brush> primary: accent;
-    out property <brush> primary-weak: dark ? accent.with-alpha(0.30) : accent.with-alpha(0.18);
-    out property <brush> primary-soft: accent.with-alpha(0.12);
-    out property <brush> primary-hover: accent.with-alpha(0.09);
+    out property <brush> primary-weak: dark ? accent.with-alpha(0.34) : accent.with-alpha(0.20);
+    out property <brush> primary-soft: accent.with-alpha(dark ? 0.22 : 0.14);
+    out property <brush> primary-hover: accent.with-alpha(dark ? 0.16 : 0.08);
+    // 按压态（pointer-down 即时反馈，比 hover 更深一档）
+    out property <brush> primary-pressed: accent.with-alpha(dark ? 0.30 : 0.20);
     // ── 文件选择与行内编辑 ──
     // 选中态使用高不透明度实色：确保完全遮挡背后文字与图标，避免透字。
     out property <brush> selection-bg: dark ? accent.with-alpha(0.92) : accent.with-alpha(0.88);
@@ -71,28 +79,29 @@ export global Theme {
     out property <brush> edit-text: (accent-key == "orange" || accent-key == "yellow") ? #1a1a1a : #ffffff;
     out property <brush> edit-selection-bg: dark ? #ffffff42 : #ffffff54;
     out property <brush> edit-selection-text: (accent-key == "orange" || accent-key == "yellow") ? #1a1a1a : #ffffff;
-    // ── 语义色 ──
-    out property <brush> danger: #d13438;
-    out property <brush> success: #107c10;
-    out property <brush> warning: #ff8c00;
-    // ── 文件卡片图标渐变基色 ──
-    out property <brush> icon-default-bg: dark ? #2d4258 : #dcecff;
-    out property <brush> folder-bg: #f6b73c;
-    out property <brush> folder-fg: #865100;
-    out property <brush> image-bg: #78c2ff;
-    out property <brush> code-bg: #bdebcf;
-    out property <brush> code-fg: #107c10;
-    out property <brush> archive-bg: #d7bbff;
-    out property <brush> archive-fg: #7442bd;
+    // ── 语义色（Apple 系统语义色）──
+    out property <brush> danger: #ff3b30;
+    out property <brush> success: #34c759;
+    out property <brush> warning: #ff9500;
+    // ── 文件图标：Apple Finder 式淡彩底 + 深彩形 ──
+    // 文件夹改为 Finder 蓝（不再是 Windows 马尼拉黄），其余为 Apple  pastel
+    out property <brush> icon-default-bg: dark ? #3a3a3c : #e8f2ff;
+    out property <brush> folder-bg: dark ? #3d6fb4 : #a8d0ff;
+    out property <brush> folder-fg: dark ? #dceaff : #2f6cb3;
+    out property <brush> image-bg: dark ? #2f6f7e : #c2ecff;
+    out property <brush> code-bg: dark ? #2f6b3f : #d3f2dc;
+    out property <brush> code-fg: dark ? #b8f0c4 : #1f7a33;
+    out property <brush> archive-bg: dark ? #5b4a8a : #e5d9ff;
+    out property <brush> archive-fg: dark ? #ddccff : #6c4fc4;
 
-    // 圆角
-    out property <length> radius-btn: 8px;
-    out property <length> radius-card: 10px;
-    out property <length> radius-dialog: 16px;
-    out property <length> radius-shell: 10px;   // 主界面外壳圆角（与 DWM 窗口圆角协调；最大化时由 main.slint 归零，避免透出瑕疵）
+    // 圆角（Apple 连续圆角：按钮 10、卡片 12、弹窗 20、外壳 12）
+    out property <length> radius-btn: 10px;
+    out property <length> radius-card: 12px;
+    out property <length> radius-dialog: 20px;
+    out property <length> radius-shell: 12px;   // 主界面外壳圆角（与 DWM 窗口圆角协调；最大化时由 main.slint 归零，避免透出瑕疵）
 
-    // 字号
-    out property <length> fs-title: 19px;
+    // 字号（Apple 字阶：大标题收紧、小字略放宽，默认系统字体已做光学适配）
+    out property <length> fs-title: 20px;
     out property <length> fs-body: 13px;
     out property <length> fs-small: 12px;
     out property <length> fs-tiny: 11px;
@@ -104,9 +113,9 @@ export global Theme {
     out property <length> sidebar-w: 232px;
     out property <length> details-w: 292px;
 
-    // 阴影（增强深度感）
-    out property <length> shadow-soft-blur: 28px;
-    out property <color> shadow-soft-color: rgba(30, 55, 90, 0.10);
-    out property <length> shadow-deep-blur: 70px;
-    out property <color> shadow-deep-color: rgba(30, 55, 90, 0.18);
+    // 阴影（Apple 式轻深浅两档：浅柔、深层，大表面更厚）
+    out property <length> shadow-soft-blur: 24px;
+    out property <color> shadow-soft-color: rgba(0, 0, 0, 0.08);
+    out property <length> shadow-deep-blur: 60px;
+    out property <color> shadow-deep-color: rgba(0, 0, 0, 0.14);
 }

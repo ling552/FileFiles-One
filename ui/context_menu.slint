@@ -9,7 +9,9 @@ component MenuRow inherits Rectangle {
     callback clicked;
     height: Theme.row-h;
     border-radius: Theme.radius-btn;
-    background: touch.has-hover ? Theme.primary-soft : transparent;
+    background: touch.pressed ? Theme.primary-pressed
+        : touch.has-hover ? Theme.primary-soft : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
     HorizontalLayout {
         padding-left: 9px;
         padding-right: 9px;
@@ -79,12 +81,12 @@ export component ContextMenu inherits Rectangle {
         width: 234px;
         // 高度收缩到菜单内容，避免背景一直延伸到窗口底部
         height: menu-col.preferred-height;
-        border-radius: 12px;
+        border-radius: 14px;
         background: Theme.surface;
         border-width: 1px;
         border-color: Theme.border;
-        drop-shadow-blur: 30px;
-        drop-shadow-color: #21375038;
+        drop-shadow-blur: 32px;
+        drop-shadow-color: rgba(0, 0, 0, 0.18);
         drop-shadow-offset-y: 12px;
 
         menu-col := VerticalLayout {

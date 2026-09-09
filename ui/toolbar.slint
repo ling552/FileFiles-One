@@ -1,7 +1,8 @@
 import { Theme } from "theme.slint";
 import { AppState, Crumb } from "globals.slint";
 
-// 圆角图标按钮（使用 Segoe MDL2 Assets 图标字体，避免几何符号在中文字体下显示为方框）
+// 圆角图标按钮（Apple 工具栏风格：pointer-down 即时加深、无延迟反馈；
+ // 使用 Segoe MDL2 Assets 图标字体，避免几何符号在中文字体下显示为方框）
 component IconBtn inherits Rectangle {
     in property <string> glyph;
     in property <bool> active: false;
@@ -11,9 +12,12 @@ component IconBtn inherits Rectangle {
     width: 36px;
     height: 36px;
     border-radius: Theme.radius-btn;
-    background: active
-        ? Theme.primary-soft
-        : (touch.has-hover && !disabled ? Theme.primary-hover : transparent);
+    // Apple 按压逻辑：pressed > active > hover > 透明；动画可中断、无输入锁定
+    background: disabled ? transparent
+        : touch.pressed ? Theme.primary-pressed
+        : active ? Theme.primary-soft
+        : (touch.has-hover ? Theme.primary-hover : transparent);
+    animate background { duration: 120ms; easing: ease-out; }
     opacity: disabled ? 0.35 : 1.0;
     Text {
         text: glyph;
@@ -28,13 +32,13 @@ component IconBtn inherits Rectangle {
         y: root.height + 6px;
         width: tip.preferred-width + 16px;
         height: 26px;
-        border-radius: 6px;
+        border-radius: 8px;
         background: Theme.surface;
         border-width: 1px;
         border-color: Theme.border;
-        drop-shadow-blur: 10px;
-        drop-shadow-color: Theme.dark ? #00000055 : #00000033;
-        drop-shadow-offset-y: 2px;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: rgba(0, 0, 0, 0.14);
+        drop-shadow-offset-y: 4px;
         z: 100;
         tip := Text {
             text: root.tooltip;
@@ -85,14 +89,14 @@ export component Toolbar inherits Rectangle {
             }
         }
 
-        // 中央 Omnibar
+        // 中央 Omnibar（Apple 搜索框风格：内嵌圆角场，半透明时带 vibrancy 填充）
         omni := Rectangle {
             min-height: 40px;
             horizontal-stretch: 1;
             border-radius: Theme.radius-card;
             border-width: 1px;
             border-color: Theme.border;
-            background: Theme.surface;
+            background: Theme.surface.with-alpha(Theme.card-alpha);
 
             // 路径模式：面包屑（点击空白处进入编辑模式）
             if AppState.omni-mode == "path": Rectangle {
@@ -110,7 +114,9 @@ export component Toolbar inherits Rectangle {
                         spacing: 0px;
                         crumb-seg := Rectangle {
                             border-radius: 7px;
-                            background: seg-touch.has-hover ? Theme.primary-soft : transparent;
+                            background: seg-touch.pressed ? Theme.primary-pressed
+                                : seg-touch.has-hover ? Theme.primary-soft : transparent;
+                            animate background { duration: 120ms; easing: ease-out; }
                             HorizontalLayout {
                                 padding: 5px;
                                 padding-left: 8px;
@@ -118,7 +124,7 @@ export component Toolbar inherits Rectangle {
                                 Text {
                                     text: crumb.name;
                                     font-size: 14px;
-                                    color: #2b4058;
+                                    color: Theme.text;
                                     vertical-alignment: center;
                                 }
                             }
@@ -327,7 +333,8 @@ export component Toolbar inherits Rectangle {
                 clicked => { AppState.set-view("grid"); }
             }
             IconBtn {
-                glyph: "\u{EA37}"; tooltip: "列表视图";   // List 列表视图
+                // 列表视图：MDL2 的 List 为 E8FD（EA37 属 Fluent 区，在部分系统缺字形会变方框）
+                glyph: "\u{E8FD}"; tooltip: "列表视图";
                 active: AppState.view-mode == "list";
                 clicked => { AppState.set-view("list"); }
             }

@@ -283,13 +283,55 @@ impl Default for Settings {
     }
 }
 
-/// 用户保存的网络位置连接（SMB 挂载等）
+/// 用户保存的网络位置连接（SMB / FTP / WebDAV / SFTP）
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NetworkLocation {
     pub name: String,          // 显示名
-    pub server: String,        // SMB: \\server\share
-    pub kind: String,          // "smb"（"webdav" 预留）
-    pub drive: Option<String>, // 挂载盘符（如 "Z:"）；未挂载为 None
+    pub server: String,        // SMB: \\server\share；其它：备用展示（自动由 host/port/path 合成）
+    pub kind: String,          // "smb" | "ftp" | "webdav" | "sftp"
+    pub drive: Option<String>, // SMB 挂载盘符（如 "Z:"）；未挂载为 None
+    // FTP / WebDAV / SFTP 专用（SMB 忽略）
+    #[serde(default)]
+    pub host: String,          // 主机名或 IP
+    #[serde(default)]
+    pub port: u16,              // 端口，0 表示使用协议默认
+    #[serde(default)]
+    pub remote_path: String,    // 远程基础路径，如 "/" 或 "/dav/files"
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub use_tls: bool,          // FTP: FTPS；WebDAV: https
+    #[serde(default)]
+    pub passive: bool,          // FTP 被动模式（默认 true）
+}
+
+impl NetworkLocation {
+    /// 用于列表与标题的友好地址展示
+    pub fn display_server(&self) -> String {
+        if !self.host.is_empty() {
+            let scheme = match self.kind.as_str() {
+                "ftp" => if self.use_tls { "ftps" } else { "ftp" },
+                "webdav" => if self.use_tls { "https" } else { "http" },
+                "sftp" => "sftp",
+                _ => "",
+            };
+            let port = if self.port != 0 { format!(":{}", self.port) } else { String::new() };
+            let path = if self.remote_path.is_empty() { "/".to_string() } else { self.remote_path.clone() };
+            if scheme.is_empty() {
+                format!("{}{}{}", self.host, port, path)
+            } else {
+                format!("{}://{}{}{}", scheme, self.host, port, path)
+            }
+        } else {
+            self.server.clone()
+        }
+    }
+    /// 云存储虚拟路径根，如 cloud://ftp/MyFTP
+    pub fn cloud_path(&self) -> String {
+        format!("cloud://{}/{}", self.kind, self.name)
+    }
 }
 
 /// 用户自定义标签定义。`id` 为唯一标识，对应的文件标签键为 `custom:<id>`，
@@ -302,7 +344,7 @@ pub struct CustomTag {
 }
 
 /// 完整应用配置
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct AppConfig {
     #[serde(default)]
     pub layout: Layout,

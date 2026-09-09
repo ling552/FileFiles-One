@@ -417,7 +417,7 @@ export component FileList inherits Rectangle {
                             x: root.icon-box - 5px;
                             y: (parent.height + root.icon-box) / 2 - 7px;
                             visible: entry.tag-important || entry.tag-archive || entry.tag-done;
-                            background: entry.tag-important ? #d13438 : (entry.tag-archive ? #ff8c00 : #107c10);
+                            background: entry.tag-important ? #ff3b30 : (entry.tag-archive ? #ff9500 : #34c759);
                             border-width: 1.5px;
                             border-color: entry.selected ? Theme.selection-bg : white;
                         }
@@ -430,10 +430,10 @@ export component FileList inherits Rectangle {
                             y: (parent.height - root.icon-box) / 2 - 2px;
                             border-width: 1.5px;
                             border-color: entry.selected ? Theme.selection-bg : white;
-                            background: entry.git-status == "?" ? #8a99aa
-                                : entry.git-status == "!" ? #d13438
-                                : entry.git-status == "A" ? #107c10
-                                : #ff8c00;
+                            background: entry.git-status == "?" ? #8e8e93
+                                : entry.git-status == "!" ? #ff3b30
+                                : entry.git-status == "A" ? #34c759
+                                : #ff9500;
                             Text {
                                 text: entry.git-status;
                                 color: white;

@@ -149,19 +149,46 @@ pub fn unmount_smb(drive: &str) -> bool {
     }
 }
 
-/// 列出用户保存的网络位置连接（网络视图用）。已挂载的 path 为盘符，否则为 server。
+/// 列出用户保存的网络位置连接（网络视图用）。SMB 已挂载的 path 为盘符，否则为 server；
+/// 云存储（FTP/WebDAV/SFTP）为 cloud:// 虚拟路径。
 pub fn list_saved(locations: &[crate::config::NetworkLocation]) -> Vec<Entry> {
     locations
         .iter()
-        .map(|l| Entry {
-            name: l.name.clone(),
-            path: l.drive.clone().unwrap_or_else(|| l.server.clone()),
-            is_dir: true,
-            size_bytes: 0,
-            modified_ts: 0,
-            kind: "网络位置".into(),
-            icon_label: "网".into(),
-            icon_class: "folder".into(),
+        .map(|l| {
+            let (path, kind, label) = match l.kind.as_str() {
+                "ftp" | "webdav" | "sftp" => (
+                    l.cloud_path(),
+                    match l.kind.as_str() {
+                        "ftp" => "FTP 位置",
+                        "webdav" => "WebDAV 位置",
+                        "sftp" => "SFTP 位置",
+                        _ => "云存储",
+                    }
+                    .to_string(),
+                    match l.kind.as_str() {
+                        "ftp" => "FTP",
+                        "webdav" => "DAV",
+                        "sftp" => "SFTP",
+                        _ => "云",
+                    }
+                    .to_string(),
+                ),
+                _ => (
+                    l.drive.clone().unwrap_or_else(|| l.server.clone()),
+                    "网络位置".to_string(),
+                    "网".to_string(),
+                ),
+            };
+            Entry {
+                name: l.name.clone(),
+                path,
+                is_dir: true,
+                size_bytes: 0,
+                modified_ts: 0,
+                kind,
+                icon_label: label,
+                icon_class: "folder".into(),
+            }
         })
         .collect()
 }

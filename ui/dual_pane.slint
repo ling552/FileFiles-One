@@ -28,12 +28,12 @@ export component DualPane inherits Rectangle {
         padding: 4px;
         spacing: 0px;
 
-        // 左面板：当前活动标签，内容随共享 view-mode 渲染
+        // 左面板：当前活动标签，内容随共享 view-mode 渲染（Apple 卡片：活动面板细蓝环）
         left-panel := Rectangle {
             // 8px = 左右外边距 4px×2；再减分隔条 8px
             width: (root.width - 8px - 8px) * clamp(AppState.dual-ratio, 0.15, 0.85);
             border-radius: Theme.radius-card;
-            border-width: 2px;
+            border-width: AppState.active-pane == "left" ? 2px : 1px;
             border-color: AppState.active-pane == "left" ? Theme.primary : Theme.border;
             // 半透明时大幅减淡面板底色（避免白板压壁纸），深色主题跟随 surface
             background: Theme.surface.with-alpha(Theme.translucent ? 0.16 : 0.52);
@@ -89,7 +89,7 @@ export component DualPane inherits Rectangle {
         right-panel := Rectangle {
             horizontal-stretch: 1;
             border-radius: Theme.radius-card;
-            border-width: 2px;
+            border-width: AppState.active-pane == "right" ? 2px : 1px;
             border-color: AppState.active-pane == "right" ? Theme.primary : Theme.border;
             background: Theme.surface.with-alpha(Theme.translucent ? 0.13 : 0.45);
             clip: true;

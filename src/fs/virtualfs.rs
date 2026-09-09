@@ -14,13 +14,14 @@ pub const TAG_KEYS: [(&str, &str); 3] = [
     ("done", "已完成"),
 ];
 
-/// 判断是否为虚拟路径
+/// 判断是否为虚拟路径（包含云存储 cloud://）
 pub fn is_virtual(path: &str) -> bool {
     path == THIS_PC_PATH
         || path.starts_with("tag://")
         || path.starts_with("recycle://")
         || path.starts_with("network://")
         || path.starts_with("device://")
+        || path.starts_with("cloud://")
 }
 
 /// 虚拟路径的友好标题（用于面包屑 / 标题栏）
@@ -38,6 +39,17 @@ pub fn friendly_title(path: &str) -> String {
         "回收站".to_string()
     } else if path == "network://" {
         "网络位置".to_string()
+    } else if let Some(rest) = path.strip_prefix("cloud://") {
+        // cloud://kind/name[/sub] -> 显示账号名与子路径
+        let mut parts = rest.splitn(3, '/');
+        let _kind = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        let sub = parts.next().unwrap_or("");
+        if sub.is_empty() {
+            name.to_string()
+        } else {
+            format!("{} / {}", name, sub)
+        }
     } else if let Some(rest) = path.strip_prefix("device://") {
         // 显示设备友好名（来自最近一次枚举的缓存）；设备内部层级同样显示设备名
         // （MTP 对象 ID 不可读）。缓存未命中（如重启后恢复标签）退回通用名称。
@@ -53,7 +65,11 @@ pub fn resolve(path: &str, config: &mut AppConfig) -> Option<Vec<Entry>> {
     if path == THIS_PC_PATH {
         let mut entries = super::disk::disk_entries();
         entries.extend(super::devices::list_devices());
+        // 云存储根：每个 FTP/WebDAV/SFTP 账号作为可进入的文件夹
+        entries.extend(super::cloud::list_cloud_roots(config));
         Some(entries)
+    } else if path.starts_with("cloud://") {
+        Some(super::cloud::list_cloud_dir(path, config))
     } else if path.starts_with("device://") {
         // WPD/MTP 设备内部浏览：枚举该对象下的子文件夹/文件
         Some(super::devices::list_content(path))
@@ -64,6 +80,8 @@ pub fn resolve(path: &str, config: &mut AppConfig) -> Option<Vec<Entry>> {
     } else if path == "network://" {
         let mut entries = super::network::list_network_drives();
         entries.extend(super::network::list_saved(&config.network_locations));
+        // 云存储同样在网络位置中聚合显示
+        entries.extend(super::cloud::list_cloud_roots(config));
         Some(entries)
     } else {
         None

@@ -2,7 +2,7 @@ import { Theme } from "theme.slint";
 import { AppState, ShellNewEntry } from "globals.slint";
 import { FileIcon } from "file_icon.slint";
 
-// 单个操作按钮：MDL2 图标 + 文字，悬停高亮。
+// 单个操作按钮：MDL2 图标 + 文字，Apple 式 pointer-down 即时反馈。
 // enabled 为假时整体置灰且不响应点击（如无选中时的复制/删除、剪贴板为空时的粘贴）。
 component ActionBtn inherits Rectangle {
     in property <string> glyph;
@@ -14,9 +14,11 @@ component ActionBtn inherits Rectangle {
     height: 32px;
     border-radius: Theme.radius-btn;
     opacity: root.enabled ? 1.0 : 0.35;
-    background: touch.has-hover && root.enabled
-        ? (danger ? #d1343814 : Theme.primary-soft)
+    background: !root.enabled ? transparent
+        : touch.pressed ? (danger ? #ff3b3026 : Theme.primary-pressed)
+        : touch.has-hover ? (danger ? #ff3b3014 : Theme.primary-soft)
         : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
     HorizontalLayout {
         padding-left: 11px;
         padding-right: 11px;
@@ -223,19 +225,19 @@ component TagButton inherits Rectangle {
                 spacing: 0px;
                 TagMenuRow {
                     on: AppState.sel-tag-important;
-                    dot-color: #d13438;
+                    dot-color: #ff3b30;
                     label: "标记为 · 重要";
                     clicked => { AppState.tag-selected("important"); popup.close(); }
                 }
                 TagMenuRow {
                     on: AppState.sel-tag-archive;
-                    dot-color: #ff8c00;
+                    dot-color: #ff9500;
                     label: "标记为 · 待归档";
                     clicked => { AppState.tag-selected("archive"); popup.close(); }
                 }
                 TagMenuRow {
                     on: AppState.sel-tag-done;
-                    dot-color: #107c10;
+                    dot-color: #34c759;
                     label: "标记为 · 已完成";
                     clicked => { AppState.tag-selected("done"); popup.close(); }
                 }

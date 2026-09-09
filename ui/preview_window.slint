@@ -22,41 +22,70 @@ export struct ArchiveNode {
     has-children: bool,    // 目录是否含子项（决定是否画箭头）
 }
 
-// 加载动画：环形进度圈匀速旋转 + 圆弧长度呼吸，色调取主题强调色。
+// 加载动画：双向扫动圆环，4 秒一循环 ——
+// 正向画满（0→一整圈）→正向擦除（满→0）→反向画满→反向擦除，如此往复。
+// 弧线两端各一颗与线同宽的实心圆点，保证端点圆角。
 // 不用 std-widgets 的 Spinner：它的描边固定为 Fluent 蓝，无法跟随本程序主题色。
-component LoadingRing inherits Path {
+component LoadingRing inherits Rectangle {
     in property <length> ring-size: 34px;
     in property <brush> ring-stroke: Theme.primary;
     width: root.ring-size;
     height: root.ring-size;
-    viewbox-width: 100;
-    viewbox-height: 100;
-    stroke: root.ring-stroke;
-    stroke-width: 8px;
 
-    // 起点绕圈：3s 一周
-    private property <float> spin: mod(animation-tick(), 3s) / 3s;
-    // 弧长呼吸：1.5s 一个来回，保持 0.2..1 之间可见
-    private property <float> arc: min(0.9999, max(0.2, abs(sin(360deg * animation-tick() / 1.5s))));
-    private property <float> r: 42;
-    private property <float> cx: 50;
-    private property <float> cy: 50;
+    // 循环相位：0 正向画 / 1 正向擦 / 2 反向画 / 3 反向擦
+    property <float> cyc: mod(animation-tick(), 4s) / 4s;
+    property <float> ph: floor(self.cyc * 4.0);
+    property <float> fr: self.cyc * 4.0 - self.ph;
+    property <bool> grow: mod(self.ph, 2.0) < 1.0;
+    property <float> len: self.grow ? self.fr : 1.0 - self.fr;
+    property <float> dir: self.ph < 1.5 ? 1.0 : -1.0;
+    // 扫动头匀速 1 圈/秒；尾 = 头 − 方向×弧长（方向切换时弧长为 0，无跳变）
+    property <angle> head-a: self.cyc * 1440deg;
+    property <angle> tail-a: self.head-a - self.dir * self.len * 360deg;
+    // viewBox(100) → px 换算须与 Slint Path 的实际映射一致：
+    // px = 线宽/2 + 坐标 × (元素宽 − 线宽)/100（见 i-slint-core fitted_path_events），
+    // 圆点用同一映射才能精确落在弧线端点上；端点直径 = 线宽 8
+    property <length> vscale: (self.width - 8px) / 100;
+    property <length> voff: 4px;
+    property <length> cap-d: 8px;
 
-    MoveTo {
-        x: cx - r * sin(-(spin - 0.001) * 360deg);
-        y: cy - r * cos(-(spin - 0.001) * 360deg);
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 100;
+        viewbox-height: 100;
+        stroke: root.ring-stroke;
+        stroke-width: 8px;
+        MoveTo {
+            x: 50 + 42 * sin(root.tail-a);
+            y: 50 - 42 * cos(root.tail-a);
+        }
+        ArcTo {
+            radius-x: 42;
+            radius-y: 42;
+            x: 50 + 42 * sin(root.head-a);
+            y: 50 - 42 * cos(root.head-a);
+            sweep: root.dir > 0.0;
+            large-arc: root.len > 0.5;
+        }
     }
-    LineTo {
-        x: cx - r * sin(-spin * 360deg);
-        y: cy - r * cos(-spin * 360deg);
+    // 头端圆角
+    Rectangle {
+        width: root.cap-d;
+        height: root.cap-d;
+        border-radius: root.cap-d / 2;
+        background: root.ring-stroke;
+        x: root.voff + root.vscale * (50 + 42 * sin(root.head-a)) - self.width / 2;
+        y: root.voff + root.vscale * (50 - 42 * cos(root.head-a)) - self.height / 2;
     }
-    ArcTo {
-        radius-x: r;
-        radius-y: r;
-        x: cx - r * sin(-(spin + arc) * 360deg);
-        y: cy - r * cos(-(spin + arc) * 360deg);
-        sweep: true;
-        large-arc: arc > 0.5;
+    // 尾端圆角
+    Rectangle {
+        width: root.cap-d;
+        height: root.cap-d;
+        border-radius: root.cap-d / 2;
+        background: root.ring-stroke;
+        x: root.voff + root.vscale * (50 + 42 * sin(root.tail-a)) - self.width / 2;
+        y: root.voff + root.vscale * (50 - 42 * cos(root.tail-a)) - self.height / 2;
     }
 }
 
@@ -84,7 +113,7 @@ component LoadingOverlay inherits Rectangle {
 }
 
 export global PreviewState {
-    // 内容类型：0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频 / 5 归档树
+    // 内容类型：0 信息 / 1 图片 / 2 文本 / 3 文件夹 / 4 视频 / 5 归档树 / 6 音频
     in-out property <int> kind;
     // 内容仍在后台加载（图片解码 / 视频媒体源解析）：显示加载动画。
     // 窗口尺寸在显示前已按内容真实尺寸算好，加载完成只换内容不改窗口。
@@ -105,8 +134,12 @@ export global PreviewState {
     in-out property <image> thumb;
     in-out property <bool> has-thumb: false;
     // Markdown/HTML/PHP 的「渲染 ↔ 源码」双视图
+    // （Office 文档走本机 Office 高保真渲染，不显示此切换）
     in-out property <bool> can-render: false;
     in-out property <bool> web-mode: false;
+    // Office 文档恒为真：隐藏渲染/源码切换；pending 为真时渲染区显示加载条
+    in-out property <bool> office-doc: false;
+    in-out property <bool> office-pending: false;
     callback set-web-mode(bool);
     // 切换视频无边框全屏（仅 kind==4 时按钮可见）
     callback toggle-fullscreen();
@@ -179,8 +212,8 @@ export component PreviewWindow inherits Window {
                             overflow: elide;
                         }
                     }
-                    // 渲染 / 源码切换（仅 Markdown/HTML/PHP）
-                    if PreviewState.can-render: Rectangle {
+                    // 渲染 / 源码切换（仅 Markdown/HTML/PHP；Office 高保真渲染不显示）
+                    if PreviewState.can-render && !PreviewState.office-doc: Rectangle {
                         width: 116px;
                         height: 30px;
                         y: (parent.height - 30px) / 2;
@@ -219,10 +252,10 @@ export component PreviewWindow inherits Window {
                             }
                         }
                     }
-                    // 全屏按钮（仅视频预览显示）。
+                    // 全屏按钮（视频和音频预览显示）。
                     // 头部不再放关闭按钮：本窗口有系统标题栏，其 X 已是关闭入口，
                     // 再画一个等于同一功能出现两次。
-                    if PreviewState.kind == 4: Rectangle {
+                    if PreviewState.kind == 4 || PreviewState.kind == 6: Rectangle {
                         width: 30px;
                         height: 30px;
                         y: (parent.height - 30px) / 2;
@@ -316,9 +349,15 @@ export component PreviewWindow inherits Window {
                 }
 
                 // 网页渲染视图（kind == 2 且渲染模式）：WebView2 子窗口覆盖本区域
+                // Office 转换中显示加载条（不定期的文本内容不再先闪一下）
                 if PreviewState.kind == 2 && PreviewState.web-mode: Rectangle {
                     background: white;
-                    LoadingOverlay { label: "正在加载渲染视图…"; }
+                    if PreviewState.office-doc && PreviewState.office-pending: LoadingOverlay {
+                        label: "正在通过 Office 生成高保真预览…";
+                    }
+                    if !PreviewState.office-doc || !PreviewState.office-pending: LoadingOverlay {
+                        label: "正在加载渲染视图…";
+                    }
                 }
 
                 // 文本/代码（kind == 2 源码模式）：四层等宽 Text 字符对齐叠加实现多色高亮
@@ -377,65 +416,130 @@ export component PreviewWindow inherits Window {
                     }
                 }
 
-                // 归档树（kind == 5）：资源管理器风格的层级列表，目录可展开/折叠
-                if PreviewState.kind == 5: ScrollView {
+                // 音频（kind == 6）：显示封面（内嵌图片或通用音符图标）+ 原生控制栏。
+                // Media Foundation 子窗口仅包含音频播放器控制条，覆盖底部区域。
+                if PreviewState.kind == 6: Rectangle {
+                    background: Theme.surface-2;
                     VerticalLayout {
-                        padding-top: 6px;
-                        padding-bottom: 6px;
-                        for node[idx] in PreviewState.archive-nodes: Rectangle {
-                            height: 30px;
-                            background: row-ta.has-hover ? Theme.primary-hover : transparent;
+                        alignment: center;
+                        spacing: 20px;
+                        Rectangle {
+                            height: parent.height - 140px;
                             HorizontalLayout {
-                                // 每级缩进 18px，与参考图的树形层级观感一致
-                                padding-left: 10px + node.level * 18px;
-                                padding-right: 14px;
-                                spacing: 6px;
-                                // 展开箭头：仅含子项的目录显示，点击整行即可切换
+                                alignment: center;
+                                // 音频封面：256×256 圆角卡片
                                 Rectangle {
-                                    width: 16px;
-                                    if node.has-children: Text {
-                                        text: node.expanded ? "\u{E70D}" : "\u{E76C}";
-                                        font-family: "Segoe MDL2 Assets";
-                                        font-size: 9px;
-                                        color: Theme.muted;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
+                                    width: 256px;
+                                    height: 256px;
+                                    border-radius: 16px;
+                                    background: Theme.surface.with-alpha(0.8);
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    clip: true;
+                                    if PreviewState.has-thumb: Image {
+                                        width: 100%;
+                                        height: 100%;
+                                        source: PreviewState.thumb;
+                                        image-fit: cover;
                                     }
-                                }
-                                // 类型图标：目录用主题文件夹色，文件用矢量文档图标
-                                Rectangle {
-                                    width: 20px;
-                                    FileIcon {
-                                        icon-class: node.is-dir ? "folder" : "default";
-                                        box: 18px;
-                                        radius: 4px;
-                                        compact: true;
-                                        y: (parent.height - 18px) / 2;
+                                    if !PreviewState.has-thumb: Path {
+                                        width: 120px;
+                                        height: 120px;
+                                        x: (parent.width - 120px) / 2;
+                                        y: (parent.height - 120px) / 2;
+                                        fill: Theme.primary.with-alpha(0.3);
+                                        commands: "M12 3 V13.55 C11.41 13.21 10.73 13 10 13 C7.79 13 6 14.79 6 17 C6 19.21 7.79 21 10 21 C12.21 21 14 19.21 14 17 V7 H18 V3 H12 Z";
+                                        viewbox-width: 24;
+                                        viewbox-height: 24;
                                     }
-                                }
-                                Text {
-                                    text: node.name;
-                                    font-size: Theme.fs-body;
-                                    color: Theme.text;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                }
-                                // 大小：文件显示字节量，目录显示后代合计
-                                Text {
-                                    text: node.size;
-                                    font-size: Theme.fs-small;
-                                    color: Theme.muted;
-                                    vertical-alignment: center;
-                                    horizontal-alignment: right;
-                                    min-width: 86px;
                                 }
                             }
-                            row-ta := TouchArea {
-                                mouse-cursor: node.has-children ? MouseCursor.pointer : MouseCursor.default;
-                                clicked => {
-                                    if (node.has-children) {
-                                        PreviewState.toggle-folder(idx);
+                        }
+                        // 原生控制条占据底部 120px（由 Rust 侧创建 Media Foundation 子窗口）
+                        Rectangle {
+                            height: 120px;
+                        }
+                    }
+                    if PreviewState.loading: LoadingOverlay {
+                        label: "正在加载音频…";
+                    }
+                }
+
+                // 归档树（kind == 5）：Apple Finder 访达式层级列表
+                // 设计要点（apple-design §12/15）：卡片化圆角行、按压即时反馈(§1)、细分隔线、vibrancy 文字
+                if PreviewState.kind == 5: Rectangle {
+                    // 背景与上层 surface-2 一致，形成统一材质，不再突兀转白
+                    background: Theme.surface-2;
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 10px;
+                            padding-top: 8px;
+                            padding-bottom: 12px;
+                            spacing: 3px;
+                            for node[idx] in PreviewState.archive-nodes: Rectangle {
+                                height: 34px;
+                                border-radius: 10px;
+                                // 按压态比 hover 更深，符合 §1 pointer-down 即时反馈
+                                background: row-ta.pressed ? Theme.primary-pressed
+                                    : row-ta.has-hover ? Theme.primary-soft : transparent;
+                                animate background { duration: 120ms; easing: ease-out; }
+                                HorizontalLayout {
+                                    // Apple 访达层级：每级 20px 缩进，右侧留足呼吸空间
+                                    padding-left: 12px + node.level * 20px;
+                                    padding-right: 12px;
+                                    spacing: 10px;
+                                    // 展开箭头：圆形轻底 + 细箭头，未展开时更淡
+                                    Rectangle {
+                                        width: 20px;
+                                        height: 20px;
+                                        y: (parent.height - 20px) / 2;
+                                        border-radius: 6px;
+                                        background: node.has-children
+                                            ? (node.expanded ? Theme.primary-soft : (row-ta.has-hover ? Theme.border : transparent))
+                                            : transparent;
+                                        if node.has-children: Text {
+                                            text: node.expanded ? "\u{E70D}" : "\u{E76C}";
+                                            font-family: "Segoe MDL2 Assets";
+                                            font-size: 8px;
+                                            color: node.expanded ? Theme.primary : Theme.subtle;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    // 类型图标：Finder 蓝文件夹 / 白底文档，带柔和阴影与描边
+                                    FileIcon {
+                                        icon-class: node.is-dir ? "folder" : "default";
+                                        box: 20px;
+                                        radius: 6px;
+                                        compact: false;
+                                        y: (parent.height - 20px) / 2;
+                                    }
+                                    Text {
+                                        text: node.name;
+                                        // Finder 字阶：13px 常规，目录稍重，负 tracking 更紧凑
+                                        font-size: Theme.fs-body;
+                                        font-weight: node.is-dir ? 600 : 400;
+                                        color: Theme.text;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    // 大小：等宽数字感，淡色右对齐，保持 88px 对齐列
+                                    Text {
+                                        text: node.size;
+                                        font-size: 11px;
+                                        color: Theme.subtle;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: right;
+                                        min-width: 88px;
+                                    }
+                                }
+                                row-ta := TouchArea {
+                                    mouse-cursor: node.has-children ? MouseCursor.pointer : MouseCursor.default;
+                                    clicked => {
+                                        if (node.has-children) {
+                                            PreviewState.toggle-folder(idx);
+                                        }
                                     }
                                 }
                             }
@@ -498,7 +602,11 @@ export component PreviewWindow inherits Window {
                         ? "滚轮缩放 · 拖动查看 · 按 空格 或 Esc 关闭"
                         : PreviewState.kind == 5
                             ? "点击文件夹展开 / 折叠 · 按 空格 或 Esc 关闭"
-                            : "按 空格 或 Esc 关闭预览";
+                            : PreviewState.office-doc
+                                ? "本机 Office 高保真预览 · 按 空格 或 Esc 关闭"
+                                : PreviewState.can-render
+                                    ? "渲染视图由本机应用排版 · 可切换源码 · 按 空格 或 Esc 关闭"
+                                    : "按 空格 或 Esc 关闭预览";
                     font-size: Theme.fs-tiny;
                     color: Theme.muted;
                     horizontal-alignment: center;

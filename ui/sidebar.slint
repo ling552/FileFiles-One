@@ -27,9 +27,11 @@ export component Sidebar inherits Rectangle {
                     : (item.is-disk ? 54px
                         : (item.icon-class == "device" ? 50px : Theme.row-h));
 
-                // ── 分区标题（快速访问 / 标签 / 系统）：整行点击折叠 ──
+                // ── 分区标题（Apple 侧栏分区：小字大写灰字，整行点击折叠）──
                 if item.is-header: Rectangle {
-                    background: head-touch.has-hover ? Theme.primary-hover : transparent;
+                    background: head-touch.pressed ? Theme.primary-pressed
+                        : head-touch.has-hover ? Theme.primary-hover : transparent;
+                    animate background { duration: 120ms; easing: ease-out; }
                     border-radius: Theme.radius-btn;
                     head-touch := TouchArea { clicked => { AppState.toggle-section(item.label); } }
                     HorizontalLayout {
@@ -38,7 +40,7 @@ export component Sidebar inherits Rectangle {
                         padding-top: 6px;
                         Text {
                             text: item.label;
-                            font-size: Theme.fs-small;
+                            font-size: Theme.fs-tiny;
                             color: Theme.subtle;
                             font-weight: 700;
                             vertical-alignment: center;
@@ -58,7 +60,10 @@ export component Sidebar inherits Rectangle {
                 // ── 树节点表头（此电脑）：无图标；文字点击进入"此电脑"界面，右侧 chevron 折叠驱动器列表 ──
                 if item.is-tree: Rectangle {
                     border-radius: Theme.radius-btn;
-                    background: item.active ? Theme.primary-soft : (tree-touch.has-hover ? Theme.primary-hover : transparent);
+                    background: item.active ? Theme.primary-soft
+                        : (tree-touch.pressed ? Theme.primary-pressed
+                            : tree-touch.has-hover ? Theme.primary-hover : transparent);
+                    animate background { duration: 120ms; easing: ease-out; }
                     HorizontalLayout {
                         padding-left: 10px; padding-right: 8px; spacing: 4px;
                         // 文字（点击进入此电脑界面），占据左侧主要宽度；
@@ -105,7 +110,10 @@ export component Sidebar inherits Rectangle {
                 // ── 驱动器条目：矢量盘符图标 + 名称 + 使用率进度条（缩进对齐树节点子项）──
                 if item.is-disk: Rectangle {
                     border-radius: Theme.radius-btn;
-                    background: item.active ? Theme.primary-soft : (disk-touch.has-hover ? Theme.primary-hover : transparent);
+                    background: item.active ? Theme.primary-soft
+                        : (disk-touch.pressed ? Theme.primary-pressed
+                            : disk-touch.has-hover ? Theme.primary-hover : transparent);
+                    animate background { duration: 120ms; easing: ease-out; }
                     disk-touch := TouchArea {
                         clicked => { AppState.navigate(item.path); }
                         // 右键：驱动器的侧栏导航菜单
@@ -130,7 +138,9 @@ export component Sidebar inherits Rectangle {
                             Text { text: item.label; font-size: Theme.fs-body; color: item.active ? Theme.primary : Theme.text; font-weight: 600; overflow: elide; }
                             Text { text: item.disk-info; font-size: Theme.fs-tiny; color: Theme.muted; overflow: elide; }
                             Rectangle {
-                                height: 4px; border-radius: 2px; background: #dce6f0; clip: true;
+                                height: 4px; border-radius: 2px;
+                                background: Theme.dark ? rgba(255, 255, 255, 0.14) : #e5e5ea;
+                                clip: true;
                                 Rectangle { x: 0; width: parent.width * item.disk-ratio; height: parent.height; border-radius: 2px; background: item.disk-color; }
                             }
                         }
@@ -141,7 +151,10 @@ export component Sidebar inherits Rectangle {
                 //    缩进/字号/字重与磁盘节点统一，仅无容量进度条 ──
                 if !item.is-header && !item.is-tree && !item.is-disk && item.icon-class == "device": Rectangle {
                     border-radius: Theme.radius-btn;
-                    background: item.active ? Theme.primary-soft : (dev-touch.has-hover ? Theme.primary-hover : transparent);
+                    background: item.active ? Theme.primary-soft
+                        : (dev-touch.pressed ? Theme.primary-pressed
+                            : dev-touch.has-hover ? Theme.primary-hover : transparent);
+                    animate background { duration: 120ms; easing: ease-out; }
                     dev-touch := TouchArea {
                         clicked => { AppState.navigate(item.path); }
                         // 右键：便携设备仅提供安全的导航操作
@@ -172,7 +185,10 @@ export component Sidebar inherits Rectangle {
                 // ── 普通导航项（快速访问 / 标签 / 系统）──
                 if !item.is-header && !item.is-tree && !item.is-disk && item.icon-class != "device": Rectangle {
                     border-radius: Theme.radius-btn;
-                    background: item.active ? Theme.primary-soft : (nav-touch.has-hover ? Theme.primary-hover : transparent);
+                    background: item.active ? Theme.primary-soft
+                        : (nav-touch.pressed ? Theme.primary-pressed
+                            : nav-touch.has-hover ? Theme.primary-hover : transparent);
+                    animate background { duration: 120ms; easing: ease-out; }
                     nav-touch := TouchArea {
                         clicked => { AppState.navigate(item.path); }
                         // 右键：真实目录提供新标签页/新面板，虚拟节点仅提供打开
@@ -206,11 +222,12 @@ export component Sidebar inherits Rectangle {
                                 vertical-alignment: center;
                             }
                         }
-                        // 内置图标模式：首字符色块
+                        // 内置图标模式：首字符色块（Apple 淡蓝底 + 深蓝字，深色适配）
                         if !item.has-thumb && item.icon-class != "qa-glyph" && item.icon != "●": Rectangle {
                             width: 18px; height: 18px; y: (parent.height - 18px) / 2;
-                            border-radius: 5px; background: #e8f3ff;
-                            border-width: 1px; border-color: #0078d424;
+                            border-radius: 6px;
+                            background: Theme.dark ? #0a84ff33 : #e8f2ff;
+                            border-width: 1px; border-color: Theme.dark ? #ffffff24 : #0a84ff24;
                             Text { text: item.icon; font-size: Theme.fs-tiny; color: Theme.primary; font-weight: 800; }
                         }
                         if !item.has-thumb && item.icon == "●": Rectangle {
@@ -227,7 +244,8 @@ export component Sidebar inherits Rectangle {
                         }
                         if item.badge != "": Rectangle {
                             y: (parent.height - 20px) / 2; height: 20px; min-width: 20px;
-                            border-radius: 10px; background: #eef3f8;
+                            border-radius: 10px;
+                            background: Theme.dark ? rgba(255, 255, 255, 0.12) : #e8e8ed;
                             HorizontalLayout {
                                 padding-left: 6px; padding-right: 6px;
                                 Text { text: item.badge; font-size: Theme.fs-tiny; color: Theme.muted; vertical-alignment: center; }

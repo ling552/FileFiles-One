@@ -162,6 +162,13 @@ pub fn cached_request(request: &IconRequest) -> Option<Arc<IconPixels>> {
     }
 }
 
+/// 该请求是否走「按类型共享」缓存（扩展名/文件夹/设备/Stock）。
+/// UI 侧据此把图标任务分两阶段：类型图标先行批量回填（快、去重），
+/// 具体文件缩略图随后跟进，避免慢缩略图挡住快类型图标的首绘。
+pub fn request_is_shared_type(request: &IconRequest) -> bool {
+    matches!(request_kind(request), Kind::Type(_))
+}
+
 /// 仅查询缓存（同步、零磁盘/Shell 访问）。供 UI 线程在构建条目时预填，
 /// 命中即首帧显示系统图标，彻底消除"先内置图标后异步替换"的闪烁。
 pub fn cached(path: &str, is_dir: bool, mtime: i64) -> Option<Arc<IconPixels>> {
@@ -245,14 +252,18 @@ pub fn load_cached_request(request: &IconRequest, size: u32) -> Option<Arc<IconP
     match kind {
         Kind::Type(k) => {
             if let Ok(mut c) = type_cache().lock() {
+                // 类型键空间有界（扩展名/特殊键），上限兜底防异常膨胀
+                if c.len() >= 256 {
+                    c.clear();
+                }
                 c.insert(k, arc.clone());
             }
         }
         Kind::Path(k) => {
             if let Ok(mut c) = path_cache().lock() {
                 // 128px RGBA 图标约 64 KiB；限制具体路径缓存规模，避免浏览大量
-                // 图片/视频后常驻内存持续增长。类型图标仍由独立缓存共享。
-                if c.len() >= 256 {
+                // 图片/视频后常驻内存持续增长（上限约 8MB）。类型图标仍由独立缓存共享。
+                if c.len() >= 128 {
                     c.clear();
                 }
                 c.insert(k, arc.clone());
@@ -332,11 +343,20 @@ pub fn special_dir_icon_cache_only(_path: &str) -> Option<Arc<IconPixels>> {
 /// 清空全部图标缓存（类型缓存 + 路径缓存）。
 /// 用户在系统「打开方式」对话框更改默认应用后调用：文件类型关联图标已变，
 /// 旧缓存必须失效，随后重载目录即可显示新图标。
+/// 注意：调用方应在 UI 线程同步调用 `ui_bridge::clear_icon_image_cache`，
+/// 否则 Slint 图像共享缓存仍持有旧像素的 Arc，旧图标继续显示。
 pub fn clear_all_caches() {
-    if let Ok(mut c) = type_cache().lock() {
+    clear_type_cache();
+    if let Ok(mut c) = path_cache().lock() {
         c.clear();
     }
-    if let Ok(mut c) = path_cache().lock() {
+}
+
+/// 仅清空「按类型共享」的图标缓存（扩展名/文件夹/设备/Stock）。
+/// 默认应用切换后的延迟补刷用：图片/视频真实缩略图不受关联变化影响，
+/// 保留路径缓存可使第二次重载秒完成，只有类型图标重新提取。
+pub fn clear_type_cache() {
+    if let Ok(mut c) = type_cache().lock() {
         c.clear();
     }
 }
@@ -896,5 +916,25 @@ mod tests {
             kind_key(&request),
             (false, r"C:\photos\sample.JPG|42".into())
         );
+    }
+
+    #[test]
+    fn shared_type_requests_are_distinguished_for_two_phase_fill() {
+        // 扩展名/文件夹走共享缓存（首阶段先行），具体文件走路径缓存（后阶段跟进）
+        assert!(request_is_shared_type(&IconRequest::Type {
+            extension: "pdf".into(),
+            is_dir: false,
+        }));
+        assert!(request_is_shared_type(&IconRequest::RealPath {
+            path: r"C:\a\b.pdf".into(),
+            is_dir: false,
+            mtime: 1,
+        }));
+        assert!(!request_is_shared_type(&IconRequest::RealPath {
+            path: r"C:\photos\sample.JPG".into(),
+            is_dir: false,
+            mtime: 1,
+        }));
+        assert!(request_is_shared_type(&IconRequest::Device));
     }
 }

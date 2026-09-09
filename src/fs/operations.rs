@@ -45,6 +45,11 @@ pub fn read_dir(path: &Path, show_hidden: bool, show_protected: bool) -> io::Res
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
 
+/// 永不显示的系统文件：无论“显示隐藏/受保护”如何组合均隐藏，且禁止任何操作触及。
+fn is_always_hidden(name: &str) -> bool {
+    name.eq_ignore_ascii_case("desktop.ini") || name.eq_ignore_ascii_case("thumbs.db")
+}
+
 /// 目录视图与文件夹详情共用的过滤规则，语义对齐资源管理器的两个独立选项：
 /// 「显示隐藏的文件」（show_hidden）与「隐藏受保护的操作系统文件」（show_protected）。
 pub(crate) fn should_hide(
@@ -53,11 +58,19 @@ pub(crate) fn should_hide(
     show_hidden: bool,
     show_protected: bool,
 ) -> bool {
+    if is_always_hidden(name) {
+        return true;
+    }
     let attrs = file_attributes(meta);
     if !show_protected && is_protected_attrs(attrs) {
         return true;
     }
     !show_hidden && is_hidden_name_or_attrs(name, attrs)
+}
+
+/// 调用方在对具体文件执行任何操作前调用：永不操作的文件返回 true。
+pub fn is_forbidden_target(name: &str) -> bool {
+    is_always_hidden(name)
 }
 
 /// 详情统计使用的默认过滤规则（与资源管理器及目录视图一致）。
@@ -106,8 +119,24 @@ fn file_attributes(meta: &fs::Metadata) -> u32 {
     }
 }
 
-/// 重命名
+fn is_forbidden_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(is_always_hidden)
+        .unwrap_or(false)
+}
+
+/// 重命名：禁止操作永不显示的系统文件
 pub fn rename(old: &Path, new_name: &str) -> io::Result<PathBuf> {
+    if is_forbidden_path(old)
+        || new_name.eq_ignore_ascii_case("desktop.ini")
+        || new_name.eq_ignore_ascii_case("thumbs.db")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "系统保护文件，禁止操作",
+        ));
+    }
     let parent = old.parent().unwrap_or(Path::new("."));
     let new_path = parent.join(new_name);
     fs::rename(old, &new_path)?;
@@ -116,8 +145,15 @@ pub fn rename(old: &Path, new_name: &str) -> io::Result<PathBuf> {
 
 /// 永久删除（不经回收站）。回收站清空等不可逆场景使用；
 /// 普通删除请走 `recyclebin::move_to_recycle_bin`。
+/// 永不显示的系统文件禁止删除。
 #[allow(dead_code)]
 pub fn delete(path: &Path) -> io::Result<()> {
+    if is_forbidden_path(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "系统保护文件，禁止删除",
+        ));
+    }
     if path.is_dir() {
         fs::remove_dir_all(path)
     } else {
@@ -127,8 +163,15 @@ pub fn delete(path: &Path) -> io::Result<()> {
 
 /// 递归复制目录或文件，自动处理同名冲突（追加 副本）。
 /// 同步实现，UI 粘贴路径现走 `tasks` 异步队列；此处保留供测试与同步调用。
+/// 永不显示的系统文件禁止复制。
 #[allow(dead_code)]
 pub fn copy_into(src: &Path, dst_dir: &Path) -> io::Result<PathBuf> {
+    if is_forbidden_path(src) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "系统保护文件，禁止操作",
+        ));
+    }
     let file_name = src
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无效源路径"))?;
@@ -145,8 +188,15 @@ pub fn copy_into(src: &Path, dst_dir: &Path) -> io::Result<PathBuf> {
 
 /// 移动（同盘 rename，跨盘 复制后删除）。
 /// 同步实现，UI 粘贴路径现走 `tasks` 异步队列；此处保留供测试与同步调用。
+/// 永不显示的系统文件禁止移动。
 #[allow(dead_code)]
 pub fn move_into(src: &Path, dst_dir: &Path) -> io::Result<PathBuf> {
+    if is_forbidden_path(src) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "系统保护文件，禁止操作",
+        ));
+    }
     let file_name = src
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "无效源路径"))?;
@@ -228,7 +278,7 @@ pub fn new_file(parent: &Path, base: &str) -> io::Result<PathBuf> {
     Ok(target)
 }
 
-/// 支持的归档格式
+/// 支持的归档格式（ZIP 容器家族均按 Zip 处理：msix/appx/apk 等本质为 ZIP）
 #[derive(Clone, Copy, PartialEq)]
 pub enum ArchiveFormat {
     Zip,
@@ -238,10 +288,19 @@ pub enum ArchiveFormat {
 }
 
 /// 判断路径的归档格式（按扩展名）。非归档返回 None。
+/// msix/msixbundle/appx/appxbundle/apk/aab/ipa 等本质为 ZIP 容器，按 Zip 处理；
+/// cab(MSCF)/iso(ISO9660)/vhd 并非 ZIP，强行解析必然报错，不支持解包。
 pub fn is_archive(path: &Path) -> Option<ArchiveFormat> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     match ext.as_str() {
-        "zip" => Some(ArchiveFormat::Zip),
+        "zip"
+        | "msix"
+        | "msixbundle"
+        | "appx"
+        | "appxbundle"
+        | "apk"
+        | "aab"
+        | "ipa" => Some(ArchiveFormat::Zip),
         "7z" => Some(ArchiveFormat::SevenZ),
         "tar" => Some(ArchiveFormat::Tar),
         "gz" | "tgz" => Some(ArchiveFormat::TarGz),

@@ -948,7 +948,7 @@ export component SettingsPanel inherits Rectangle {
                         }
                     }
 
-                    // ── 云存储账号(当前实现:SMB 网络位置管理) ──
+                    // ── 云存储账号（SMB / FTP / WebDAV / SFTP）──
                     if current-section == "cloud": VerticalLayout {
                         spacing: 16px;
                         SectionTitle { text: "云存储账号"; }
@@ -958,16 +958,18 @@ export component SettingsPanel inherits Rectangle {
                             // 空列表提示
                             if AppState.net-locations.length == 0: SettingRow {
                                 name: "暂无已保存的连接";
-                                desc: "点击下方\"添加网络位置\"连接 SMB 共享";
+                                desc: "点击下方\"添加网络位置\"连接 SMB 共享或 FTP / WebDAV / SFTP";
                                 last: true;
                                 VerticalLayout { alignment: center; }
                             }
                             for acc[i] in AppState.net-locations: SettingRow {
-                                name: acc.name;
-                                desc: acc.drive == "" ? acc.server : acc.server + " · 已挂载到 " + acc.drive;
+                                name: acc.kind == "smb" ? acc.name : acc.name + " · " + acc.kind;
+                                desc: acc.kind == "smb"
+                                    ? (acc.drive == "" ? acc.server : acc.server + " · 已挂载到 " + acc.drive)
+                                    : acc.server;
                                 last: i == AppState.net-locations.length - 1;
                                 VerticalLayout { alignment: center; Btn {
-                                    label: "断开并移除";
+                                    label: acc.kind == "smb" ? "断开并移除" : "移除";
                                     clicked => { AppState.remove-network-location(acc.name); }
                                 } }
                             }
@@ -977,7 +979,7 @@ export component SettingsPanel inherits Rectangle {
                             title: "";
                             SettingRow {
                                 name: "添加网络位置";
-                                desc: "连接 SMB 共享 (\\\\server\\share) 并挂载为驱动器;OneDrive / OSS / S3 等云盘暂未支持";
+                                desc: "支持 SMB (\\\\server\\share) 挂载为驱动器，以及 FTP (21)、SFTP (22)、WebDAV (80/443) 云存储";
                                 last: true;
                                 VerticalLayout { alignment: center; Btn {
                                     label: "添加网络位置"; primary: true;
