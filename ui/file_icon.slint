@@ -111,6 +111,16 @@ export component FileIcon inherits Rectangle {
     // 仅真实内容缩略图（图片/视频首帧）裁成圆角；Shell 图标保留透明边缘，
     // 尤其是手机图标的顶部与底部，不能由外层 clip 截掉。
     property <bool> round-thumb: icon-class == "image" || icon-class == "video";
+    // WebDAV 挂载图标预设（drive-cloud/net/folder/vault/star）：Segoe MDL2 字形渲染，
+    // 与内置矢量模式一致，不依赖系统图标提取
+    property <bool> drive-preset: icon-class == "drive-cloud" || icon-class == "drive-net"
+        || icon-class == "drive-folder" || icon-class == "drive-vault" || icon-class == "drive-star";
+    // 预设对应的 MDL2 字形：云端 E753 / 网络 E968 / 文件夹 E8B7 / 保险箱锁 E72E / 收藏星 E735
+    property <string> drive-glyph: icon-class == "drive-cloud" ? "\u{E753}"
+        : icon-class == "drive-net" ? "\u{E968}"
+        : icon-class == "drive-folder" ? "\u{E8B7}"
+        : icon-class == "drive-vault" ? "\u{E72E}"
+        : "\u{E735}";
     width: box;
     height: box;
     border-radius: root.has-thumb ? (root.round-thumb ? radius : 0px) : radius;
@@ -146,6 +156,11 @@ export component FileIcon inherits Rectangle {
         : icon-class == "video" ? (Theme.dark ? #2c4a5e : #c8e9ff)
         : icon-class == "pdf" ? (Theme.dark ? #5e2f2e : #ffdad6)
         : icon-class == "drive" ? (Theme.dark ? #2f5b96 : #3a7bd5)
+        : icon-class == "drive-cloud" ? (Theme.dark ? #3b5f8a : #107c10)
+        : icon-class == "drive-net" ? (Theme.dark ? #54413a : #c46c14)
+        : icon-class == "drive-folder" ? (Theme.dark ? #4b5d1f : #ffb900)
+        : icon-class == "drive-vault" ? (Theme.dark ? #5b4a68 : #6b3fa0)
+        : icon-class == "drive-star" ? (Theme.dark ? #6a5b2a : #ca5010)
         : icon-class == "device" ? (Theme.dark ? #236b6b : #b8e8e8)
         : Theme.icon-default-bg;
 
@@ -199,6 +214,17 @@ export component FileIcon inherits Rectangle {
         x: root.inner-off; y: root.inner-off;
         width: root.inner-s; height: root.inner-s;
     }
+    // 挂载图标预设：彩色底 + Segoe MDL2 字形（与侧栏字形同源）
+    if !root.has-thumb && !root.compact && root.drive-preset: Text {
+        x: root.inner-off; y: root.inner-off;
+        width: root.inner-s; height: root.inner-s;
+        font-family: "Segoe MDL2 Assets";
+        font-size: root.inner-s;
+        text: root.drive-glyph;
+        color: #ffffff;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
     if !root.has-thumb && !root.compact && icon-class == "device": DeviceGlyph {
         x: root.inner-off; y: root.inner-off;
         width: root.inner-s; height: root.inner-s;
@@ -211,8 +237,8 @@ export component FileIcon inherits Rectangle {
     // 兼容旧的 icon-class 之外未列出类别
     if !root.has-thumb && !root.compact && icon-class != "folder" && icon-class != "image" && icon-class != "code"
         && icon-class != "archive" && icon-class != "audio" && icon-class != "video"
-        && icon-class != "pdf" && icon-class != "drive" && icon-class != "device"
-        && icon-class != "default" && icon-class != "": DocGlyph {
+        && icon-class != "pdf" && icon-class != "drive" && !root.drive-preset
+        && icon-class != "device" && icon-class != "default" && icon-class != "": DocGlyph {
         x: root.inner-off; y: root.inner-off;
         width: root.inner-s; height: root.inner-s;
     }
@@ -283,6 +309,16 @@ export component FileIcon inherits Rectangle {
         glyph-color: root.glyph-color;
     }
     // 紧凑模式默认/未知
+    if !root.has-thumb && root.compact && root.drive-preset: Text {
+        x: 0; y: 0;
+        width: root.box; height: root.box;
+        font-family: "Segoe MDL2 Assets";
+        font-size: root.box;
+        text: root.drive-glyph;
+        color: root.glyph-color;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
     if !root.has-thumb && root.compact && (icon-class == "default" || icon-class == ""): Glyph {
         x: 0; y: 0;
         width: root.box; height: root.box;
@@ -292,8 +328,8 @@ export component FileIcon inherits Rectangle {
     }
     if !root.has-thumb && root.compact && icon-class != "folder" && icon-class != "image" && icon-class != "code"
         && icon-class != "archive" && icon-class != "audio" && icon-class != "video"
-        && icon-class != "pdf" && icon-class != "drive" && icon-class != "device"
-        && icon-class != "default" && icon-class != "": Glyph {
+        && icon-class != "pdf" && icon-class != "drive" && !root.drive-preset
+        && icon-class != "device" && icon-class != "default" && icon-class != "": Glyph {
         x: 0; y: 0;
         width: root.box; height: root.box;
         d: "M14 2 H6 C4.9 2 4 2.9 4 4 V20 C4 21.1 4.9 22 6 22 H18 C19.1 22 20 21.1 20 20 V8 L14 2 Z M14 2 V8 H20 M8 13 H16 M8 16 H16 M8 19 H13";

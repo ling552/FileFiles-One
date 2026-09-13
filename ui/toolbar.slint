@@ -169,6 +169,11 @@ export component Toolbar inherits Rectangle {
                         }
                         AppState.set-omni-mode("path");
                         AppState.input-active = false;
+                        // 归还键盘焦点到全局作用域：本输入框随后被条件销毁，
+                        // changed has-focus 不会再触发，不主动归还则全局快捷键
+                        // （Ctrl+A / F5 / 空格预览等）全部失灵直到重启。
+                        // input-blur-token 变化由 main.slint 的 watcher 调 key-scope.focus()。
+                        AppState.input-blur-token = AppState.input-blur-token + 1;
                     }
                     key-pressed(ev) => {
                         // > 命令模式：上下箭头选择命令
@@ -185,6 +190,8 @@ export component Toolbar inherits Rectangle {
                         if (ev.text == Key.Escape) {
                             AppState.set-omni-mode("path");
                             AppState.input-active = false;
+                            // 同 accepted：Escape 也会销毁输入框，需主动归还焦点
+                            AppState.input-blur-token = AppState.input-blur-token + 1;
                             return accept;
                         }
                         return reject;

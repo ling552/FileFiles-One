@@ -18,8 +18,67 @@ use slint::Model;
 // 无边框窗口下访问底层 winit 窗口以实现自定义标题栏拖动
 use slint::winit_030::WinitWindowAccessor;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
+
+struct DirectoryLoadResult {
+    generation: u64,
+    path: PathBuf,
+    entries: Result<Vec<fs::metadata::Entry>, String>,
+    folders_first: bool,
+    clear_search: bool,
+    previous_selection: HashSet<String>,
+}
+
+struct PendingSelection {
+    paths: Vec<PathBuf>,
+    edit_single: bool,
+}
+
+static LEFT_DIRECTORY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RIGHT_DIRECTORY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static LEFT_DIRECTORY_RESULT: OnceLock<Mutex<Option<DirectoryLoadResult>>> = OnceLock::new();
+static RIGHT_DIRECTORY_RESULT: OnceLock<Mutex<Option<DirectoryLoadResult>>> = OnceLock::new();
+static LEFT_PENDING_SELECTION: OnceLock<Mutex<Option<PendingSelection>>> = OnceLock::new();
+static RIGHT_PENDING_SELECTION: OnceLock<Mutex<Option<PendingSelection>>> = OnceLock::new();
+
+/// 进度卡片速率曲线的采样点数（约 2 秒窗口，40ms 一帧）
+const SPEED_HISTORY_POINTS: usize = 48;
+
+fn directory_generation(right: bool) -> &'static AtomicU64 {
+    if right {
+        &RIGHT_DIRECTORY_GENERATION
+    } else {
+        &LEFT_DIRECTORY_GENERATION
+    }
+}
+
+fn directory_result(right: bool) -> &'static Mutex<Option<DirectoryLoadResult>> {
+    if right {
+        RIGHT_DIRECTORY_RESULT.get_or_init(|| Mutex::new(None))
+    } else {
+        LEFT_DIRECTORY_RESULT.get_or_init(|| Mutex::new(None))
+    }
+}
+
+fn pending_selection(right: bool) -> &'static Mutex<Option<PendingSelection>> {
+    if right {
+        RIGHT_PENDING_SELECTION.get_or_init(|| Mutex::new(None))
+    } else {
+        LEFT_PENDING_SELECTION.get_or_init(|| Mutex::new(None))
+    }
+}
+
+fn queue_selection_after_load(right: bool, paths: Vec<PathBuf>, edit_single: bool) {
+    if let Ok(mut pending) = pending_selection(right).lock() {
+        *pending = Some(PendingSelection { paths, edit_single });
+    }
+}
 
 fn home_start_path() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"))
@@ -90,10 +149,18 @@ fn main() -> Result<(), slint::PlatformError> {
     // 注册侧栏图标后台加载完成后的重建入口（须在首次 build_sidebar 之前）
     ui_bridge::init_sidebar_warm(ui.as_weak());
 
+    // 目录枚举在后台线程完成，回调必须先于首次加载绑定。
+    bind_directory_loads(&ui, &core);
+
     // 首次加载
     load_current(&ui, &core);
-    // 右侧独立面板首次加载（双面板视图用）
-    load_right(&ui, &core);
+    // 右侧面板仅在实际启用双面板时加载，避免启动时保留一份不可见目录模型。
+    if {
+        let settings = &core.borrow().config.settings;
+        settings.dual_pane_default || settings.default_view == "dual"
+    } {
+        load_right(&ui, &core);
+    }
     let state = ui.global::<AppState>();
     {
         let c = core.borrow();
@@ -204,7 +271,105 @@ fn main() -> Result<(), slint::PlatformError> {
     // Slint 窗口/着色器初始化开销前移到启动期，视频/图片首开不再卡顿。
     warmup_preview_window(&ui);
 
+    // 启动后台自动挂载已保存的 WebDAV 虚拟磁盘（rclone，无终端窗口）：
+    // 成功后回写盘符并刷新侧栏/此电脑，失败静默保留 cloud:// 原生浏览
+    auto_mount_saved_webdav(&ui, &core);
+
     ui.run()
+}
+
+/// 启动后台线程把 WebDAV 挂载为虚拟磁盘（rclone mount，无终端）。
+/// 缺 rclone 时先后台供给（约 50MB）；成功经 webdav-mounted 回调回主线程
+/// 回写配置盘符并刷新（jump=true 时跳转盘符），失败仅状态栏提示。
+fn spawn_webdav_mount(ui: &MainWindow, loc: &crate::config::NetworkLocation, jump: bool) {
+    let w = ui.as_weak();
+    let loc = loc.clone();
+    std::thread::spawn(move || {
+        if crate::fs::rclone::rclone_exe().is_none() {
+            let _ = crate::fs::rclone::ensure_rclone();
+        }
+        match crate::fs::rclone::mount_webdav(&loc) {
+            Ok(drive) => {
+                let name = loc.name.clone();
+                let _ = w.upgrade_in_event_loop(move |ui| {
+                    ui.global::<AppState>().invoke_webdav_mounted(name.into(), drive.into(), jump);
+                });
+            }
+            Err(e) => {
+                let name = loc.name.clone();
+                let msg = format!("WebDAV 原生浏览可用；虚拟磁盘挂载失败：{}", e);
+                let _ = w.upgrade_in_event_loop(move |ui| {
+                    ui.global::<AppState>().invoke_webdav_mount_failed(name.into(), msg.into());
+                });
+            }
+        }
+    });
+}
+
+/// 启动后台自动挂载已保存的 WebDAV 为虚拟磁盘（rclone mount，无终端）。
+/// 仅重挂「设置过挂载盘符」的账户（挂载为用户显式行为，盘符是必填项）；
+/// 逐个挂载（避免并发抢盘符），每个最长 20 秒；全部在后台线程执行，
+/// 成功逐个经 webdav-mounted 回调回主线程回写配置并刷新（回调内可安全访问 Rc）。
+fn auto_mount_saved_webdav(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
+    let saved: Vec<crate::config::NetworkLocation> = core
+        .borrow()
+        .config
+        .network_locations
+        .iter()
+        .filter(|l| l.kind == "webdav" && l.mount_drive.is_some())
+        .cloned()
+        .collect();
+    if saved.is_empty() {
+        return;
+    }
+    let w = ui.as_weak();
+    // 后台线程仅持有 owned 数据（Send），不持有 Rc<RefCell>（!Send）
+    std::thread::spawn(move || {
+        // 缺 rclone 时先供给一次（失败则整批跳过，下次添加/启动再试）
+        if crate::fs::rclone::rclone_exe().is_none() {
+            let _ = crate::fs::rclone::ensure_rclone();
+        }
+        if crate::fs::rclone::rclone_exe().is_none() {
+            return;
+        }
+        if !crate::fs::rclone::winfsp_installed() {
+            return;
+        }
+        for loc in saved {
+            // 手动挂载进行中则跳过（避免与用户点击抢盘符互杀）
+            if crate::fs::rclone::is_mounting(&loc.name) {
+                continue;
+            }
+            // 已有有效盘符则跳过（上次正常退出未卸载的残留由驱动器轮询自然显示）
+            if let Some(d) = loc.drive.clone() {
+                let letter = d.trim_end_matches(':').chars().next().unwrap_or('?');
+                if crate::fs::rclone::drive_in_use(letter) || crate::fs::rclone::is_mounted_name(&loc.name).is_some() {
+                    continue;
+                }
+            }
+            // 与手动挂载共用同一防重入闸门：标记期间用户的点击会被 is_mounting
+            // 拦下，否则两个 rclone 并发抢同一盘符、互相超时 kill
+            crate::fs::rclone::mark_mounting(&loc.name);
+            let result = crate::fs::rclone::mount_webdav(&loc);
+            crate::fs::rclone::unmark_mounting(&loc.name);
+            match result {
+                Ok(drive) => {
+                    let name = loc.name.clone();
+                    let _ = w.upgrade_in_event_loop(move |ui| {
+                        ui.global::<AppState>().invoke_webdav_mounted(name.into(), drive.into(), false);
+                    });
+                }
+                Err(e) => {
+                    // 失败不再完全静默：状态栏提示一次（凭据过期等原因用户应可知）
+                    let name = loc.name.clone();
+                    let msg = format!("自动挂载 {} 失败：{}（可稍后在设置中手动重试）", loc.name, e);
+                    let _ = w.upgrade_in_event_loop(move |ui| {
+                        ui.global::<AppState>().invoke_webdav_mount_failed(name.into(), msg.into());
+                    });
+                }
+            }
+        }
+    });
 }
 
 /// 启动 1.2s 后（避开主窗口首帧与设备枚举高峰）预创建预览窗口实例。
@@ -967,6 +1132,167 @@ fn bind_layout(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     });
 }
 
+/// 接收后台目录枚举结果；只应用仍对应当前面板路径的最新一代结果。
+fn bind_directory_loads(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
+    let weak = ui.as_weak();
+    let core = core.clone();
+    ui.global::<AppState>().on_directory_load_ready(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        for right in [false, true] {
+            let pending = directory_result(right)
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take());
+            let Some(pending) = pending else { continue };
+            if directory_generation(right).load(Ordering::SeqCst) != pending.generation {
+                continue;
+            }
+            let path_matches = {
+                let core = core.borrow();
+                core.pane(right).history.current() == &pending.path
+            };
+            if !path_matches {
+                continue;
+            }
+            let entries = match pending.entries {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let prefix = if right { "右面板无法打开目录" } else { "无法打开目录" };
+                    ui.global::<AppState>()
+                        .set_status_text(format!("{}：{}", prefix, error).into());
+                    continue;
+                }
+            };
+            {
+                let mut core = core.borrow_mut();
+                let tab = core.pane_mut(right);
+                tab.entries = entries;
+                tab.folders_first = pending.folders_first;
+                if pending.clear_search {
+                    tab.search.clear();
+                }
+                tab.rebuild();
+                restore_selection_by_path(tab, &pending.previous_selection);
+            }
+            if right {
+                ui_bridge::push_right(&ui, &core.borrow());
+                if toolbar_routes_right(&ui) {
+                    ui_bridge::update_selection_pane(&ui, &core.borrow(), true);
+                }
+            } else {
+                let core_ref = core.borrow();
+                ui_bridge::push_entries(&ui, &core_ref);
+                ui_bridge::push_tabs(&ui, &core_ref);
+                ui.global::<AppState>()
+                    .set_nav_items(ui_bridge::build_sidebar(
+                        &pending.path,
+                        &core_ref.collapsed_sections,
+                        &core_ref.config,
+                    ));
+            }
+            let select = pending_selection(right)
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.take());
+            if let Some(select) = select {
+                if select.edit_single && select.paths.len() == 1 {
+                    select_created_and_edit(
+                        &ui,
+                        &core,
+                        right,
+                        &select.paths[0].to_string_lossy(),
+                    );
+                } else {
+                    select_completed_paths(&ui, &core, right, &select.paths);
+                }
+            }
+        }
+    });
+}
+
+/// 在工作线程读取本地或云目录，避免文件系统/网络 I/O 阻塞 Slint 事件循环。
+fn load_directory_in_background(
+    ui: &MainWindow,
+    core: &Rc<RefCell<AppCore>>,
+    right: bool,
+    path: PathBuf,
+    generation: u64,
+    clear_search: bool,
+) {
+    let path_str = path.to_string_lossy().to_string();
+    let is_cloud = fs::cloud::is_cloud_path(&path_str);
+    let (show_hidden, show_protected, folders_first, locations, previous_selection) = {
+        let core = core.borrow();
+        (
+            core.config.settings.show_hidden,
+            core.config.settings.show_protected,
+            core.config.settings.folders_first,
+            core.config.network_locations.clone(),
+            selected_path_set(core.pane(right)),
+        )
+    };
+
+    if clear_search {
+        {
+            let mut core = core.borrow_mut();
+            let tab = core.pane_mut(right);
+            tab.entries.clear();
+            tab.search.clear();
+            tab.rebuild();
+        }
+        if right {
+            ui_bridge::push_right(ui, &core.borrow());
+        } else {
+            let core_ref = core.borrow();
+            ui_bridge::push_entries(ui, &core_ref);
+            ui_bridge::push_tabs(ui, &core_ref);
+            ui.global::<AppState>()
+                .set_nav_items(ui_bridge::build_sidebar(
+                    &path,
+                    &core_ref.collapsed_sections,
+                    &core_ref.config,
+                ));
+        }
+    }
+    if clear_search {
+        ui.global::<AppState>().set_status_text(
+            if is_cloud {
+                "正在连接云存储…"
+            } else {
+                "正在加载文件夹…"
+            }
+            .into(),
+        );
+    }
+
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let entries = if is_cloud {
+            fs::cloud::list_cloud_dir_result(&path_str, &locations)
+        } else {
+            ops::read_dir(&path, show_hidden, show_protected).map_err(|e| e.to_string())
+        };
+        if directory_generation(right).load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if let Ok(mut slot) = directory_result(right).lock() {
+            *slot = Some(DirectoryLoadResult {
+                generation,
+                path,
+                entries,
+                folders_first,
+                clear_search,
+                previous_selection,
+            });
+        } else {
+            return;
+        }
+        let _ = weak.upgrade_in_event_loop(|ui| {
+            ui.global::<AppState>().invoke_directory_load_ready();
+        });
+    });
+}
+
 /// 读取当前活跃标签页目录并推送到 UI
 fn load_current(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     // 导航/刷新时清除可能残留的跨面板拖拽幽灵状态：
@@ -975,6 +1301,8 @@ fn load_current(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     // 同时退出行内重命名（两侧下标一并清）：editing 下标残留会禁用 InputOverlay，
     // 表现为「编辑框一直显示且界面无法点击」（如在新面板打开后旧编辑态未清）。
     ui.invoke_clear_editing();
+    let generation = directory_generation(false).fetch_add(1, Ordering::SeqCst) + 1;
+
     // 设置标签页不读取文件系统，仅推送标签与视图状态
     let is_settings = core.borrow().active_tab().kind == app::TabKind::Settings;
     if is_settings {
@@ -993,7 +1321,16 @@ fn load_current(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     let path = core.borrow().active_tab().history.current().clone();
     let path_str = path.to_string_lossy().to_string();
 
-    // 虚拟路径（标签 / 回收站 / 网络位置）走 provider 生成条目
+    // 云目录和真实目录均可能阻塞，统一在后台枚举。
+    if fs::cloud::is_cloud_path(&path_str) {
+        if let Some(w) = core.borrow_mut().watcher.as_mut() {
+            w.clear();
+        }
+        load_directory_in_background(ui, core, false, path, generation, true);
+        return;
+    }
+
+    // 其它虚拟路径走 provider 生成条目；它们不涉及远程云网络请求。
     if fs::virtualfs::is_virtual(&path_str) {
         let entries = {
             let mut c = core.borrow_mut();
@@ -1021,54 +1358,18 @@ fn load_current(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     &c.config,
                 ));
         }
-        // 虚拟路径（标签 / 回收站 / 网络位置）内容不由文件系统驱动，停止实时监听
+        // 虚拟路径内容不由文件系统驱动，停止实时监听
         if let Some(w) = core.borrow_mut().watcher.as_mut() {
             w.clear();
         }
         return;
     }
 
-    // 提前取出设置项，避免 match 表达式中的临时借用与内部 borrow_mut 冲突
-    let (show_hidden, show_protected, folders_first) = {
-        let c = core.borrow();
-        (
-            c.config.settings.show_hidden,
-            c.config.settings.show_protected,
-            c.config.settings.folders_first,
-        )
-    };
-    match ops::read_dir(&path, show_hidden, show_protected) {
-        Ok(entries) => {
-            let mut c = core.borrow_mut();
-            let prev = selected_path_set(c.active_tab());
-            let tab = c.active_tab_mut();
-            tab.entries = entries;
-            tab.folders_first = folders_first;
-            tab.search.clear();
-            tab.rebuild();
-            restore_selection_by_path(tab, &prev);
-        }
-        Err(e) => {
-            let st = ui.global::<AppState>();
-            st.set_status_text(format!("无法打开目录：{}", e).into());
-            return;
-        }
-    }
-    {
-        let c = core.borrow();
-        ui_bridge::push_entries(ui, &c);
-        ui_bridge::push_tabs(ui, &c);
-        ui.global::<AppState>()
-            .set_nav_items(ui_bridge::build_sidebar(
-                &path,
-                &c.collapsed_sections,
-                &c.config,
-            ));
-    }
-    // 更新实时监听到新的当前目录（notify 后端非递归监听其直接子项变化）
+    // 先切换监听目标，再后台读取；后续变化由软刷新补齐。
     if let Some(w) = core.borrow_mut().watcher.as_mut() {
         w.watch(&path);
     }
+    load_directory_in_background(ui, core, false, path, generation, true);
 }
 
 /// 目录实时监听触发的「软刷新」：重读当前活跃标签目录并推送 UI，
@@ -1080,52 +1381,11 @@ fn reload_current_soft(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         return;
     }
     let path = core.borrow().active_tab().history.current().clone();
-    let path_str = path.to_string_lossy().to_string();
-    if fs::virtualfs::is_virtual(&path_str) {
+    if fs::virtualfs::is_virtual(&path.to_string_lossy()) {
         return;
     }
-
-    let (show_hidden, show_protected, folders_first) = {
-        let c = core.borrow();
-        (
-            c.config.settings.show_hidden,
-            c.config.settings.show_protected,
-            c.config.settings.folders_first,
-        )
-    };
-    let entries = match ops::read_dir(&path, show_hidden, show_protected) {
-        Ok(e) => e,
-        Err(_) => return, // 目录已被删除/移动等：留待用户主动导航，不打断当前视图
-    };
-
-    {
-        let mut c = core.borrow_mut();
-        // 记录刷新前的选中项路径，用于按路径恢复
-        let prev: std::collections::HashSet<String> = c
-            .active_tab()
-            .selected_paths()
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-        let tab = c.active_tab_mut();
-        tab.entries = entries;
-        tab.folders_first = folders_first;
-        // 注意：不清空 tab.search，rebuild 会按现有搜索词重建 filtered
-        tab.rebuild();
-        // 按路径恢复选中（条目可能已重排，先收集下标再置位以避开借用冲突）
-        if !prev.is_empty() {
-            let to_select: Vec<usize> = (0..tab.filtered.len())
-                .filter(|&fi| tab.entry_at(fi).is_some_and(|e| prev.contains(&e.path)))
-                .collect();
-            for fi in to_select {
-                tab.selected[fi] = true;
-            }
-        }
-    }
-
-    let c = core.borrow();
-    ui_bridge::push_entries(ui, &c);
-    ui_bridge::push_tabs(ui, &c);
+    let generation = directory_generation(false).fetch_add(1, Ordering::SeqCst) + 1;
+    load_directory_in_background(ui, core, false, path, generation, false);
 }
 
 /// 右面板「软刷新」：与 reload_current_soft 同语义——重读目录并推送 UI，
@@ -1136,31 +1396,8 @@ fn reload_right_soft(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     if fs::virtualfs::is_virtual(&path.to_string_lossy()) {
         return;
     }
-    let (show_hidden, show_protected, folders_first) = {
-        let c = core.borrow();
-        (
-            c.config.settings.show_hidden,
-            c.config.settings.show_protected,
-            c.config.settings.folders_first,
-        )
-    };
-    let entries = match ops::read_dir(&path, show_hidden, show_protected) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    {
-        let mut c = core.borrow_mut();
-        let prev = selected_path_set(&c.right_pane);
-        let tab = &mut c.right_pane;
-        tab.entries = entries;
-        tab.folders_first = folders_first;
-        tab.rebuild();
-        restore_selection_by_path(tab, &prev);
-    }
-    ui_bridge::push_right(ui, &core.borrow());
-    if toolbar_routes_right(ui) {
-        ui_bridge::update_selection_pane(ui, &core.borrow(), true);
-    }
+    let generation = directory_generation(true).fetch_add(1, Ordering::SeqCst) + 1;
+    load_directory_in_background(ui, core, true, path, generation, false);
 }
 
 /// 初始化当前目录实时监听：绑定 `auto-refresh` 回调到软刷新，创建 `DirWatcher`
@@ -1589,6 +1826,9 @@ fn start_next_job(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     st.set_task_progress(0.0);
     st.set_task_speed("计算中…".into());
     st.set_task_eta("计算中…".into());
+    // 速率曲线从零开始记录本任务
+    st.set_task_speed_history(slint::ModelRc::new(slint::VecModel::from(Vec::<f32>::new())));
+    st.set_task_speed_max(1.0);
 
     let w_progress = ui.as_weak();
     let w_done = ui.as_weak();
@@ -1623,6 +1863,32 @@ fn start_next_job(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                             st.set_task_progress(p.fraction);
                             st.set_task_speed(p.speed.into());
                             st.set_task_eta(p.eta.into());
+                            // 速率记录：追加瞬时采样并维护窗口内最大值（曲线归一化用）。
+                            // 复用同一个 VecModel 增量增删，避免每帧整体重建模型。
+                            if p.speed_bps > 0.0 {
+                                let model = st.get_task_speed_history();
+                                let max = match model
+                                    .as_any()
+                                    .downcast_ref::<slint::VecModel<f32>>()
+                                {
+                                    Some(vm) => {
+                                        vm.push(p.speed_bps);
+                                        if vm.row_count() > SPEED_HISTORY_POINTS {
+                                            vm.remove(0);
+                                        }
+                                        (0..vm.row_count())
+                                            .filter_map(|i| vm.row_data(i))
+                                            .fold(0.0f32, f32::max)
+                                    }
+                                    None => {
+                                        st.set_task_speed_history(slint::ModelRc::new(
+                                            slint::VecModel::from(vec![p.speed_bps]),
+                                        ));
+                                        p.speed_bps
+                                    }
+                                };
+                                st.set_task_speed_max(max.max(1.0));
+                            }
                         }
                     });
                 },
@@ -1964,14 +2230,14 @@ fn rename_in_pane(
     ui.invoke_clear_editing();
     // 名称未变则无需重载目录（否则反而引入卡顿）
     if !unchanged {
+        // 目录枚举在后台完成，待结果应用后再按新路径恢复选中。
+        if let Some(path) = renamed_to {
+            queue_selection_after_load(right, vec![path], false);
+        }
         if right {
             load_right(ui, c);
         } else {
             load_current(ui, c);
-        }
-        // 重命名后的条目按新路径重新选中，保持「一直选中直到取消」
-        if let Some(p) = renamed_to {
-            select_completed_paths(ui, c, right, &[p]);
         }
     }
 }
@@ -2087,32 +2353,20 @@ fn reload_and_select_new(
     right: bool,
     before: &std::collections::HashSet<String>,
 ) -> bool {
+    let created: Vec<PathBuf> = snapshot_pane_dir(core, right)
+        .unwrap_or_default()
+        .difference(before)
+        .map(PathBuf::from)
+        .collect();
+    if !created.is_empty() {
+        queue_selection_after_load(right, created.clone(), created.len() == 1);
+    }
     if right {
         load_right(ui, core);
     } else {
         load_current(ui, core);
     }
-    let created: Vec<PathBuf> = {
-        let c = core.borrow();
-        let tab = c.pane(right);
-        tab.filtered
-            .iter()
-            .filter_map(|&ei| tab.entries.get(ei))
-            .filter(|e| !before.contains(&norm_path_key(&e.path)))
-            .map(|e| PathBuf::from(&e.path))
-            .collect()
-    };
-    if created.is_empty() {
-        return false;
-    }
-    // 新建单项：与应用内「新增」一致，选中并直接进入行内重命名，
-    // 用户可立刻输入名称。多项（粘贴/解压等）仅选中，不进入编辑。
-    if created.len() == 1 {
-        select_created_and_edit(ui, core, right, &created[0].to_string_lossy());
-    } else {
-        select_completed_paths(ui, core, right, &created);
-    }
-    true
+    !created.is_empty()
 }
 
 /// 系统 Shell 菜单命令后的刷新序列：立即比对一次，并在给定延迟点重试。
@@ -2183,10 +2437,10 @@ fn default_folder_layout(settings: &config::Settings) -> (&'static str, bool) {
 
 fn folder_layout_for(config: &config::AppConfig, path: &Path) -> (&'static str, bool) {
     match config.folder_layout_normalized(&path.to_string_lossy()) {
-        Some("grid") => ("grid", false),
-        Some("dual-list") => ("list", true),
-        Some("dual-grid") => ("grid", true),
-        Some("list") => ("list", false),
+        // 双面板只能由用户手动开启（工具栏按钮 / F3 / 命令面板 /「在新面板打开」），
+        // 按路径记忆的双面板布局不再自动生效，仅保留其网格/列表子视图。
+        Some("grid") | Some("dual-grid") => ("grid", false),
+        Some("dual-list") | Some("list") => ("list", false),
         _ => default_folder_layout(&config.settings),
     }
 }
@@ -2223,11 +2477,12 @@ fn save_current_folder_layout(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         return;
     }
     let st = ui.global::<AppState>();
-    let mode = match (st.get_dual_pane(), st.get_view_mode().as_str()) {
-        (true, "grid") => "dual-grid",
-        (true, _) => "dual-list",
-        (false, "grid") => "grid",
-        _ => "list",
+    // 只记录网格/列表子视图，永不写入 dual-*：双面板是会话级手动开关，
+    // 不随目录持久化，避免导航到旧路径时被自动拉回双面板。
+    let mode = if st.get_view_mode().as_str() == "grid" {
+        "grid"
+    } else {
+        "list"
     };
     let path = core
         .borrow()
@@ -2252,6 +2507,24 @@ fn navigate_to(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, target: PathBuf) {
     load_current(ui, core);
 }
 
+fn release_right_pane(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
+    directory_generation(true).fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut result) = directory_result(true).lock() {
+        result.take();
+    }
+    if let Ok(mut selection) = pending_selection(true).lock() {
+        selection.take();
+    }
+    {
+        let mut core = core.borrow_mut();
+        core.right_pane.entries.clear();
+        core.right_pane.filtered.clear();
+        core.right_pane.selected.clear();
+        core.right_pane.last_clicked = None;
+    }
+    ui_bridge::push_right(ui, &core.borrow());
+}
+
 // ─── 双面板：右侧独立面板 ───
 
 /// 读取右侧面板当前目录并推送到 UI 的 r-* 属性
@@ -2261,42 +2534,29 @@ fn load_right(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     // 错挂到新列表同下标条目上
     ui.global::<AppState>().set_pane_drag_active(false);
     ui.invoke_clear_editing();
+    let generation = directory_generation(true).fetch_add(1, Ordering::SeqCst) + 1;
     let path = core.borrow().right_pane.history.current().clone();
     let path_str = path.to_string_lossy().to_string();
-    let is_virtual = fs::virtualfs::is_virtual(&path_str);
-    let (show_hidden, show_protected, folders_first) = {
-        let c = core.borrow();
-        (
-            c.config.settings.show_hidden,
-            c.config.settings.show_protected,
-            c.config.settings.folders_first,
-        )
+
+    if fs::cloud::is_cloud_path(&path_str) || !fs::virtualfs::is_virtual(&path_str) {
+        load_directory_in_background(ui, core, true, path, generation, true);
+        return;
+    }
+
+    let entries = {
+        let mut core = core.borrow_mut();
+        fs::virtualfs::resolve(&path_str, &mut core.config).unwrap_or_default()
     };
-    let result = if is_virtual {
-        let entries = {
-            let mut c = core.borrow_mut();
-            fs::virtualfs::resolve(&path_str, &mut c.config).unwrap_or_default()
-        };
-        Ok(entries)
-    } else {
-        ops::read_dir(&path, show_hidden, show_protected)
-    };
-    match result {
-        Ok(entries) => {
-            let mut c = core.borrow_mut();
-            let prev = selected_path_set(&c.right_pane);
-            let t = &mut c.right_pane;
-            t.entries = entries;
-            t.folders_first = folders_first;
-            t.search.clear();
-            t.rebuild();
-            restore_selection_by_path(t, &prev);
-        }
-        Err(e) => {
-            ui.global::<AppState>()
-                .set_status_text(format!("右面板无法打开目录：{}", e).into());
-            return;
-        }
+    {
+        let mut core = core.borrow_mut();
+        let folders_first = core.config.settings.folders_first;
+        let previous_selection = selected_path_set(&core.right_pane);
+        let tab = &mut core.right_pane;
+        tab.entries = entries;
+        tab.folders_first = folders_first;
+        tab.search.clear();
+        tab.rebuild();
+        restore_selection_by_path(tab, &previous_selection);
     }
     ui_bridge::push_right(ui, &core.borrow());
     // 导航/刷新已清空右面板选中：右面板为活动面板时同步 sel-* 全局状态
@@ -2726,6 +2986,10 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                                 password: String::new(),
                                 use_tls: false,
                                 passive: false,
+                                mount_drive: None,
+                                mount_readonly: false,
+                                mount_max_size_gb: None,
+                                mount_icon: String::new(),
                             });
                             core.config.save();
                         }
@@ -2745,7 +3009,9 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     }
                 }
             } else {
-                // FTP / WebDAV / SFTP：以虚拟路径 cloud://kind/name 呈现，无需挂载盘符
+                // FTP / SFTP / WebDAV：以虚拟路径 cloud://kind/name 呈现，添加后立即可浏览；
+                // WebDAV 的虚拟磁盘挂载（盘符/只读/空间/图标）由用户在设置页
+                // 点「挂载」按钮经挂载设置对话框手动发起
                 if host.is_empty() {
                     st.set_status_text("请输入主机地址".into());
                     return;
@@ -2774,6 +3040,11 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     password: pass.clone(),
                     use_tls,
                     passive: true,
+                    // 挂载设置在「挂载」按钮的设置对话框中填写（盘符为必填项）
+                    mount_drive: None,
+                    mount_readonly: false,
+                    mount_max_size_gb: None,
+                    mount_icon: String::new(),
                 };
                 loc.server = loc.display_server();
                 {
@@ -2801,14 +3072,24 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     ));
                 }
                 load_current(&ui, &c);
-                // 跳转到新建的云存储根
-                navigate_to(&ui, &c, PathBuf::from(loc.cloud_path()));
-                st.set_status_text(format!("已添加 {}：{}", kind.to_uppercase(), name).into());
+                // 所有类型一致：添加后立即进入 cloud:// 原生浏览（即时可用）。
+                // WebDAV 不再自动挂载（挂载盘符为必填项）：需要虚拟硬盘时，
+                // 在 设置 → 云存储账号 点击「挂载」进入挂载设置
+                if kind == "webdav" {
+                    navigate_to(&ui, &c, PathBuf::from(loc.cloud_path()));
+                    st.set_status_text(
+                        format!("已添加 WebDAV：{}；可在 设置 → 云存储账号 点击「挂载」挂载为虚拟硬盘", name).into(),
+                    );
+                } else {
+                    // 跳转到新建的云存储根
+                    navigate_to(&ui, &c, PathBuf::from(loc.cloud_path()));
+                    st.set_status_text(format!("已添加 {}：{}", kind.to_uppercase(), name).into());
+                }
             }
         }
     });
 
-    // 移除网络位置：卸载盘符 + 删除配置
+    // 移除网络位置：卸载盘符（SMB/rclone WebDAV 虚拟磁盘）+ 删除配置
     let w = ui.as_weak();
     let c = core.clone();
     state.on_remove_network_location(move |name| {
@@ -2828,7 +3109,13 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 }
             }
             if let Some(loc) = removed {
-                if let Some(d) = loc.drive {
+                if loc.kind == "webdav" {
+                    // rclone 虚拟磁盘卸载（无终端，后台 kill）
+                    crate::fs::rclone::unmount_by_name(&loc.name);
+                    if let Some(d) = loc.drive {
+                        crate::fs::rclone::unmount_drive(&d);
+                    }
+                } else if let Some(d) = loc.drive {
                     crate::fs::network::unmount_smb(&d);
                 }
             }
@@ -2839,6 +3126,299 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             if at_network {
                 load_current(&ui, &c);
             }
+        }
+    });
+
+    // ── WebDAV 挂载设置对话框 ──
+    // 打开对话框：按账户名定位配置并预填当前挂载设置（盘符/只读/空间/图标），
+    // 推送可选盘符 + 已占用盘符 + 当前挂载盘符。盘符为必须设置项：
+    // 未保存过设置且未挂载时预选为空，强制用户手动点选（避免自动预选导致误挂）。
+    let w = ui.as_weak();
+    let c = core.clone();
+    state.on_open_mount_dialog(move |name| {
+        if let Some(ui) = w.upgrade() {
+            let st = ui.global::<AppState>();
+            let name = name.to_string();
+            let loc = {
+                let core = c.borrow();
+                core.config.network_locations.iter().find(|l| l.name == name).cloned()
+            };
+            let Some(loc) = loc.filter(|l| l.kind == "webdav") else {
+                st.set_status_text("未找到该 WebDAV 账户".into());
+                return;
+            };
+            // 已挂载判定：内存挂载表或配置盘符真实存在任一即算（与设置页一致）
+            let mounted = crate::fs::cloud::is_webdav_mounted(&loc);
+            // 可选盘符：未占用盘符 + 当前挂载盘符（换设置时可保留）
+            let current_letter = if mounted {
+                loc.drive.as_deref()
+                    .and_then(|d| d.trim_end_matches(':').chars().next())
+                    .map(|ch| ch.to_ascii_uppercase())
+            } else {
+                None
+            };
+            let letters = crate::fs::rclone::available_drive_letters(current_letter);
+            // 已占用盘符（置灰禁用展示用）：D～Z 全量减去可用，当前挂载盘符除外已在可用中
+            let busy: Vec<char> = ('D'..='Z')
+                .filter(|ch| !letters.contains(ch))
+                .collect();
+            // 预选盘符：已保存的设定盘符 > 当前挂载盘符；均无则为空（必须手动选择）。
+            // 若保存的盘符已被其它设备占用（不在可用列表），同样置空强制重选。
+            let mut preselect = loc
+                .mount_drive
+                .clone()
+                .or_else(|| current_letter.map(|ch| ch.to_string()))
+                .unwrap_or_default();
+            preselect = preselect.trim().trim_end_matches(':').to_ascii_uppercase();
+            let available_set: std::collections::HashSet<String> =
+                letters.iter().map(|ch| ch.to_string()).collect();
+            if !preselect.is_empty() && !available_set.contains(&preselect) {
+                preselect.clear();
+            }
+            let max_size = loc
+                .mount_max_size_gb
+                .filter(|gb| *gb > 0)
+                .map(|gb| gb.to_string())
+                .unwrap_or_default();
+            st.set_mount_target_name(loc.name.clone().into());
+            st.set_mount_drive(preselect.into());
+            st.set_mount_readonly(loc.mount_readonly);
+            st.set_mount_max_size(max_size.into());
+            st.set_mount_icon(loc.mount_icon.clone().into());
+            st.set_mount_icon_custom(matches!(
+                loc.mount_icon_kind(),
+                crate::config::MountIconKind::File(_)
+            ));
+            st.set_mount_mounted(mounted);
+            st.set_mount_current_drive(
+                loc.drive.clone().unwrap_or_default().into(),
+            );
+            st.set_mount_available_drives(slint::ModelRc::new(slint::VecModel::from(
+                letters.into_iter().map(|ch| ch.to_string().into()).collect::<Vec<_>>(),
+            )));
+            st.set_mount_busy_drives(slint::ModelRc::new(slint::VecModel::from(
+                busy.into_iter().map(|ch| ch.to_string().into()).collect::<Vec<_>>(),
+            )));
+            st.set_mount_dialog_open(true);
+        }
+    });
+
+    // 确认挂载设置并执行挂载：写回 mount_* 配置 → 已挂载先卸载 → 后台挂载 →
+    // 成功跳转盘符（复用 webdav-mounted 回写/刷新链路），失败仅状态栏提示
+    let w = ui.as_weak();
+    let c = core.clone();
+    state.on_apply_mount(move || {
+        if let Some(ui) = w.upgrade() {
+            let st = ui.global::<AppState>();
+            let name = st.get_mount_target_name().to_string();
+            let drive = st.get_mount_drive().trim().trim_end_matches(':').to_string();
+            let readonly = st.get_mount_readonly();
+            let max_raw = st.get_mount_max_size().trim().to_string();
+            let icon = st.get_mount_icon().to_string();
+            // 防重入：正在挂载中时拒绝重复提交（此前三次点击抢盘符导致互相杀进程、永远挂载失败）
+            if crate::fs::rclone::is_mounting(&name) {
+                st.set_status_text("正在挂载中，请稍候（成功后按钮变为“取消挂载”）...".into());
+                return;
+            }
+            if drive.is_empty() || !drive.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                st.set_status_text("请先选择挂载盘符（必须设置）".into());
+                return;
+            }
+            let drive = drive.to_ascii_uppercase();
+            let letter = drive.chars().next().unwrap();
+            if !('D'..='Z').contains(&letter) {
+                st.set_status_text("挂载盘符必须在 D:～Z: 范围内".into());
+                return;
+            }
+            if crate::fs::rclone::drive_in_use(letter) && !crate::fs::rclone::is_mounted_name(&name)
+                .map(|d| d.trim_end_matches(':').chars().next() == Some(letter))
+                .unwrap_or(false)
+            {
+                st.set_status_text(format!("盘符 {} 已被占用，请更换", drive).into());
+                return;
+            }
+            let max_gb: Option<u64> = if max_raw.is_empty() {
+                None
+            } else {
+                match max_raw.parse::<u64>() {
+                    Ok(gb) if gb > 0 => Some(gb),
+                    Ok(_) => None, // 0 = 不限制
+                    Err(_) => {
+                        st.set_status_text("最大空间须为正整数（GB），留空则不限制".into());
+                        return;
+                    }
+                }
+            };
+            // 写回挂载设置（自定义图标 file: 前缀由 UI 端 pick-mount-icon 已写入）
+            let loc = {
+                let mut core = c.borrow_mut();
+                let found = core
+                    .config
+                    .network_locations
+                    .iter_mut()
+                    .find(|l| l.name == name && l.kind == "webdav")
+                    .map(|l| {
+                        l.mount_drive = Some(drive.clone());
+                        l.mount_readonly = readonly;
+                        l.mount_max_size_gb = max_gb;
+                        l.mount_icon = icon.clone();
+                        l.drive = None; // 待挂载成功后由 webdav-mounted 回写
+                        l.clone()
+                    });
+                if found.is_some() {
+                    core.config.save();
+                }
+                found
+            };
+            let Some(loc) = loc else {
+                st.set_status_text("未找到该 WebDAV 账户".into());
+                return;
+            };
+            st.set_mount_dialog_open(false);
+            st.set_status_text(format!("正在挂载 WebDAV 虚拟磁盘 {}…", drive).into());
+            // 已挂载先卸载（换盘符/换设置重挂场景）
+            let _ = crate::fs::rclone::unmount_by_name(&name);
+            // 标记挂载中并立即刷新设置页（按钮变为“挂载中...”禁用态，防重复点击抢盘符）
+            crate::fs::rclone::mark_mounting(&name);
+            ui_bridge::push_network_locations(&ui, &c.borrow());
+            spawn_webdav_mount(&ui, &loc, true);
+        }
+    });
+
+    // 卸载 WebDAV 虚拟磁盘：kill rclone 进程、清空 drive，保留账户与挂载设置
+    // （下次点「挂载」预填原设置）；若正停留在该盘符内则跳回 cloud:// 原生浏览
+    let w = ui.as_weak();
+    let c = core.clone();
+    state.on_unmount_network_location(move |name| {
+        if let Some(ui) = w.upgrade() {
+            let st = ui.global::<AppState>();
+            let name = name.to_string();
+            // 挂载中禁止取消（后台线程 20s 轮询中，kill 会导致互相抢盘符；稍候自动完成）
+            if crate::fs::rclone::is_mounting(&name) {
+                st.set_status_text("正在挂载中，请稍候再取消挂载...".into());
+                return;
+            }
+            let mut removed_drive: Option<String> = None;
+            {
+                let mut core = c.borrow_mut();
+                if let Some(saved) = core
+                    .config
+                    .network_locations
+                    .iter_mut()
+                    .find(|l| l.name == name && l.kind == "webdav")
+                {
+                    removed_drive = saved.drive.take();
+                    core.config.save();
+                }
+            }
+            crate::fs::rclone::unmount_by_name(&name);
+            if let Some(d) = &removed_drive {
+                crate::fs::rclone::unmount_drive(d);
+            }
+            // 卸载后 WinFsp 回收盘符需短暂延时，稍等后刷新磁盘缓存再重建侧栏，
+            // 否则侧栏仍残留已卸载的盘符（cached_disks 快照未更新）
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let _ = crate::fs::disk::list_disks();
+            ui_bridge::push_network_locations(&ui, &c.borrow());
+            {
+                let core = c.borrow();
+                ui.global::<AppState>().set_nav_items(ui_bridge::build_sidebar(
+                    core.active_tab().history.current(),
+                    &core.collapsed_sections,
+                    &core.config,
+                ));
+            }
+            // 正停留在被卸载盘符内（含子目录）→ 跳回该账户 cloud:// 根
+            let cur = c.borrow().active_tab().history.current().to_string_lossy().to_string();
+            if let Some(d) = removed_drive {
+                // get(..2) 防止多字节字符路径按字节切片越界 panic
+                if cur.get(..2).map_or(false, |two| two.eq_ignore_ascii_case(&d)) {
+                    let cloud_root = {
+                        let core = c.borrow();
+                        core.config
+                            .network_locations
+                            .iter()
+                            .find(|l| l.name == name)
+                            .map(|l| l.cloud_path())
+                    };
+                    if let Some(target) = cloud_root {
+                        navigate_to(&ui, &c, PathBuf::from(target));
+                    }
+                }
+            }
+            // 此电脑/网络视图即时刷新
+            if cur == fs::virtualfs::THIS_PC_PATH || cur == "network://" {
+                load_current(&ui, &c);
+            }
+            st.set_status_text(format!("已卸载 {} 的虚拟磁盘", name).into());
+        }
+    });
+
+    // 选择挂载图标文件：后台线程弹系统对话框（阻塞等待用户关闭），
+    // 选定后经事件循环回填 mount-icon（file:<路径>）并置自定义标记
+    let w = ui.as_weak();
+    state.on_pick_mount_icon(move || {
+        let w2 = w.clone();
+        std::thread::spawn(move || {
+            if let Ok(Some(path)) = crate::fs::rclone::pick_icon_file() {
+                let value = format!("file:{}", path);
+                let _ = w2.upgrade_in_event_loop(move |ui| {
+                    let st = ui.global::<AppState>();
+                    st.set_mount_icon(value.into());
+                    st.set_mount_icon_custom(true);
+                });
+            }
+        });
+    });
+
+    // WebDAV 虚拟磁盘挂载完成（后台 rclone 线程回调，主线程可安全访问 Rc）：
+    // 回写盘符到配置，刷新侧栏/账号页；jump 为真（挂载设置确认）时跳转到盘符
+    // （驱动器图标与 D:/H: 一致），启动自动挂载时仅静默刷新不抢焦点
+    let w = ui.as_weak();
+    let c = core.clone();
+    state.on_webdav_mounted(move |name, drive, jump| {
+        if let Some(ui) = w.upgrade() {
+            let (name, drive) = (name.to_string(), drive.to_string());
+            crate::fs::rclone::unmark_mounting(&name);
+            {
+                let mut core = c.borrow_mut();
+                if let Some(saved) = core.config.network_locations.iter_mut().find(|l| l.name == name) {
+                    saved.drive = Some(drive.clone());
+                }
+                core.config.save();
+            }
+            // 挂载后真实盘符已出现，刷新磁盘快照再重建侧栏，
+            // 否则侧栏/此电脑看不到新盘（cached_disks 仍是挂载前快照）
+            let _ = crate::fs::disk::list_disks();
+            ui_bridge::push_network_locations(&ui, &c.borrow());
+            let cur = c.borrow().active_tab().history.current().clone();
+            ui.global::<AppState>().set_nav_items(ui_bridge::build_sidebar(
+                &cur,
+                &c.borrow().collapsed_sections,
+                &c.borrow().config,
+            ));
+            // 此电脑视图刷新以显示新挂载的虚拟磁盘（驱动器图标）
+            if cur.to_string_lossy() == fs::virtualfs::THIS_PC_PATH {
+                load_current(&ui, &c);
+            }
+            if jump {
+                navigate_to(&ui, &c, PathBuf::from(&drive));
+                ui.global::<AppState>().set_status_text(format!("WebDAV 已挂载为虚拟磁盘 {}，可像本地磁盘一样浏览", drive).into());
+            }
+        }
+    });
+
+    // WebDAV 虚拟磁盘挂载失败：清除挂载中标记并刷新设置页（按钮恢复为“挂载”可重试），
+    // 状态栏提示失败原因（含 WinFsp/rclone/超时指引），原生 cloud:// 浏览不受影响
+    let w = ui.as_weak();
+    let c = core.clone();
+    state.on_webdav_mount_failed(move |name, msg| {
+        if let Some(ui) = w.upgrade() {
+            // 按账户名清除挂载中标记：全清会误清其它并发挂载账户的防重入闸门
+            // （自动挂载与手动挂载可能同时在途）
+            crate::fs::rclone::unmark_mounting(&name.to_string());
+            ui_bridge::push_network_locations(&ui, &c.borrow());
+            ui.global::<AppState>().set_status_text(msg);
         }
     });
 
@@ -3402,18 +3982,17 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             c.borrow_mut().task_control = None;
             let right_pane = ui.global::<AppState>().get_dual_pane()
                 && ui.global::<AppState>().get_active_pane().as_str() == "right";
-            load_current(&ui, &c);
-            // 双面板时右侧面板也可能是任务的源或目标，一并刷新
-            if ui.global::<AppState>().get_dual_pane() {
-                load_right(&ui, &c);
-            }
-            // 刷新完成后，选中 pending_select 中的路径
             let paths = {
                 let mut core = c.borrow_mut();
                 std::mem::take(&mut core.pending_select)
             };
             if !paths.is_empty() {
-                select_completed_paths(&ui, &c, right_pane, &paths);
+                queue_selection_after_load(right_pane, paths, false);
+            }
+            load_current(&ui, &c);
+            // 双面板时右侧面板也可能是任务的源或目标，一并刷新
+            if ui.global::<AppState>().get_dual_pane() {
+                load_right(&ui, &c);
             }
             let st = ui.global::<AppState>();
             st.set_status_text(msg);
@@ -3562,8 +4141,8 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 match fs::cloud::create_dir(&dst_str, &name, &cfg) {
                     Ok(path) => {
                         ui.global::<AppState>().set_status_text("已在云存储新建文件夹".into());
+                        queue_selection_after_load(right, vec![PathBuf::from(path)], true);
                         reload_active_pane(&ui, &c);
-                        select_created_and_edit(&ui, &c, right, &path);
                         return;
                     }
                     Err(e) => {
@@ -3598,8 +4177,8 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     if c.borrow().config.settings.background_index {
                         fs::index::add_path(&path);
                     }
+                    queue_selection_after_load(right, vec![path], true);
                     reload_active_pane(&ui, &c);
-                    select_created_and_edit(&ui, &c, right, &path.to_string_lossy());
                     return;
                 }
                 Err(error) => {
@@ -3658,8 +4237,8 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     if c.borrow().config.settings.background_index {
                         fs::index::add_path(&path);
                     }
+                    queue_selection_after_load(right, vec![path], true);
                     reload_active_pane(&ui, &c);
-                    select_created_and_edit(&ui, &c, right, &path.to_string_lossy());
                     return;
                 }
                 Err(error) => {
@@ -3976,11 +4555,9 @@ fn bind_new_menu(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             path: created.clone(),
         });
 
+        queue_selection_after_load(right, vec![created], true);
         reload_active_pane(&ui, &c);
 
-        // 刷新后的列表中定位新建项，并统一更新选择/详情状态后进入编辑。
-        let created_str = created.to_string_lossy().to_string();
-        select_created_and_edit(&ui, &c, right, &created_str);
         ui.global::<AppState>()
             .set_status_text(format!("已新建「{}」", item.name).into());
     });
@@ -4860,6 +5437,7 @@ fn bind_settings(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     if val {
                         load_right(&ui, &c);
                     } else {
+                        release_right_pane(&ui, &c);
                         // 关闭双面板时退出行内重命名，防 r-editing-index 残留锁死 InputOverlay
                         ui.invoke_clear_editing();
                     }
@@ -5047,6 +5625,8 @@ fn bind_view_and_search(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             if on {
                 load_right(&ui, &c);
             } else {
+                // 关闭后释放不可见右面板的目录模型与图标引用；再次开启会按原路径重载。
+                release_right_pane(&ui, &c);
                 // 关闭双面板时退出行内重命名：RightPane 卸载后 Escape/Enter
                 // 无法触达，残留的 r-editing-index 会永久禁用 InputOverlay
                 ui.invoke_clear_editing();
@@ -5088,8 +5668,9 @@ fn bind_view_and_search(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     });
 
     // 打开「此电脑」属性（系统信息页）
+    // 无窗口启动，避免闪出终端
     state.on_open_computer_properties(move || {
-        let _ = std::process::Command::new("explorer.exe")
+        let _ = crate::fs::hidden::hidden_command("explorer.exe")
             .arg("ms-settings:about")
             .spawn();
     });
@@ -5261,6 +5842,7 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 // 保留路径缓存使第二次重载秒完成，只有类型图标重新提取。
                 fs::thumbnail::clear_all_caches();
                 ui_bridge::clear_icon_image_cache();
+                queue_selection_after_load(right, vec![PathBuf::from(&path)], false);
                 reload_active_pane(&ui, &c);
                 let w2 = ui.as_weak();
                 let c2 = c.clone();
@@ -5301,11 +5883,17 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     st.set_quicklook_open(false);
                     return;
                 }
-                if st.get_ql_kind() == 4 || st.get_ql_kind() == 6 {
-                    // 视频(4)/音频(6)：在预览内容区之上启动 Media Foundation 子窗口播放
+                if st.get_ql_kind() == 4 {
+                    // 视频(4)：在预览内容区之上启动 Media Foundation 子窗口播放
                     fs::web_preview::stop();
                     if !path.is_empty() {
                         start_video_preview(&ui, &path);
+                    }
+                } else if st.get_ql_kind() == 6 {
+                    // 音频(6)：无画面、无原生子窗口，MF 纯音频播放 + Slint 自绘控制条
+                    fs::web_preview::stop();
+                    if !path.is_empty() {
+                        start_audio_preview(&ui, &path);
                     }
                 } else if st.get_ql_can_render() && st.get_ql_web_mode() {
                     // Markdown/HTML/PHP/Office/PDF：默认渲染视图（WebView2 子窗口覆盖内容区）
@@ -5379,6 +5967,11 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             st.set_ql_has_thumb(false);
             st.set_ql_thumb(slint::Image::default());
             st.set_ql_office_pending(false);
+            st.set_ql_video_position(0);
+            st.set_ql_video_duration(0);
+            st.set_ql_video_paused(false);
+            st.set_ql_video_muted(false);
+            st.set_ql_video_rate(1.0);
             #[cfg(windows)]
             clear_preview_window_icon();
             preview_host::hide();
@@ -5387,12 +5980,12 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     });
 
     // 视频全屏：复用当前播放器，把独立预览窗口切换为当前显示器的无边框全屏。
-    // 主窗口不参与，因此无需重新应用其无边框样式。
+    // 主窗口不参与，因此无需重新应用其无边框样式。仅视频支持，音频无全屏按钮。
     let w_fs = ui.as_weak();
     state.on_ql_toggle_video_fullscreen(move || {
         if let Some(ui) = w_fs.upgrade() {
             let st = ui.global::<AppState>();
-            if !st.get_quicklook_open() || (st.get_ql_kind() != 4 && st.get_ql_kind() != 6) {
+            if !st.get_quicklook_open() || st.get_ql_kind() != 4 {
                 return;
             }
             let fullscreen = !st.get_ql_video_fullscreen();
@@ -5409,12 +6002,26 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         }
     });
 
-    // 播放 / 暂停切换
+    // 播放 / 暂停切换（视频原生控制条与音频 Slint 控制条共用）
     let w_play = ui.as_weak();
     state.on_ql_video_toggle_play(move || {
         let paused = fs::video_preview::toggle_play();
         if let Some(ui) = w_play.upgrade() {
-            ui.global::<AppState>().set_ql_video_paused(paused);
+            let st = ui.global::<AppState>();
+            st.set_ql_video_paused(paused);
+            // 音频 Slint 控制条即时刷新（不等 250ms 轮询）
+            if st.get_ql_kind() == 6 {
+                if let Some(pw) = preview_host::window() {
+                    preview_host::sync_audio_state(
+                        &pw,
+                        st.get_ql_video_position(),
+                        st.get_ql_video_duration(),
+                        paused,
+                        st.get_ql_video_muted(),
+                        st.get_ql_video_rate(),
+                    );
+                }
+            }
         }
     });
 
@@ -5429,6 +6036,18 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 let paused = fs::video_preview::toggle_play();
                 st.set_ql_video_paused(paused);
             }
+            if st.get_ql_kind() == 6 {
+                if let Some(pw) = preview_host::window() {
+                    preview_host::sync_audio_state(
+                        &pw,
+                        0,
+                        st.get_ql_video_duration(),
+                        st.get_ql_video_paused(),
+                        st.get_ql_video_muted(),
+                        st.get_ql_video_rate(),
+                    );
+                }
+            }
         }
     });
 
@@ -5438,7 +6057,20 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         let muted = !fs::video_preview::is_muted();
         fs::video_preview::set_muted(muted);
         if let Some(ui) = w_mute.upgrade() {
-            ui.global::<AppState>().set_ql_video_muted(muted);
+            let st = ui.global::<AppState>();
+            st.set_ql_video_muted(muted);
+            if st.get_ql_kind() == 6 {
+                if let Some(pw) = preview_host::window() {
+                    preview_host::sync_audio_state(
+                        &pw,
+                        st.get_ql_video_position(),
+                        st.get_ql_video_duration(),
+                        st.get_ql_video_paused(),
+                        muted,
+                        st.get_ql_video_rate(),
+                    );
+                }
+            }
         }
     });
 
@@ -5456,6 +6088,47 @@ fn bind_hash(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             // 秒 -> 100ns
             fs::video_preview::seek_100ns(sec * 10_000_000);
             st.set_ql_video_position(sec as i32);
+            if st.get_ql_kind() == 6 {
+                if let Some(pw) = preview_host::window() {
+                    preview_host::sync_audio_state(
+                        &pw,
+                        sec as i32,
+                        dur,
+                        st.get_ql_video_paused(),
+                        st.get_ql_video_muted(),
+                        st.get_ql_video_rate(),
+                    );
+                }
+            }
+        }
+    });
+
+    // 播放速率：音频 Slint 速率 pills 与视频共用播放器（视频暂无 UI 入口，预留）
+    let w_rate = ui.as_weak();
+    state.on_ql_video_set_rate(move |rate| {
+        if let Some(ui) = w_rate.upgrade() {
+            let st = ui.global::<AppState>();
+            if !st.get_quicklook_open() {
+                return;
+            }
+            let kind = st.get_ql_kind();
+            if kind != 4 && kind != 6 {
+                return;
+            }
+            let applied = fs::video_preview::set_rate(rate);
+            st.set_ql_video_rate(applied);
+            if kind == 6 {
+                if let Some(pw) = preview_host::window() {
+                    preview_host::sync_audio_state(
+                        &pw,
+                        st.get_ql_video_position(),
+                        st.get_ql_video_duration(),
+                        st.get_ql_video_paused(),
+                        st.get_ql_video_muted(),
+                        applied,
+                    );
+                }
+            }
         }
     });
 
@@ -5646,6 +6319,41 @@ fn show_preview_window(ui: &MainWindow, path: &str, preview_generation: u64) -> 
     preview_host::sync_theme(ui, &pw);
     preview_host::push_content(ui, &pw, path);
 
+    // 音频 Slint 控制条回调 → 转发到主窗口 AppState（共用视频播放器控制）。
+    // 预览窗口复用常驻，每次打开重绑一次即可（捕获主窗口弱引用）。
+    {
+        let w = ui.as_weak();
+        pw.global::<PreviewState>().on_audio_toggle_play(move || {
+            if let Some(ui) = w.upgrade() {
+                ui.global::<AppState>().invoke_ql_video_toggle_play();
+            }
+        });
+        let w = ui.as_weak();
+        pw.global::<PreviewState>().on_audio_replay(move || {
+            if let Some(ui) = w.upgrade() {
+                ui.global::<AppState>().invoke_ql_video_replay();
+            }
+        });
+        let w = ui.as_weak();
+        pw.global::<PreviewState>().on_audio_toggle_mute(move || {
+            if let Some(ui) = w.upgrade() {
+                ui.global::<AppState>().invoke_ql_video_toggle_mute();
+            }
+        });
+        let w = ui.as_weak();
+        pw.global::<PreviewState>().on_audio_seek(move |ratio| {
+            if let Some(ui) = w.upgrade() {
+                ui.global::<AppState>().invoke_ql_video_seek(ratio);
+            }
+        });
+        let w = ui.as_weak();
+        pw.global::<PreviewState>().on_audio_set_rate(move |rate| {
+            if let Some(ui) = w.upgrade() {
+                ui.global::<AppState>().invoke_ql_video_set_rate(rate);
+            }
+        });
+    }
+
     // 每次打开都按内容尺寸重算并居中（图片/视频已在 ui_bridge 中探测尺寸）
     let kind = ui.global::<AppState>().get_ql_kind();
     center_and_size_preview(ui, &pw, kind);
@@ -5666,15 +6374,20 @@ fn show_preview_window(ui: &MainWindow, path: &str, preview_generation: u64) -> 
     // 图片：后台解码位图（避免大图阻塞 UI 线程）
     if kind == 1 {
         decode_image_async(ui, &pw, path, preview_generation);
-    } else if kind != 4 {
+    } else if kind != 4 && kind != 6 {
         // 文本/归档/文件夹/信息等内容已同步就绪，下一帧关闭加载动画。
-        // 视频（kind==4）由 on_video_size_ready 关闭。
+        // 视频（kind==4）由 on_video_size_ready 关闭，音频（kind==6）由音频就绪回调关闭。
         // 加一帧延迟：让本帧的加载占位先绘制出来，再换内容，避免透明窗口闪现。
         let pw_weak = pw.as_weak();
         let ui_weak = ui.as_weak();
         slint::Timer::single_shot(std::time::Duration::from_millis(16), move || {
             if let (Some(pw), Some(ui)) = (pw_weak.upgrade(), ui_weak.upgrade()) {
-                if ui.global::<AppState>().get_quicklook_open() && preview_generation_is_current(preview_generation) {
+                // 慢速文件系统（ql-loading-async）的内容仍在后台读取，
+                // 不在此收起加载动画，由各后台回填完成时统一收起
+                if ui.global::<AppState>().get_quicklook_open()
+                    && preview_generation_is_current(preview_generation)
+                    && !ui.global::<AppState>().get_ql_loading_async()
+                {
                     preview_host::set_loading(&pw, false);
                     ui.global::<AppState>().set_ql_loading(false);
                 }
@@ -5683,6 +6396,44 @@ fn show_preview_window(ui: &MainWindow, path: &str, preview_generation: u64) -> 
     }
 
     true
+}
+
+/// 视频内容区尺寸：窗口与视频画面尺寸一致（等比），超出上限时缩到上限内播放。
+///
+/// 横/竖屏各自独立的最大上限，且均由当前显示器工作区按比例算出（自适应屏幕，
+/// 非固定值），两套区间不同：
+/// - 横屏（宽>=高）：偏宽，宽取工作区 68%，高取工作区 75% 扣除头部/底部；
+/// - 竖屏（高>宽）：偏高窄，宽取工作区 38%，高取工作区 82% 扣除头部/底部。
+/// 小视频不放大（fit<=1），大视频等比缩小，窗口内容区即画面尺寸（无多余黑边）。
+fn video_content_size(
+    vw: f32,
+    vh: f32,
+    work_w_log: f32,
+    work_h_log: f32,
+    chrome: f32,
+) -> (f32, f32) {
+    // 横竖屏各自的最大内容区（逻辑像素），随屏幕工作区缩放
+    let (cap_w, cap_h) = if vh > vw {
+        // 竖屏：窄而高
+        let cw = (work_w_log * 0.38).clamp(340.0, 640.0);
+        let ch = (work_h_log * 0.82 - chrome).clamp(440.0, 1050.0);
+        (cw, ch)
+    } else {
+        // 横屏（含正方形）：宽而矮
+        let cw = (work_w_log * 0.68).clamp(560.0, 1440.0);
+        let ch = (work_h_log * 0.75 - chrome).clamp(340.0, 860.0);
+        (cw, ch)
+    };
+    if vw <= 0.0 || vh <= 0.0 {
+        // 分辨率未知（探测失败/慢速盘）：按横屏 16:9 占位，同样自适应屏幕，
+        // 待 MF 就绪后按真实分辨率重定窗口
+        let w = cap_w.min(cap_h * 16.0 / 9.0).max(280.0);
+        return (w, w * 9.0 / 16.0);
+    }
+    let fit = (cap_w / vw).min(cap_h / vh).min(1.0);
+    let cw = (vw * fit).max(280.0).min(cap_w.max(280.0));
+    let ch = (vh * fit).max(200.0).min(cap_h.max(200.0));
+    (cw, ch)
 }
 
 /// 按内容类型计算预览窗口尺寸并居中到主窗口所在显示器，每次打开时调用。
@@ -5786,16 +6537,14 @@ fn center_and_size_preview(ui: &MainWindow, pw: &PreviewWindow, kind: i32) {
                 (860.0_f32.min(max_w), 560.0_f32.min(max_h - chrome))
             }
         }
-        // 视频：按探测到的分辨率计算，失败时回退 16:9
+        // 视频：按真实画面尺寸定窗口，横/竖屏各自独立的自适应上限
+        // （超限等比缩小，小视频不放大；未知分辨率时按 16:9 自适应占位）
         4 => {
             let vw = st.get_ql_img_w().max(0) as f32;
             let vh = st.get_ql_img_h().max(0) as f32;
-            if vw > 0.0 && vh > 0.0 {
-                let fit = (max_w / vw).min((max_h - chrome) / vh).min(1.0);
-                ((vw * fit).max(420.0), (vh * fit).max(280.0))
-            } else {
-                (880.0_f32.min(max_w), 495.0_f32.min(max_h - chrome))
-            }
+            let work_w_log = work_w / scale;
+            let work_h_log = work_h / scale;
+            video_content_size(vw, vh, work_w_log, work_h_log, chrome)
         }
         // 归档树：偏高，便于展开层级后浏览
         5 => (760.0_f32.min(max_w), 620.0_f32.min(max_h - chrome)),
@@ -5805,7 +6554,9 @@ fn center_and_size_preview(ui: &MainWindow, pw: &PreviewWindow, kind: i32) {
         _ => (520.0_f32.min(max_w), 420.0_f32.min(max_h - chrome)),
     };
 
-    let logical_size = slint::LogicalSize::new(cw.max(420.0), ch + chrome);
+    // 视频允许更窄（竖屏），其它类型保持 420 下限；高度由内容+头部/底部组成
+    let min_w = if kind == 4 { 320.0 } else { 420.0 };
+    let logical_size = slint::LogicalSize::new(cw.max(min_w), ch + chrome);
     pw.window().set_size(logical_size);
 
     // 居中：在工作区内居中显示，考虑 Chrome（标题栏 + 间隙）
@@ -6241,6 +6992,19 @@ fn start_video_timer(ui: &MainWindow) {
                 if dur > 0 {
                     st.set_ql_video_duration((dur / 10_000_000) as i32);
                 }
+                // 音频 Slint 控制条同步（视频走原生控制条，此处仅更新其重绘数据）
+                if st.get_ql_kind() == 6 {
+                    if let Some(pw) = preview_host::window() {
+                        preview_host::sync_audio_state(
+                            &pw,
+                            st.get_ql_video_position(),
+                            st.get_ql_video_duration(),
+                            st.get_ql_video_paused(),
+                            st.get_ql_video_muted(),
+                            st.get_ql_video_rate(),
+                        );
+                    }
+                }
                 fs::video_preview::update_controls(
                     st.get_ql_video_position(),
                     st.get_ql_video_duration(),
@@ -6249,8 +7013,9 @@ fn start_video_timer(ui: &MainWindow) {
                 );
                 // 预览窗口被拖动/缩放时，原生控制条（WS_POPUP owned 窗口）不会
                 // 跟随 owner，这里在 250ms 轮询中检测原点变化并主动重定位。
+                // 音频无原生窗口，内部按 kind==4 守卫直接返回。
                 reposition_video_if_moved(&ui);
-                // 预览卡片内鼠标活动 → 显示；静止 5 秒 → 隐藏
+                // 预览卡片内鼠标活动 → 显示；静止 5 秒 → 隐藏（仅视频）
                 poll_video_controls_visibility(&ui);
             }
         },
@@ -6360,29 +7125,120 @@ fn start_video_preview(ui: &MainWindow, path: &str) {
 #[cfg(not(windows))]
 fn start_video_preview(_ui: &MainWindow, _path: &str) {}
 
+/// 启动音频预览：MF 纯音频播放（无画面、无原生子窗口），控制条由 Slint 自绘。
+/// 媒体源异步加载，`on_audio_ready` 收起加载动画并启动进度轮询。
+#[cfg(windows)]
+fn start_audio_preview(ui: &MainWindow, path: &str) {
+    let wk = ui.as_weak();
+    let gen = current_preview_generation();
+    let ok = fs::video_preview::start_audio(
+        path,
+        Box::new(move || {
+            let _ = wk.upgrade_in_event_loop(move |ui| on_audio_ready(&ui, gen));
+        }),
+    );
+    if !ok {
+        let st = ui.global::<AppState>();
+        st.set_ql_loading(false);
+        if let Some(pw) = preview_host::window() {
+            preview_host::set_loading(&pw, false);
+        }
+        st.set_status_text("音频播放启动失败（编解码器不支持）".into());
+    } else {
+        // 复位进度/速率并启动轮询（进度→ Slint 控制条）
+        let st = ui.global::<AppState>();
+        st.set_ql_video_position(0);
+        st.set_ql_video_duration(0);
+        st.set_ql_video_paused(false);
+        st.set_ql_video_muted(false);
+        st.set_ql_video_rate(1.0);
+        if let Some(pw) = preview_host::window() {
+            preview_host::sync_audio_state(&pw, 0, 0, false, false, 1.0);
+        }
+        start_video_timer(ui);
+    }
+}
+
+#[cfg(not(windows))]
+fn start_audio_preview(_ui: &MainWindow, _path: &str) {}
+
+/// 音频媒体就绪：收起加载动画。防串台：预览已关闭/切换文件时丢弃迟到回调。
+#[cfg(windows)]
+fn on_audio_ready(ui: &MainWindow, gen: u64) {
+    if !preview_generation_is_current(gen) {
+        return;
+    }
+    let st = ui.global::<AppState>();
+    if !st.get_quicklook_open() || st.get_ql_kind() != 6 {
+        return;
+    }
+    st.set_ql_loading(false);
+    if let Some(pw) = preview_host::window() {
+        preview_host::set_loading(&pw, false);
+        // 就绪即推一次状态，播放按钮立刻从加载态切到暂停图标
+        preview_host::sync_audio_state(
+            &pw,
+            st.get_ql_video_position(),
+            st.get_ql_video_duration(),
+            st.get_ql_video_paused(),
+            st.get_ql_video_muted(),
+            st.get_ql_video_rate(),
+        );
+    }
+}
+
 /// 视频原生分辨率就绪：更新副标题并显示播放器（窗口尺寸已在打开前探测）
+/// 仅视频（kind==4）走此回调；音频由 on_audio_ready 处理。
 #[cfg(windows)]
 fn on_video_size_ready(ui: &MainWindow, vw: u32, vh: u32) {
     let st = ui.global::<AppState>();
     // 预览可能已被关闭或切换到其它内容：忽略迟到的分辨率
-    if !st.get_quicklook_open() || (st.get_ql_kind() != 4 && st.get_ql_kind() != 6) {
+    if !st.get_quicklook_open() || st.get_ql_kind() != 4 {
+        return;
+    }
+    if vw == 0 || vh == 0 {
         return;
     }
 
-    // 探测失败时才记录媒体真实分辨率（探测成功在 ui_bridge 已记录）。
-    // 此时还需更新字幕：ui_bridge 探测失败时字幕只有「视频文件 · 30.5 MB」，
-    // 现在媒体就绪拿到真实尺寸后补上分辨率前缀。
-    if st.get_ql_img_w() == 0 {
-        st.set_ql_img_w(vw as i32);
-        st.set_ql_img_h(vh as i32);
-        // 只有探测失败（宽度为 0）时才需要添加分辨率前缀
-        let sub = st.get_ql_subtitle().to_string();
-        let res = format!("{}×{}", vw, vh);
-        if !sub.starts_with(&res) {
-            let sub = format!("{} 像素 · {}", res, sub);
-            st.set_ql_subtitle(sub.clone().into());
-            if let Some(pw) = preview_host::window() {
-                preview_host::set_subtitle(&pw, &sub);
+    // fill_quicklook 打开时已把宽高清零（避免沿用上一次图片的尺寸，
+    // 即“先看图片再看视频会保留图片尺寸”的旧 BUG），此处以 MF 真实分辨率覆盖，
+    // 无论之前是图片残留、探测值还是 0，最终都纠正为视频真实尺寸，不会复发。
+    // 音频（kind==6）不记录视频尺寸、不重定窗口，仅走下面的显示与定位。
+    if st.get_ql_kind() == 4 {
+        let prev_w = st.get_ql_img_w();
+        let prev_h = st.get_ql_img_h();
+        let size_changed = prev_w != vw as i32 || prev_h != vh as i32;
+        // 探测失败（prev 为 0，慢速盘/网络路径常见）或探测值与解码器不一致时更新
+        if size_changed {
+            st.set_ql_img_w(vw as i32);
+            st.set_ql_img_h(vh as i32);
+            // 副标题分辨率前缀：探测成功时 fill 已带上，此处仅在缺失或不一致时修正，
+            // 避免重复叠加“1920×1080 像素 · 1920×1080 像素 · …”
+            let new_res = format!("{}×{}", vw, vh);
+            let mut sub = st.get_ql_subtitle().to_string();
+            // 若之前带的是旧分辨率前缀（探测值与 MF 不一致），先剥离旧前缀
+            if prev_w > 0 && prev_h > 0 {
+                let old_prefix = format!("{}×{} 像素 · ", prev_w, prev_h);
+                if let Some(rest) = sub.strip_prefix(&old_prefix) {
+                    sub = rest.to_string();
+                }
+            }
+            if !sub.starts_with(&new_res) {
+                sub = format!("{} 像素 · {}", new_res, sub);
+                st.set_ql_subtitle(sub.clone().into());
+                if let Some(pw) = preview_host::window() {
+                    preview_host::set_subtitle(&pw, &sub);
+                }
+            }
+            // 迟到分辨率：窗口打开时用的是 16:9 自适应占位（或探测值），现在按真实
+            // 画面比例重定窗口（横/竖屏各自独立的自适应上限），使窗口与画面一致。
+            // 全屏时不重定窗口尺寸，仅重定位子窗口。
+            if !st.get_ql_video_fullscreen() {
+                if let Some(pw) = preview_host::window() {
+                    center_and_size_preview(ui, &pw, 4);
+                    // set_size 生效有延迟，排两次延迟重定位确保子窗口最终对齐新窗口
+                    schedule_video_repositions(ui, &[40, 180]);
+                }
             }
         }
     }
@@ -6414,7 +7270,72 @@ fn start_web_preview(ui: &MainWindow, path: &str) {
     if hwnd == 0 {
         return;
     }
+    let st = ui.global::<AppState>();
     let dark = ui.global::<Theme>().get_dark();
+
+    // 慢速文件系统（WebDAV/SMB 挂载盘，fill_quicklook 已置 ql-loading-async）：
+    // url_for 需要读文件才能解析 URL（Markdown 全文 / Office 文本回退 / PDF stat），
+    // 改为后台解析——先以 about:blank 占位并隐藏渲染层，解析完成后 navigate 升级。
+    if st.get_ql_loading_async() {
+        let ok = fs::web_preview::start_placeholder(hwnd, rect);
+        if !ok {
+            st.set_ql_web_mode(false);
+            st.set_ql_office_pending(false);
+            if let Some(pw) = preview_host::window() {
+                pw.global::<PreviewState>().set_web_mode(false);
+            }
+            st.set_status_text("渲染视图不可用（需要 WebView2 运行时），已切换到源码视图".into());
+            return;
+        }
+        let content = fs::web_preview::WebContent {
+            path: path.to_string(),
+            dark,
+        };
+        let path = path.to_string();
+        let gen = current_preview_generation();
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let url = fs::web_preview::url_for(&content);
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(ui) = weak.upgrade() else { return };
+                let st = ui.global::<AppState>();
+                // 预览已关闭或已切换文件：丢弃迟到的解析结果
+                if !st.get_quicklook_open() || st.get_sel_path() != path.as_str() {
+                    return;
+                }
+                match url {
+                    // Office 已装未缓存：url 为占位页，交后台转换升级流程
+                    // （maybe_upgrade 完成后自行导航并清除挂起态）
+                    Some(url) if url == "about:blank" => {
+                        let _ = fs::web_preview::navigate(&url);
+                        st.set_ql_office_pending(true);
+                        maybe_upgrade_office_preview(&ui, &path, gen);
+                    }
+                    Some(url) => {
+                        let _ = fs::web_preview::navigate(&url);
+                        st.set_ql_office_pending(false);
+                        st.set_ql_loading(false);
+                        st.set_ql_loading_async(false);
+                        if let Some(pw) = preview_host::window() {
+                            preview_host::set_loading(&pw, false);
+                        }
+                    }
+                    // 解析失败：回退源码视图（正文由后台文本读取回填）
+                    None => {
+                        st.set_ql_web_mode(false);
+                        st.set_ql_office_pending(false);
+                        if let Some(pw) = preview_host::window() {
+                            pw.global::<PreviewState>().set_web_mode(false);
+                        }
+                        st.set_ql_loading(false);
+                        st.set_ql_loading_async(false);
+                    }
+                }
+            });
+        });
+        return;
+    }
+
     let ok = fs::web_preview::start(
         hwnd,
         rect,
@@ -6443,26 +7364,28 @@ fn start_web_preview(_ui: &MainWindow, _path: &str) {}
 /// 转换失败时清除挂起态并导航到文本回退版，避免加载条永久悬挂。
 #[cfg(windows)]
 fn maybe_upgrade_office_preview(ui: &MainWindow, path: &str, generation: u64) {
-    let office_src = Path::new(path);
-    if !crate::fs::office_preview::is_office_doc(office_src)
-        || crate::fs::office_preview::cached_pdf_if_fresh(office_src).is_some()
-    {
-        return;
-    }
-    // 未安装对应 Office：url_for 已直接回退文本版，无需后台任务
-    let installed = office_src
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(crate::fs::office_preview::office_app_for_ext)
-        .map(crate::fs::office_preview::is_office_installed)
-        .unwrap_or(false);
-    if !installed {
-        return;
-    }
-    let ql_path = path.to_string();
+    // 前置检查（Office 缓存 stat / 注册表安装检测）放后台执行：慢速文件系统上
+    // 这些是网络请求，不能在 UI 线程同步做（本地路径仅是稍后判定，行为不变）
     let dark = ui.global::<Theme>().get_dark();
+    let ql_path = path.to_string();
     let weak = ui.as_weak();
     std::thread::spawn(move || {
+        let office_src = Path::new(&ql_path);
+        if !crate::fs::office_preview::is_office_doc(office_src)
+            || crate::fs::office_preview::cached_pdf_if_fresh(office_src).is_some()
+        {
+            return;
+        }
+        // 未安装对应 Office：url_for 已直接回退文本版，无需后台任务
+        let installed = office_src
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::fs::office_preview::office_app_for_ext)
+            .map(crate::fs::office_preview::is_office_installed)
+            .unwrap_or(false);
+        if !installed {
+            return;
+        }
         let pdf =
             crate::fs::office_preview::convert_to_pdf_blocking(Path::new(&ql_path));
         // 成功：PDF 的 file:// URL（导航前复验魔数，防清理线程误删/残留 partial）；
@@ -7380,5 +8303,68 @@ mod tests {
         assert_eq!(startup_path("quick"), home);
         assert_eq!(startup_path("last"), home_start_path());
         assert_eq!(startup_path("unknown"), home_start_path());
+    }
+
+    /// 横屏小视频不放大：窗口内容区即原生尺寸
+    #[test]
+    fn video_landscape_small_keeps_native_size() {
+        // 1080p 工作区：1920×1040，chrome 98
+        let (cw, ch) = video_content_size(852.0, 480.0, 1920.0, 1040.0, 98.0);
+        assert!((cw - 852.0).abs() < 1.0, "横屏小视频应保持原生宽：{cw}");
+        assert!((ch - 480.0).abs() < 1.0, "横屏小视频应保持原生高：{ch}");
+    }
+
+    /// 横屏大视频等比缩小到横屏上限内，且保持宽高比
+    #[test]
+    fn video_landscape_large_fits_cap_preserving_ratio() {
+        let (cw, ch) = video_content_size(3840.0, 2176.0, 1920.0, 1040.0, 98.0);
+        // 横屏上限：宽 1920*0.68≈1305，高 1040*0.75-98=682
+        assert!(cw <= 1306.0 + 1.0 && ch <= 682.0 + 1.0, "超限视频应缩到上限内：{cw}×{ch}");
+        let ratio = cw / ch;
+        let src = 3840.0 / 2176.0;
+        assert!((ratio - src).abs() < 0.02, "须保持宽高比：{ratio} vs {src}");
+        // 横屏结果仍是横向
+        assert!(cw > ch, "横屏视频窗口应为横向：{cw}×{ch}");
+    }
+
+    /// 竖屏小视频：窗口为竖向，且与横屏上限不同
+    #[test]
+    fn video_portrait_window_is_portrait_and_differs_from_landscape() {
+        let (pw, ph) = video_content_size(480.0, 856.0, 1920.0, 1040.0, 98.0);
+        assert!(ph > pw, "竖屏视频窗口应为竖向：{pw}×{ph}");
+        // 竖屏上限宽 1920*0.38≈730→钳制640，横屏上限宽≈1305，两者不同
+        let (lw, lh) = video_content_size(856.0, 480.0, 1920.0, 1040.0, 98.0);
+        assert!(lw > lh, "横屏对照应为横向");
+        assert!(
+            (pw - lw).abs() > 1.0 || (ph - lh).abs() > 1.0,
+            "横竖屏窗口尺寸不能一样：竖屏{pw}×{ph} 横屏{lw}×{lh}"
+        );
+    }
+
+    /// 超大竖屏等比缩小且保持比例
+    #[test]
+    fn video_portrait_large_preserves_ratio() {
+        let (cw, ch) = video_content_size(1080.0, 1920.0, 1920.0, 1040.0, 98.0);
+        let src = 1080.0 / 1920.0;
+        assert!((cw / ch - src).abs() < 0.02, "竖屏大视频须保持比例");
+        assert!(ch > cw);
+    }
+
+    /// 未知分辨率时按 16:9 自适应占位（非固定 880×495），且随屏幕缩放
+    #[test]
+    fn video_unknown_uses_adaptive_placeholder() {
+        let (w1, h1) = video_content_size(0.0, 0.0, 1920.0, 1040.0, 98.0);
+        let (w2, h2) = video_content_size(0.0, 0.0, 2560.0, 1440.0, 98.0);
+        assert!((w1 / h1 - 16.0 / 9.0).abs() < 0.02);
+        assert!((w2 / h2 - 16.0 / 9.0).abs() < 0.02);
+        assert!(w2 > w1, "占位应随屏幕变大而变大，而非固定值：{w1} vs {w2}");
+    }
+
+    /// 自适应屏幕：同一视频在大屏上的窗口不小于小屏
+    #[test]
+    fn video_content_adapts_to_screen_size() {
+        let (s1w, s1h) = video_content_size(3840.0, 2176.0, 1366.0, 768.0, 98.0);
+        let (s2w, s2h) = video_content_size(3840.0, 2176.0, 2560.0, 1440.0, 98.0);
+        assert!(s2w >= s1w && s2h >= s1h, "大屏窗口应不小于小屏：{s1w}×{s1h} vs {s2w}×{s2h}");
     }
 }

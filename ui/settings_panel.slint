@@ -963,15 +963,57 @@ export component SettingsPanel inherits Rectangle {
                                 VerticalLayout { alignment: center; }
                             }
                             for acc[i] in AppState.net-locations: SettingRow {
-                                name: acc.kind == "smb" ? acc.name : acc.name + " · " + acc.kind;
+                                name: acc.kind == "smb" ? acc.name
+                                    : acc.kind == "webdav"
+                                        ? acc.name + " · " + acc.kind + (acc.mounted ? " · 已挂载" : (acc.mounting ? " · 挂载中" : " · 未挂载"))
+                                        : acc.name + " · " + acc.kind;
                                 desc: acc.kind == "smb"
                                     ? (acc.drive == "" ? acc.server : acc.server + " · 已挂载到 " + acc.drive)
-                                    : acc.server;
+                                    : acc.kind == "webdav"
+                                        ? (acc.mounted && acc.drive != ""
+                                            ? acc.server + " · 已挂载到 " + acc.drive + "（虚拟磁盘，同本地盘在“此电脑”浏览）"
+                                            : (acc.mounting
+                                                ? (acc.mount-setting != ""
+                                                    ? acc.server + " · 正在挂载到 " + acc.mount-setting + "...请稍候，成功后按钮变为“取消挂载”"
+                                                    : acc.server + " · 正在挂载...请稍候")
+                                                : (acc.mount-setting != ""
+                                                    ? acc.server + " · 未挂载（已设置盘符 " + acc.mount-setting + "，点击“挂载”挂载）"
+                                                    : acc.server + " · 未挂载（未设置盘符，点击“挂载”选择盘符）")))
+                                        : acc.server;
                                 last: i == AppState.net-locations.length - 1;
-                                VerticalLayout { alignment: center; Btn {
-                                    label: acc.kind == "smb" ? "断开并移除" : "移除";
-                                    clicked => { AppState.remove-network-location(acc.name); }
-                                } }
+                                VerticalLayout {
+                                    alignment: center;
+                                    // WebDAV：挂载中显示禁用态防重入；未挂载显示「挂载」；
+                                    // 已挂载必须显示「取消挂载（X:)」，不得继续显示为挂载。
+                                    if acc.kind == "webdav": HorizontalLayout {
+                                        spacing: 8px;
+                                        if acc.mounting: Btn {
+                                            label: "挂载中...";
+                                            clicked => { AppState.status-text = acc.mount-setting != "" ? "正在挂载到 " + acc.mount-setting + "，请稍候..." : "正在挂载，请稍候..."; }
+                                        }
+                                        if !acc.mounted && !acc.mounting: Btn {
+                                            label: "挂载";
+                                            primary: true;
+                                            clicked => { AppState.open-mount-dialog(acc.name); }
+                                        }
+                                        if acc.mounted && !acc.mounting: Btn {
+                                            label: acc.drive != "" ? "取消挂载 (" + acc.drive + ")" : "取消挂载";
+                                            clicked => { AppState.unmount-network-location(acc.name); }
+                                        }
+                                        if acc.mounted && !acc.mounting: Btn {
+                                            label: "挂载设置";
+                                            clicked => { AppState.open-mount-dialog(acc.name); }
+                                        }
+                                        Btn {
+                                            label: "移除";
+                                            clicked => { AppState.remove-network-location(acc.name); }
+                                        }
+                                    }
+                                    if acc.kind != "webdav": Btn {
+                                        label: acc.kind == "smb" ? "断开并移除" : "移除";
+                                        clicked => { AppState.remove-network-location(acc.name); }
+                                    }
+                                }
                             }
                         }
 

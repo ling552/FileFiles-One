@@ -1,0 +1,375 @@
+// WebDAV 挂载设置对话框（设置页「挂载 / 挂载设置」打开）：
+// 挂载盘符（必选）/ 读写模式（可写/只读）/ 最大空间 / 图标（预设 + 自定义文件），
+// 确认后经内嵌 rclone 把该 WebDAV 挂载为虚拟硬盘（依赖 WinFsp）。
+// 已挂载时标题与按钮切换为重挂/取消挂载逻辑，盘符必须手动选择，不得自动预选。
+import { Theme } from "theme.slint";
+import { AppState } from "globals.slint";
+import { LineEdit } from "std-widgets.slint";
+import { FileIcon } from "file_icon.slint";
+
+// 盘符选择芯片：可选态点击选中，已选中高亮
+component LetterChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked;
+    height: 30px;
+    border-radius: 8px;
+    background: selected ? Theme.primary : (chip-touch.has-hover ? Theme.primary-hover : Theme.surface-2);
+    border-width: selected ? 0px : 1px;
+    border-color: selected ? transparent : Theme.border;
+    Text {
+        text: root.label;
+        font-size: 13px;
+        font-weight: selected ? 700 : 400;
+        color: selected ? #ffffff : Theme.text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    chip-touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+// 已占用盘符：置灰禁用，点击无反应
+component BusyChip inherits Rectangle {
+    in property <string> label;
+    height: 30px;
+    border-radius: 8px;
+    background: Theme.dark ? rgba(255,255,255,0.05) : rgba(0,0,0,0.04);
+    border-width: 1px;
+    border-color: Theme.border;
+    opacity: 0.55;
+    Text {
+        text: root.label;
+        font-size: 12px;
+        color: Theme.muted;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// 读写模式二选一卡片
+component ModeCard inherits Rectangle {
+    in property <string> title;
+    in property <string> desc;
+    in property <bool> selected;
+    callback clicked;
+    height: 52px;
+    border-radius: 10px;
+    background: selected ? Theme.primary.with-alpha(0.10) : Theme.surface-2;
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? Theme.primary : Theme.border;
+    HorizontalLayout {
+        padding: 10px;
+        padding-left: 12px;
+        spacing: 10px;
+        Rectangle {
+            width: 16px; height: 16px; y: 2px;
+            border-radius: 8px;
+            border-width: selected ? 5px : 1px;
+            border-color: selected ? Theme.primary : Theme.muted;
+            background: white;
+        }
+        VerticalLayout {
+            spacing: 2px;
+            Text { text: root.title; font-size: 12px; font-weight: 600; color: selected ? Theme.primary : Theme.text; }
+            Text { text: root.desc; font-size: 10px; color: Theme.muted; }
+        }
+    }
+    card-touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+// 图标预设选项：小图标 + 名称，选中高亮（含"默认"数据盘图标）
+component IconChoice inherits Rectangle {
+    in property <string> icon-class; // drive / drive-cloud / drive-net / drive-folder / drive-vault / drive-star
+    in property <string> caption;
+    in property <bool> selected;
+    callback clicked;
+    width: 62px;
+    height: 72px;
+    border-radius: 8px;
+    background: selected ? Theme.primary.with-alpha(0.12) : (choice-touch.has-hover ? Theme.primary.with-alpha(0.06) : Theme.surface-2);
+    border-width: selected ? 2px : 1px;
+    border-color: selected ? Theme.primary : Theme.border;
+    VerticalLayout {
+        padding: 4px;
+        alignment: center;
+        spacing: 2px;
+        FileIcon {
+            icon-class: root.icon-class;
+            box: 38px;
+            radius: 9px;
+        }
+        Text {
+            text: root.caption;
+            font-size: 10px;
+            color: root.selected ? Theme.primary : Theme.muted;
+            horizontal-alignment: center;
+        }
+    }
+    choice-touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+export component MountDialog inherits Rectangle {
+    visible: AppState.mount-dialog-open;
+    if AppState.mount-dialog-open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #12223433;
+        TouchArea { clicked => { AppState.mount-dialog-open = false; } }
+
+        Rectangle {
+            width: 560px;
+            height: 660px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: Theme.radius-dialog;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: #ffffffcc;
+            drop-shadow-blur: 40px;
+            drop-shadow-color: #1c304a4d;
+            clip: true;
+            TouchArea {}
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                Text {
+                    text: AppState.mount-mounted ? "WebDAV 挂载设置（已挂载）" : "挂载 WebDAV 虚拟磁盘";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Theme.text;
+                }
+                Text {
+                    text: "账户：" + AppState.mount-target-name
+                        + (AppState.mount-mounted && AppState.mount-current-drive != "" ? "　·　已挂载到 " + AppState.mount-current-drive : "　·　未挂载");
+                    font-size: 11px;
+                    color: AppState.mount-mounted ? Theme.primary : Theme.muted;
+                    font-weight: AppState.mount-mounted ? 600 : 400;
+                }
+                Text {
+                    text: "挂载后以虚拟硬盘显示在「此电脑」与左侧栏，可像本地磁盘一样浏览、打开与读写。进入挂载盘看到的即真实文件与文件夹图标，不再走云端列表。";
+                    font-size: 11px;
+                    color: Theme.muted;
+                    wrap: word-wrap;
+                }
+
+                Flickable {
+                    vertical-stretch: 1;
+                    viewport-height: form.preferred-height;
+                    form := VerticalLayout {
+                        spacing: 12px;
+
+                        // ── 1. 挂载盘符（必须手动选择）──
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text { text: "1. 挂载盘符（必选，未选择前无法挂载）"; font-size: 12px; font-weight: 600; color: Theme.text; }
+                            // 可选盘符：点击选中
+                            VerticalLayout {
+                                spacing: 6px;
+                                for row in 3: HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    for col in 8: Rectangle {
+                                        width: 36px;
+                                        height: 30px;
+                                        if row * 8 + col < AppState.mount-available-drives.length: LetterChip {
+                                            width: 100%;
+                                            height: 100%;
+                                            label: AppState.mount-available-drives[row * 8 + col];
+                                            selected: AppState.mount-drive == AppState.mount-available-drives[row * 8 + col];
+                                            clicked => {
+                                                AppState.mount-drive = AppState.mount-available-drives[row * 8 + col];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if AppState.mount-drive == "": Text {
+                                text: "请点击上方选择一个盘符（如 Z），挂载后显示为 Z: 虚拟硬盘。";
+                                font-size: 11px; color: #d13438; wrap: word-wrap;
+                            }
+                            if AppState.mount-drive != "": Text {
+                                text: "将挂载为 " + AppState.mount-drive + ":，显示在「此电脑」与左侧栏，等同本地磁盘。";
+                                font-size: 11px; color: Theme.primary; wrap: word-wrap;
+                            }
+                            if AppState.mount-busy-drives.length > 0: VerticalLayout {
+                                spacing: 4px;
+                                Text { text: "以下盘符已被占用，不可选："; font-size: 11px; color: Theme.muted; }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    for b[i] in AppState.mount-busy-drives: BusyChip {
+                                        width: 36px;
+                                        label: b;
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── 2. 读写模式（可写 / 只读二选一）──
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text { text: "2. 读写模式"; font-size: 12px; font-weight: 600; color: Theme.text; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                ModeCard {
+                                    horizontal-stretch: 1;
+                                    title: "可写";
+                                    desc: "可在挂载盘中新建/修改/删除";
+                                    selected: !AppState.mount-readonly;
+                                    clicked => { AppState.mount-readonly = false; }
+                                }
+                                ModeCard {
+                                    horizontal-stretch: 1;
+                                    title: "只读";
+                                    desc: "禁止写入，防止误改云端";
+                                    selected: AppState.mount-readonly;
+                                    clicked => { AppState.mount-readonly = true; }
+                                }
+                            }
+                        }
+
+                        // ── 3. 最大空间 ──
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text { text: "3. 最大空间（GB，留空则不限制）"; font-size: 12px; font-weight: 600; color: Theme.text; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                LineEdit {
+                                    width: 180px;
+                                    text <=> AppState.mount-max-size;
+                                    placeholder-text: "如: 512";
+                                    input-type: InputType.number;
+                                    changed has-focus => { AppState.input-active = self.has-focus; }
+                                }
+                                Text { text: "容量条按此值显示"; font-size: 11px; color: Theme.muted; vertical-alignment: center; }
+                            }
+                        }
+
+                        // ── 4. 图标（不设置使用数据盘图标）──
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text { text: "4. 图标（不设置则使用数据盘图标，与 D:/H: 等非系统盘一致）"; font-size: 12px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: center;
+                                IconChoice {
+                                    icon-class: "drive";
+                                    caption: "默认";
+                                    selected: AppState.mount-icon == "" && !AppState.mount-icon-custom;
+                                    clicked => { AppState.mount-icon = ""; AppState.mount-icon-custom = false; }
+                                }
+                                IconChoice {
+                                    icon-class: "drive-cloud";
+                                    caption: "云端";
+                                    selected: AppState.mount-icon == "cloud";
+                                    clicked => { AppState.mount-icon = "cloud"; AppState.mount-icon-custom = false; }
+                                }
+                                IconChoice {
+                                    icon-class: "drive-net";
+                                    caption: "网络";
+                                    selected: AppState.mount-icon == "net";
+                                    clicked => { AppState.mount-icon = "net"; AppState.mount-icon-custom = false; }
+                                }
+                                IconChoice {
+                                    icon-class: "drive-folder";
+                                    caption: "文件夹";
+                                    selected: AppState.mount-icon == "folder";
+                                    clicked => { AppState.mount-icon = "folder"; AppState.mount-icon-custom = false; }
+                                }
+                                IconChoice {
+                                    icon-class: "drive-vault";
+                                    caption: "保险箱";
+                                    selected: AppState.mount-icon == "vault";
+                                    clicked => { AppState.mount-icon = "vault"; AppState.mount-icon-custom = false; }
+                                }
+                                IconChoice {
+                                    icon-class: "drive-star";
+                                    caption: "收藏";
+                                    selected: AppState.mount-icon == "star";
+                                    clicked => { AppState.mount-icon = "star"; AppState.mount-icon-custom = false; }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: center;
+                                Rectangle {
+                                    width: 120px; height: 28px; border-radius: 6px;
+                                    background: pick-touch.has-hover ? Theme.primary-hover : Theme.surface-2;
+                                    border-width: 1px; border-color: Theme.border;
+                                    Text {
+                                        text: "选择图标文件…";
+                                        font-size: 11px; color: Theme.text;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
+                                    pick-touch := TouchArea { clicked => { AppState.pick-mount-icon(); } }
+                                }
+                                if AppState.mount-icon-custom: Text {
+                                    text: AppState.mount-icon;
+                                    font-size: 10px;
+                                    color: Theme.muted;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+                                if AppState.mount-icon-custom: Rectangle {
+                                    width: 52px; height: 28px; border-radius: 6px;
+                                    background: clear-touch.has-hover ? Theme.primary-hover : Theme.surface;
+                                    border-width: 1px; border-color: Theme.border;
+                                    Text { text: "清除"; font-size: 11px; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; }
+                                    clear-touch := TouchArea { clicked => { AppState.mount-icon = ""; AppState.mount-icon-custom = false; } }
+                                }
+                            }
+                            Text {
+                                text: "支持 .ico / .exe / .dll 文件图标；自定义文件在两种图标模式下均显示位图。";
+                                font-size: 10px; color: Theme.muted; wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: end;
+
+                    Rectangle {
+                        width: 80px; height: 34px; border-radius: 6px;
+                        background: cancel-touch.has-hover ? Theme.primary-hover : Theme.surface;
+                        border-width: 1px; border-color: Theme.border;
+                        Text { text: "取消"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; }
+                        cancel-touch := TouchArea {
+                            clicked => { AppState.mount-dialog-open = false; AppState.input-active = false; }
+                        }
+                    }
+                    if AppState.mount-mounted: Rectangle {
+                        width: 100px; height: 34px; border-radius: 6px;
+                        background: unmount-touch.has-hover ? Theme.primary-hover : Theme.surface;
+                        border-width: 1px; border-color: Theme.border;
+                        Text { text: "取消挂载"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; font-size: 12px; }
+                        unmount-touch := TouchArea {
+                            clicked => {
+                                AppState.mount-dialog-open = false;
+                                AppState.unmount-network-location(AppState.mount-target-name);
+                            }
+                        }
+                    }
+                    Rectangle {
+                        width: AppState.mount-mounted ? 150px : 120px; height: 34px; border-radius: 6px;
+                        background: AppState.mount-drive == "" ? Theme.border : (ok-touch.has-hover ? #1a86e0 : Theme.primary);
+                        opacity: AppState.mount-drive == "" ? 0.6 : 1;
+                        Text {
+                            text: AppState.mount-mounted ? "保存并重新挂载" : "挂载";
+                            color: white; horizontal-alignment: center; vertical-alignment: center;
+                            font-size: 12px;
+                        }
+                        ok-touch := TouchArea {
+                            enabled: AppState.mount-drive != "";
+                            clicked => { AppState.apply-mount(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

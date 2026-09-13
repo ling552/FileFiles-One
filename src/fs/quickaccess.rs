@@ -183,9 +183,10 @@ pub fn pin(path: &str) -> bool {
 /// 在真实文件夹路径的上下文菜单里不存在，故优先通过 QA 子项调用；
 /// 失败再回退到真实路径动词。
 #[cfg(windows)]
-#[allow(dead_code)]
 pub fn unpin(path: &str) -> bool {
-    let ok = invoke_qa_verb(path, "unpinfromhome") || invoke_verb(path, "unpinfromhome");
+    let ok = invoke_qa_verb(path, "unpinfromhome")
+        || invoke_qa_verb(path, "removefromhome")
+        || invoke_verb(path, "unpinfromhome");
     if ok {
         invalidate();
     }

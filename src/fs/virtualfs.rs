@@ -64,6 +64,17 @@ pub fn friendly_title(path: &str) -> String {
 pub fn resolve(path: &str, config: &mut AppConfig) -> Option<Vec<Entry>> {
     if path == THIS_PC_PATH {
         let mut entries = super::disk::disk_entries();
+        // WebDAV 挂载盘（rclone 虚拟磁盘）：图标预设覆盖盘符条目的图标类，
+        // 使挂载盘在此电脑中显示用户选择的预设字形而非通用数据盘图标
+        for e in entries.iter_mut() {
+            if e.icon_class == "drive" {
+                if let Some(letter) = e.path.chars().next() {
+                    if let Some(cls) = super::cloud::mounted_drive_icon_class(config, letter) {
+                        e.icon_class = cls;
+                    }
+                }
+            }
+        }
         entries.extend(super::devices::list_devices());
         // 云存储根：每个 FTP/WebDAV/SFTP 账号作为可进入的文件夹
         entries.extend(super::cloud::list_cloud_roots(config));
@@ -79,9 +90,9 @@ pub fn resolve(path: &str, config: &mut AppConfig) -> Option<Vec<Entry>> {
         Some(super::recyclebin::list_recycle_bin())
     } else if path == "network://" {
         let mut entries = super::network::list_network_drives();
+        // 已保存位置（含 SMB 与 FTP/WebDAV/SFTP 虚拟路径）即为全量，
+        // 不再额外拼接 cloud_roots（旧实现导致每个云账号出现两次）
         entries.extend(super::network::list_saved(&config.network_locations));
-        // 云存储同样在网络位置中聚合显示
-        entries.extend(super::cloud::list_cloud_roots(config));
         Some(entries)
     } else {
         None

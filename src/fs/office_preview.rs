@@ -197,13 +197,64 @@ fn mark_failed(src: &Path, meta: &std::fs::Metadata) {
     }
 }
 
+/// 目标 Office 应用是否正在运行。
+///
+/// COM 自动化（`New-Object -ComObject Word.Application`）在目标应用已运行时
+/// 会复用用户正在使用的实例，脚本末尾的 `Quit` 会连带关闭用户尚未保存的文档，
+/// `Visible=$false`/`DisplayAlerts` 也会作用到用户的窗口上。因此一旦检测到目标
+/// 应用在运行就直接放弃本次转换，由调用方回退文本预览 —— 用户数据安全优先。
+#[cfg(windows)]
+fn office_busy(app: OfficeApp) -> bool {
+    let exe = match app {
+        OfficeApp::Word => "WINWORD.EXE",
+        OfficeApp::Excel => "EXCEL.EXE",
+        OfficeApp::PowerPoint => "POWERPNT.EXE",
+    };
+    let filter = format!("IMAGENAME eq {}", exe);
+    let Ok(out) = super::hidden::hidden_command("tasklist")
+        .args(["/FI", &filter, "/NH"])
+        .output()
+    else {
+        // 拿不到进程列表时保守当作在运行：宁可退化为文本预览，也不误关用户文档
+        return true;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .to_ascii_uppercase()
+        .contains(exe)
+}
+
+#[cfg(not(windows))]
+fn office_busy(_app: OfficeApp) -> bool {
+    false
+}
+
+/// 同一时刻只允许一个 Office 转换：选中预热与打开预览可能同时对同一文件发起
+/// 转换，两个 Office 实例同时写同一个缓存文件会产出损坏 PDF。
+static CONVERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 阻塞式转换：有缓存直接返回；否则调用 Office 转 PDF（后台线程调用）。
 /// Office 未安装/转换失败返回 None，调用方回退文本预览。
 /// 同一文件 10 分钟内失败过则直接返回 None（不再重复拉起 Office 空等超时）。
+/// 全局串行执行，且在拿到锁后重查缓存与失败记忆 —— 等锁期间别的线程可能
+/// 已经把同一文件转好了。
 pub fn convert_to_pdf_blocking(src: &Path) -> Option<PathBuf> {
     let meta = std::fs::metadata(src).ok()?;
     if meta.len() > 200 * 1024 * 1024 {
         return None;
+    }
+    if recently_failed(src, &meta) {
+        return None;
+    }
+    if let Some(hit) = cached_pdf_if_fresh(src) {
+        return Some(hit);
+    }
+    // 串行化：等锁期间别的线程可能已把同一文件转好或刚失败，拿到锁后重新判定
+    let _guard = CONVERT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 拿锁后重读 metadata：等锁期间文件可能已被修改，用旧 meta（size/mtime）
+    // 计算的缓存键会把新内容写到旧条目下，产生陈旧缓存
+    let meta = std::fs::metadata(src).ok().unwrap_or(meta);
+    if let Some(hit) = cached_pdf_if_fresh(src) {
+        return Some(hit);
     }
     if recently_failed(src, &meta) {
         return None;
@@ -213,9 +264,6 @@ pub fn convert_to_pdf_blocking(src: &Path) -> Option<PathBuf> {
         None
     };
     let out = cached_pdf_path_for(src, &meta);
-    if let Some(hit) = cached_pdf_if_fresh(src) {
-        return Some(hit);
-    }
     let ext = src
         .extension()
         .and_then(|e| e.to_str())
@@ -224,6 +272,11 @@ pub fn convert_to_pdf_blocking(src: &Path) -> Option<PathBuf> {
     let app = office_app_for_ext(&ext)?;
     if !is_office_installed(app) {
         return fail(src, &meta);
+    }
+    // 用户正在使用该 Office：放弃转换（理由见 office_busy）。
+    // 不记入失败记忆 —— 用户关掉 Office 后应能立即重试。
+    if office_busy(app) {
+        return None;
     }
     if std::fs::create_dir_all(cache_dir()).is_err() {
         return fail(src, &meta);
@@ -285,15 +338,23 @@ fn run_office_export(src: &Path, dst: &Path, app: OfficeApp) -> Result<(), Strin
             src = ps_quote(&src_str),
             dst = ps_quote(&dst_str),
         ),
+        // 注意：PowerPoint 不能用 ExportAsFixedFormat 导出 PDF ——
+        // 该方法第二个参数 PpFixedFormatType 在 PowerPoint 类型库里是 Object，
+        // PowerShell 后期绑定传 int 必然抛「无法将类型"int"的"2"值转换为类型"Object"」，
+        // 导出永远失败、预览只能回退纯文本（旧版本即因此丢失 PPT 版式）。
+        // SaveAs(路径, 32) 的 32 是 ppSaveAsPDF，实测可稳定导出。
         OfficeApp::PowerPoint => format!(
             "$ErrorActionPreference='Stop'\r\n\
              $src='{src}'; $dst='{dst}'\r\n\
              $p=New-Object -ComObject PowerPoint.Application\r\n\
              try {{\r\n\
-             \x20 $pres=$p.Presentations.Open($src, $true, $true, $false)\r\n\
-             \x20 $pres.ExportAsFixedFormat($dst, 2)\r\n\
+             \x20 $p.DisplayAlerts=1\r\n\
+             \x20 $pres=$p.Presentations.Open($src, $true, $false, $false)\r\n\
+             \x20 if (Test-Path $dst) {{ Remove-Item $dst -Force -ErrorAction SilentlyContinue }}\r\n\
+             \x20 $pres.SaveAs($dst, 32)\r\n\
              \x20 $pres.Close()\r\n\
-             }} finally {{ $p.Quit() }}\r\n",
+             }} finally {{ $p.Quit(); \
+             [System.Runtime.Interopservices.Marshal]::ReleaseComObject($p)|Out-Null }}\r\n",
             src = ps_quote(&src_str),
             dst = ps_quote(&dst_str),
         ),
@@ -320,13 +381,17 @@ fn run_office_export(_src: &Path, _dst: &Path, _app: OfficeApp) -> Result<(), St
 }
 
 /// 执行 ps1 脚本并等待（轮询 try_wait 实现超时杀进程）
+/// 无窗口：经 hidden_command 创建（CREATE_NO_WINDOW），预览 Office 文档时
+/// 不再闪出 PowerShell 终端黑框。
 #[cfg(windows)]
 fn run_powershell_script(ps_path: &Path, timeout: Duration) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("powershell")
+    use std::process::Stdio;
+    let mut child = super::hidden::hidden_command("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-ExecutionPolicy",
             "Bypass",
             "-File",
@@ -387,6 +452,85 @@ fn cleanup_old_cache() {
             let _ = std::fs::remove_file(&p);
         }
     }
+}
+
+// ---------- 选中即预热 ----------
+
+/// 预热请求发送端：文件列表选中项变化时投递，由专职线程串行消化。
+/// Sender 仅在消费线程创建成功时安装（None = 预热不可用），
+/// 避免线程创建失败后请求进入无人消费的死信箱。
+static WARMUP_TX: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::mpsc::Sender<PathBuf>>>> =
+    std::sync::OnceLock::new();
+
+/// 请求预热（非阻塞，UI 线程可安全调用）：文件在列表里被选中时调用，
+/// 让 Office 文档提前转出 PDF 缓存，用户按空格预览时命中缓存秒开，
+/// 不必再等 Office 冷启动（10~20 秒）。非 Office 文档直接忽略。
+pub fn request_warmup(path: &Path) {
+    if !is_office_doc(path) {
+        return;
+    }
+    let tx = WARMUP_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        let worker = std::thread::Builder::new()
+            .name("ff-office-warmup".into())
+            .spawn(move || warmup_worker(rx));
+        std::sync::Mutex::new(worker.ok().map(|_| tx))
+    });
+    if let Ok(tx) = tx.lock() {
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(path.to_path_buf());
+        }
+    }
+}
+
+/// 预热消费线程：等选中项「停留」下来再转换 ——
+/// 等待窗口内又来了新的选中项就改判最新一个，避免在目录里滚动时反复拉起 Office。
+fn warmup_worker(rx: std::sync::mpsc::Receiver<PathBuf>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    // 停留判定窗口：只是滚过的文件不触发预热
+    const SETTLE: Duration = Duration::from_millis(1200);
+    let mut pending = match rx.recv() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    loop {
+        match rx.recv_timeout(SETTLE) {
+            Ok(next) => {
+                pending = next;
+                continue;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        if worth_warming(&pending) {
+            let _ = convert_to_pdf_blocking(&pending);
+        }
+        pending = match rx.recv() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+    }
+}
+
+/// 预热前的廉价判定：装了对应 Office、缓存未命中、近期也没失败过
+fn worth_warming(src: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(src) else {
+        return false;
+    };
+    if meta.len() > 200 * 1024 * 1024 || recently_failed(src, &meta) {
+        return false;
+    }
+    if cached_pdf_if_fresh(src).is_some() {
+        return false;
+    }
+    let Some(app) = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(office_app_for_ext)
+    else {
+        return false;
+    };
+    is_office_installed(app) && !office_busy(app)
 }
 
 #[cfg(test)]

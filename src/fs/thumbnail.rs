@@ -59,6 +59,9 @@ const DIR_KEY: &str = "\u{0}<dir>";
 const FILE_KEY: &str = "\u{0}<file>";
 /// 便携设备在类型缓存中的特殊键。
 const DEVICE_KEY: &str = "\u{0}<device>";
+/// 通用数据盘在类型缓存中的特殊键（WebDAV 等挂载的虚拟磁盘用，
+/// 与除 C 盘外的其它盘共用同一张系统盘符图标，而非黄色文件夹）。
+const DATA_DRIVE_KEY: &str = "\u{0}<datadrive>";
 
 /// 图标提取请求。虚拟设备路径只能构造成 Type/Device，避免误入真实路径提取器。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +76,9 @@ pub enum IconRequest {
         is_dir: bool,
     },
     Device,
+    /// 通用数据盘图标（非 C 盘的标准盘符图标）：供 cloud:// WebDAV 等
+    /// 虚拟磁盘条目使用，保证与 D:/H: 等数据盘显示同一张系统图标。
+    DataDrive,
 }
 
 fn normalize_extension(extension: &str) -> String {
@@ -151,6 +157,7 @@ fn request_kind(request: &IconRequest) -> Kind {
             }
         }),
         IconRequest::Device => Kind::Type(DEVICE_KEY.to_string()),
+        IconRequest::DataDrive => Kind::Type(DATA_DRIVE_KEY.to_string()),
     }
 }
 
@@ -201,13 +208,24 @@ pub fn load_cached_request(request: &IconRequest, size: u32) -> Option<Arc<IconP
     }
     let kind = request_kind(request);
     let raw = match (request, &kind) {
-        (IconRequest::RealPath { .. }, Kind::Type(key)) => {
+        (IconRequest::RealPath { path, .. }, Kind::Type(key)) => {
             let dotted = if key == DIR_KEY || key == FILE_KEY {
                 String::new()
             } else {
                 format!(".{}", key)
             };
-            extract_type_icon(&dotted, key == DIR_KEY, size)
+            // 真实文件优先走真实路径的 Shell 提取（仅取关联图标）：
+            // 与资源管理器同源，能解析每用户关联选择（含 AppX/UWP 商店应用，
+            // 如 Win11 记事本接管 .txt）。伪文件名 + USEFILEATTRIBUTES 只查
+            // HKCR 经典 ProgID，HKCR\.txt 无默认值且 AppX 图标不在经典注册表
+            // 可读范围内，会错误回退到「通用文档」图标（与资源管理器不一致）。
+            if key == DIR_KEY || key == FILE_KEY {
+                extract_type_icon(&dotted, key == DIR_KEY, size).or_else(|| extract(path, size))
+            } else {
+                extract_icon_only(path, size)
+                    .or_else(|| extract_type_icon(&dotted, false, size))
+                    .or_else(|| extract(path, size))
+            }
         }
         (IconRequest::RealPath { path, .. }, Kind::Path(_)) => extract(path, size).or_else(|| {
             let ext = ext_of(path);
@@ -228,23 +246,30 @@ pub fn load_cached_request(request: &IconRequest, size: u32) -> Option<Arc<IconP
             extract_type_icon(&dotted, *is_dir, size)
         }
         (IconRequest::Device, _) => extract_device_icon(size),
+        (IconRequest::DataDrive, _) => extract_data_drive_icon(size),
     };
     // 全部提取路径失败时的最终回退：Shell Stock 图标（文件夹/文档），
-    // 保证行内始终显示系统图标而非内置矢量图
+    // 保证行内始终显示系统图标而非内置矢量图。
+    // 数据盘请求回退为固定驱动器 Stock 图标，保证与 D:/H: 同类的盘符外观，
+    // 而非黄色文件夹或通用文档。
     let raw = match raw {
         Some(r) => Some(r),
         None => {
-            let is_dir = matches!(
-                request,
-                IconRequest::RealPath {
-                    is_dir: true,
-                    ..
-                } | IconRequest::Type {
-                    is_dir: true,
-                    ..
-                }
-            );
-            stock_fallback(is_dir, size)
+            if matches!(request, IconRequest::DataDrive) {
+                extract_stock_drive_fixed(size)
+            } else {
+                let is_dir = matches!(
+                    request,
+                    IconRequest::RealPath {
+                        is_dir: true,
+                        ..
+                    } | IconRequest::Type {
+                        is_dir: true,
+                        ..
+                    }
+                );
+                stock_fallback(is_dir, size)
+            }
         }
     };
     let (pixels, w, h) = valid_icon(raw)?;
@@ -308,13 +333,20 @@ fn stock_fallback(is_dir: bool, size: u32) -> Option<(Vec<u8>, u32, u32)> {
 /// 按"具体路径"提取特殊系统文件夹（桌面/下载/文档等）的专属图标。
 /// 普通文件夹走 DIR_KEY 类型缓存共享同一张通用图标；这些已知文件夹在
 /// Shell 中有带标识的专属图标，须以路径为键单独提取与缓存。
+/// 实现：优先用 SHGetFileInfo 直接取真实路径的系统图标索引（不带
+/// USEFILEATTRIBUTES），再经 IImageList JUMBO 取高清 HICON——与资源管理器
+/// 同源，能拿到桌面/下载/文档等带标识的专属图标；IShellItemImageFactory
+/// 的 GetImage 对文件夹常只返回通用黄色文件夹，故仅作回退。
 #[cfg(windows)]
 pub fn special_dir_icon_cached(path: &str, size: u32) -> Option<Arc<IconPixels>> {
     let key = format!("{}|specialdir", path);
     if let Some(c) = path_cache().lock().ok()?.get(&key).cloned() {
         return Some(c);
     }
-    let (pixels, w, h) = valid_icon(extract(path, size))?;
+    // 主路径：真实路径图标（专属图标，如桌面的显示器、下载的箭头）
+    // 回退：缩略图工厂（通用文件夹，至少不为空）
+    let raw = extract_path_icon(path, size).or_else(|| extract(path, size));
+    let (pixels, w, h) = valid_icon(raw)?;
     let arc = Arc::new(IconPixels { pixels, w, h });
     if let Ok(mut c) = path_cache().lock() {
         c.insert(key, arc.clone());
@@ -491,11 +523,357 @@ pub fn extract(_path: &str, _size: u32) -> Option<(Vec<u8>, u32, u32)> {
     None
 }
 
+/// 按真实路径提取「文件类型关联图标」，跳过缩略图提供器（仅 SIIGBF_ICONONLY）。
+///
+/// 与 `extract` 的区别：强制只取图标，不走缩略图管线——供类型图标链路使用，
+/// 避免 pdf/docx 等带预览处理器的文档从「关联图标」变成「内容缩略图」，
+/// 与资源管理器小图标视图的行为保持一致。同样能解析每用户关联
+/// （AppX/UWP 商店应用接管 .txt 等类型的场景）。
+#[cfg(windows)]
+pub fn extract_icon_only(path: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    use windows::Win32::System::Com::{
+        CoInitializeEx, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+    }
+
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(windows::core::PCWSTR(wide.as_ptr()), None).ok()?;
+        let hbitmap = factory
+            .GetImage(
+                SIZE {
+                    cx: size as i32,
+                    cy: size as i32,
+                },
+                SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            )
+            .ok()?;
+        if hbitmap.is_invalid() {
+            return None;
+        }
+
+        let mut bm = BITMAP::default();
+        let got = GetObjectW(
+            HGDIOBJ(hbitmap.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut _ as *mut _),
+        );
+        if got == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+            let _ = DeleteObject(HGDIOBJ(hbitmap.0));
+            return None;
+        }
+        let w = bm.bmWidth as u32;
+        let h = bm.bmHeight as u32;
+
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: bm.bmWidth,
+            biHeight: -(bm.bmHeight),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let hdc = GetDC(None);
+        let scanned = GetDIBits(
+            hdc,
+            hbitmap,
+            0,
+            h,
+            Some(buf.as_mut_ptr() as *mut _),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        let _ = ReleaseDC(None, hdc);
+        let _ = DeleteObject(HGDIOBJ(hbitmap.0));
+        if scanned == 0 {
+            return None;
+        }
+
+        // BGRA → RGBA；alpha 全 0 时强制不透明（低色深图标源）
+        let mut any_alpha = false;
+        let mut i = 0;
+        while i < buf.len() {
+            buf.swap(i, i + 2);
+            if buf[i + 3] != 0 {
+                any_alpha = true;
+            }
+            i += 4;
+        }
+        if !any_alpha {
+            let mut j = 3;
+            while j < buf.len() {
+                buf[j] = 255;
+                j += 4;
+            }
+        }
+        Some((buf, w, h))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn extract_icon_only(_path: &str, _size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    None
+}
+
 /// 提取 Windows 通用便携设备图标。
 #[cfg(windows)]
 fn extract_device_icon(size: u32) -> Option<(Vec<u8>, u32, u32)> {
     use windows::Win32::UI::Shell::SIID_DEVICECELLPHONE;
     extract_stock(SIID_DEVICECELLPHONE, size)
+}
+
+/// 固定驱动器 Stock 图标（SIID_DRIVEFIXED）：数据盘回退用，
+/// 与 D:/H: 等数据盘的系统盘符外观同类（非 C 盘的 Windows 标识盘）。
+#[cfg(windows)]
+fn extract_stock_drive_fixed(size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use windows::Win32::UI::Shell::SIID_DRIVEFIXED;
+    extract_stock(SIID_DRIVEFIXED, size)
+}
+
+#[cfg(not(windows))]
+fn extract_stock_drive_fixed(_size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    None
+}
+
+/// 通用数据盘图标：取首个非 C 盘固定盘的真实系统盘符图标，
+/// 保证 WebDAV 等虚拟磁盘与 D:/H: 显示同一张图标。
+/// 后台线程调用（可访问磁盘枚举）；命中缓存后 UI 线程秒回。
+#[cfg(windows)]
+fn extract_data_drive_icon(size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    // 只取一次磁盘快照并全程复用：两次 cached_disks() 之间快照可能被并发填充，
+    // 会让 list_disks 的兜底结果与下面的类型判定不一致
+    let disks = crate::fs::disk::cached_disks();
+    let mut roots: Vec<String> = disks.iter().map(|d| d.root.clone()).collect();
+    if roots.is_empty() {
+        roots = crate::fs::disk::list_disks().into_iter().map(|d| d.root).collect();
+    }
+    // 排序：固定盘优先、盘符升序，且 C: 永远排最后（取“除 C 以外的其它盘”）
+    let mut candidates: Vec<(u8, String)> = Vec::new();
+    // 若快照为空（首启），用 roots 兜底：D: 优先、C: 最后
+    if disks.is_empty() {
+        let mut sorted = roots;
+        sorted.sort();
+        // C: 沉底
+        sorted.sort_by_key(|r| r.to_ascii_uppercase().starts_with("C:"));
+        for r in sorted {
+            if r.len() == 3 && r.as_bytes()[1] == b':' {
+                // 首启未知类型，一律按普通盘处理（C: 除外优先）
+                let prio = if r.to_ascii_uppercase().starts_with("C:") { 9 } else { 0 };
+                candidates.push((prio, r));
+            }
+        }
+    } else {
+        for d in disks {
+            if d.root.len() != 3 {
+                continue;
+            }
+            let is_c = d.letter.eq_ignore_ascii_case("C");
+            // 固定盘最优先（0），可移动/网络/其它次之（1），C 盘沉底（+10）
+            let base = match d.kind {
+                crate::fs::disk::DriveKind::Fixed => 0,
+                _ => 1,
+            };
+            let prio = base + if is_c { 10 } else { 0 };
+            candidates.push((prio, d.root));
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    }
+    for (_, root) in candidates {
+        if let Some(raw) = extract(&root, size) {
+            if valid_icon(Some(raw.clone())).is_some() {
+                return Some(raw);
+            }
+        }
+        // 真实路径图标兜底（与特殊目录同源，资源管理器盘符图标）
+        if let Some(raw) = extract_path_icon(&root, size) {
+            if valid_icon(Some(raw.clone())).is_some() {
+                return Some(raw);
+            }
+        }
+    }
+    // 本机仅有 C 盘或全部提取失败：回退固定驱动器 Stock 图标
+    extract_stock_drive_fixed(size)
+}
+
+#[cfg(not(windows))]
+fn extract_data_drive_icon(_size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    None
+}
+
+/// 按真实路径取 Shell 系统图标（不带 USEFILEATTRIBUTES），
+/// 专供桌面/下载/文档等已知文件夹与盘符：返回资源管理器同款专属图标，
+/// 而非 IShellItemImageFactory 常给的通用黄色文件夹。
+#[cfg(windows)]
+pub fn extract_path_icon(path: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    use windows::Win32::System::Com::{
+        CoInitializeEx, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
+    };
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::UI::Controls::{IImageList, ILD_NORMAL};
+    use windows::Win32::UI::Shell::{
+        SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+        SHGFI_SYSICONINDEX, SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_LARGE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON};
+
+    if size == 0 || path.is_empty() {
+        return None;
+    }
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+        // 真实路径：不带 USEFILEATTRIBUTES，Shell 按磁盘实际对象查图标
+        // （已知文件夹的 desktop.ini / 注册表图标、盘符的卷图标均生效）。
+        let mut info = SHFILEINFOW::default();
+        let res = SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        );
+        if res == 0 {
+            return None;
+        }
+        let icon_idx = info.iIcon;
+        let mut hicon_opt: Option<HICON> = None;
+        if size >= 48 {
+            if let Ok(list) = SHGetImageList::<IImageList>(SHIL_JUMBO as i32) {
+                if let Ok(ic) = list.GetIcon(icon_idx, ILD_NORMAL.0 as u32) {
+                    hicon_opt = Some(ic);
+                }
+            }
+        }
+        if hicon_opt.is_none() {
+            if let Ok(list) = SHGetImageList::<IImageList>(SHIL_EXTRALARGE as i32) {
+                if let Ok(ic) = list.GetIcon(icon_idx, ILD_NORMAL.0 as u32) {
+                    hicon_opt = Some(ic);
+                }
+            }
+        }
+        if hicon_opt.is_none() {
+            if let Ok(list) = SHGetImageList::<IImageList>(SHIL_LARGE as i32) {
+                if let Ok(ic) = list.GetIcon(icon_idx, ILD_NORMAL.0 as u32) {
+                    hicon_opt = Some(ic);
+                }
+            }
+        }
+        let hicon = match hicon_opt {
+            Some(h) => h,
+            None => {
+                let mut info2 = SHFILEINFOW::default();
+                let res2 = SHGetFileInfoW(
+                    PCWSTR(wide.as_ptr()),
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    Some(&mut info2),
+                    std::mem::size_of::<SHFILEINFOW>() as u32,
+                    SHGFI_ICON | SHGFI_LARGEICON,
+                );
+                if res2 == 0 || info2.hIcon.is_invalid() {
+                    return None;
+                }
+                info2.hIcon
+            }
+        };
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size as i32,
+            biHeight: -(size as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let mut bits_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(
+            Some(screen_dc),
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits_ptr,
+            None,
+            0,
+        );
+        let Ok(dib) = dib else {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            let _ = DestroyIcon(hicon);
+            return None;
+        };
+        if bits_ptr.is_null() || dib.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            let _ = DestroyIcon(hicon);
+            return None;
+        }
+        let prev = SelectObject(mem_dc, HGDIOBJ(dib.0));
+        let _ = DrawIconEx(
+            mem_dc,
+            0,
+            0,
+            hicon,
+            size as i32,
+            size as i32,
+            0,
+            None,
+            DI_NORMAL,
+        );
+        SelectObject(mem_dc, prev);
+        let len = (size * size * 4) as usize;
+        let mut buf = vec![0u8; len];
+        std::ptr::copy_nonoverlapping(bits_ptr as *const u8, buf.as_mut_ptr(), len);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
+        let _ = DeleteDC(mem_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        let _ = DestroyIcon(hicon);
+        let mut any_alpha = false;
+        let mut i = 0;
+        while i < buf.len() {
+            buf.swap(i, i + 2);
+            if buf[i + 3] != 0 {
+                any_alpha = true;
+            }
+            i += 4;
+        }
+        if !any_alpha {
+            let mut j = 3;
+            while j < buf.len() {
+                buf[j] = 255;
+                j += 4;
+            }
+        }
+        Some((buf, size, size))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn extract_path_icon(_path: &str, _size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    None
 }
 
 /// 常用 Shell 备用（Stock）图标：侧栏系统节点用。

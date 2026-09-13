@@ -1,6 +1,13 @@
-// 文件操作进度卡片：显示复制、移动、删除等操作的实时进度
+// 文件操作进度卡片：显示复制、移动、删除等操作的实时进度。
+// 设计取向（Apple HIG + 资源管理器）：
+// - 卡片为悬浮 vibrancy 材质：大圆角、深阴影、细分隔，深浅色主题跟随 Theme
+// - 细进度条（4px 胶囊）+ 右对齐百分比，强调色单色填充
+// - 速率记录曲线：最近 48 个瞬时速率采样（约 2 秒窗口）绘成的迷你柱状图，
+//   对应资源管理器复制对话框中的速率图表；暂停时整体压暗
+// - 总尺寸 310x180 与旧版一致：UpdateToast 的避让偏移（192px）依赖此几何
+//   （卡片高 180 + 右下角边距），改动高度须同步 update_toast.slint
 import { Theme } from "theme.slint";
-import { Button } from "std-widgets.slint";
+import { AppState } from "globals.slint";
 
 export component ProgressCard inherits Rectangle {
     in-out property <bool> show-progress: false;    // 显示/隐藏进度卡片
@@ -31,18 +38,19 @@ export component ProgressCard inherits Rectangle {
             width: 310px;
             height: 180px;
             border-radius: 16px;
-            background: rgba(255, 255, 255, 0.95);
+            background: Theme.dark ? #2c2c2ef2 : #fffffff5;
             border-width: 1px;
             border-color: Theme.border;
             drop-shadow-blur: 58px;
             drop-shadow-color: rgba(33, 55, 80, 0.22);
 
             VerticalLayout {
-                padding: 14px;
-                spacing: 12px;
+                padding: 12px;
+                spacing: 5px;
 
-                // 标题栏
+                // ── 标题行：操作名 + 百分比（强调色）──
                 HorizontalLayout {
+                    height: 18px;
                     spacing: 8px;
                     Text {
                         text: root.operation;
@@ -51,84 +59,127 @@ export component ProgressCard inherits Rectangle {
                         color: Theme.text;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
+                        overflow: elide;
                     }
                     Text {
                         text: Math.round(root.progress * 100) + "%";
                         font-size: 14px;
                         font-weight: 700;
-                        color: Theme.text;
+                        color: Theme.primary;
                         vertical-alignment: center;
                     }
                 }
 
-                // 当前文件
-                Text {
-                    text: "当前: " + root.current-file;
-                    font-size: 12px;
-                    color: Theme.muted;
-                    overflow: elide;
-                }
-
-                // 目标路径（动词随任务类型：复制/移动/解压/压缩）
-                Text {
-                    text: "正在" + (root.operation == "移动文件" ? "移动"
-                        : root.operation == "解压文件" ? "解压"
-                        : root.operation == "压缩文件" ? "压缩"
-                        : "复制") + "到 " + root.target-path;
-                    font-size: 12px;
-                    color: Theme.muted;
-                    overflow: elide;
-                }
-
-                // 进度条
+                // ── 细进度条（Apple 胶囊）──
                 Rectangle {
-                    height: 9px;
-                    border-radius: 999px;
-                    background: #dfeaf4;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: Theme.dark ? #ffffff1f : #00000014;
 
                     Rectangle {
                         width: parent.width * root.progress;
                         height: 100%;
                         border-radius: parent.border-radius;
-                        background: @linear-gradient(90deg, Theme.primary, #35b8ff);
+                        background: Theme.primary;
+                        opacity: root.paused ? 0.35 : 1.0;
+                        animate opacity { duration: 200ms; easing: ease-out; }
                     }
                 }
 
-                // 统计信息
-                VerticalLayout {
-                    spacing: 6px;
+                // ── 速率记录曲线：右端为最新采样，高度按窗口内最大速率归一化 ──
+                graph := Rectangle {
+                    height: 28px;
+                    clip: true;
+
+                    // 基线
+                    Rectangle {
+                        y: parent.height - 1px;
+                        height: 1px;
+                        background: Theme.separator;
+                    }
+
+                    property <length> step: parent.width / 48;
+                    for v[i] in AppState.task-speed-history: Rectangle {
+                        x: graph.width - (AppState.task-speed-history.length - i) * graph.step;
+                        width: max(1.5px, graph.step - 1.5px);
+                        height: max(2px, min(v / AppState.task-speed-max, 1.0) * (graph.height - 3px));
+                        y: graph.height - 1px - self.height;
+                        border-radius: 1px;
+                        background: Theme.primary;
+                        opacity: root.paused ? 0.3 : 0.55;
+                        animate opacity { duration: 200ms; easing: ease-out; }
+                    }
+                }
+
+                // ── 当前文件 ──
+                Text {
+                    height: 16px;
+                    text: "当前: " + root.current-file;
+                    font-size: Theme.fs-tiny;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                // ── 目标路径（动词随任务类型：复制/移动/解压/压缩）──
+                Text {
+                    height: 16px;
+                    text: "正在" + (root.operation == "移动文件" ? "移动"
+                        : root.operation == "解压文件" ? "解压"
+                        : root.operation == "压缩文件" ? "压缩"
+                        : "复制") + "到 " + root.target-path;
+                    font-size: Theme.fs-tiny;
+                    color: Theme.muted;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                // ── 统计行：左侧完成数，右侧速率与剩余时间 ──
+                HorizontalLayout {
+                    height: 16px;
+                    spacing: 8px;
                     Text {
                         // total < 0 表示总数未知（tar 解压无法预知条目数）
                         text: root.total < 0
                             ? "已完成 " + root.completed + " 个文件"
                             : "已完成 " + root.completed + " / " + root.total + " 个文件";
-                        font-size: 12px;
+                        font-size: Theme.fs-tiny;
                         color: Theme.muted;
+                        vertical-alignment: center;
+                        overflow: elide;
                     }
+                    Rectangle { horizontal-stretch: 1; }
                     Text {
-                        text: "速度 " + root.speed + " · 预计剩余 " + root.eta;
-                        font-size: 12px;
+                        text: root.speed == "" ? "" : root.speed + " · 预计剩余 " + root.eta;
+                        font-size: Theme.fs-tiny;
                         color: Theme.muted;
+                        vertical-alignment: center;
+                        overflow: elide;
                     }
                 }
 
-                // 按钮组
+                // ── 按钮组（Apple 胶囊按钮：暂停为强调色调，取消为危险色调）──
                 HorizontalLayout {
+                    height: 26px;
                     alignment: end;
                     spacing: 8px;
 
                     pause-btn := Rectangle {
                         width: 64px;
-                        height: 34px;
-                        border-radius: 8px;
+                        height: 26px;
+                        border-radius: 13px;
                         border-width: 1px;
                         border-color: Theme.border;
-                        background: pause-touch.has-hover ? rgba(0, 0, 0, 0.04) : white;
+                        background: root.paused || pause-touch.has-hover
+                            ? Theme.primary-soft
+                            : (pause-touch.pressed ? Theme.primary-weak : Theme.dark ? #ffffff0f : #00000008);
+                        animate background { duration: 100ms; easing: ease-out; }
 
                         Text {
                             text: root.paused ? "继续" : "暂停";
-                            font-size: 13px;
-                            color: #284057;
+                            font-size: Theme.fs-small;
+                            font-weight: 600;
+                            color: Theme.primary;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
@@ -140,15 +191,18 @@ export component ProgressCard inherits Rectangle {
 
                     cancel-btn := Rectangle {
                         width: 64px;
-                        height: 34px;
-                        border-radius: 8px;
+                        height: 26px;
+                        border-radius: 13px;
                         border-width: 1px;
                         border-color: Theme.border;
-                        background: cancel-touch.has-hover ? rgba(209, 52, 56, 0.08) : white;
+                        background: cancel-touch.has-hover ? Theme.danger.with-alpha(0.12)
+                            : (cancel-touch.pressed ? Theme.danger.with-alpha(0.2) : Theme.dark ? #ffffff0f : #00000008);
+                        animate background { duration: 100ms; easing: ease-out; }
 
                         Text {
                             text: "取消";
-                            font-size: 13px;
+                            font-size: Theme.fs-small;
+                            font-weight: 600;
                             color: Theme.danger;
                             horizontal-alignment: center;
                             vertical-alignment: center;

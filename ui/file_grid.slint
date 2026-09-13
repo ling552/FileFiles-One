@@ -192,12 +192,14 @@ export component FileGrid inherits Rectangle {
 
     // 选中项目作为完整不透明卡片绘制在列表上层：长名称覆盖下一行，
     // 不会再被下一行图标盖住，也不会透出零碎的底层内容。
-    for entry[i] in AppState.entries: selected-card := Rectangle {
-        property <bool> visible-card: entry.selected;
-        property <int> grid-row: floor(i / root.cols);
-        property <int> grid-col: mod(i, root.cols);
+    // 按「选中下标模型」（AppState.selected-indices，Rust 维护）渲染：
+    // 普通裸 for 会对全部条目各建一个隐藏实例，大目录下实例数 O(N)；
+    // 这里只实例化选中卡片，导航/滚动/改选的开销均为 O(选中数)。
+    for idx in AppState.selected-indices: selected-card := Rectangle {
+        property <FileEntry> entry: AppState.entries[idx];
+        property <int> grid-row: floor(idx / root.cols);
+        property <int> grid-col: mod(idx, root.cols);
         property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
-        visible: self.visible-card;
         x: 12px + self.grid-col * root.pitch;
         y: self.content-y;
         width: root.cell-w;
@@ -214,20 +216,20 @@ export component FileGrid inherits Rectangle {
         FileIcon {
             x: (parent.width - root.icon-box) / 2;
             y: root.icon-top;
-            icon-class: entry.icon-class;
-            label: entry.icon-label;
-            thumb: entry.thumb;
-            has-thumb: entry.has-thumb;
-            has-files: entry.has-files;
+            icon-class: selected-card.entry.icon-class;
+            label: selected-card.entry.icon-label;
+            thumb: selected-card.entry.thumb;
+            has-thumb: selected-card.entry.has-thumb;
+            has-files: selected-card.entry.has-files;
             box: root.icon-box;
         }
         selected-name-text := Text {
-            visible: AppState.editing-index != i;
+            visible: AppState.editing-index != idx;
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap;
             width: parent.width - 16px;
             height: selected-card.expand-name ? self.preferred-height : root.name-h;
-            text: entry.name;
+            text: selected-card.entry.name;
             font-size: Theme.fs-small;
             color: Theme.text;
             horizontal-alignment: center;
@@ -245,9 +247,9 @@ export component FileGrid inherits Rectangle {
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap + root.name-h + selected-card.extra-name-h;
             width: parent.width - 16px;
-            text: entry.icon-class == "drive" ? entry.size
-                : entry.icon-class == "device" ? entry.kind
-                : entry.is-dir ? entry.modified : entry.size;
+            text: selected-card.entry.icon-class == "drive" ? selected-card.entry.size
+                : selected-card.entry.icon-class == "device" ? selected-card.entry.kind
+                : selected-card.entry.is-dir ? selected-card.entry.modified : selected-card.entry.size;
             font-size: Theme.fs-tiny;
             color: Theme.subtle;
             height: root.info-h;
@@ -266,21 +268,21 @@ export component FileGrid inherits Rectangle {
             HorizontalLayout {
                 alignment: start;
                 spacing: 3px;
-                if entry.tag-important: Rectangle {
+                if selected-card.entry.tag-important: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
                     background: #ff3b30; border-width: 2px; border-color: Theme.selection-bg;
                 }
-                if entry.tag-archive: Rectangle {
+                if selected-card.entry.tag-archive: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
                     background: #ff9500; border-width: 2px; border-color: Theme.selection-bg;
                 }
-                if entry.tag-done: Rectangle {
+                if selected-card.entry.tag-done: Rectangle {
                     width: 9px; height: 9px; border-radius: 4.5px;
                     background: #34c759; border-width: 2px; border-color: Theme.selection-bg;
                 }
             }
         }
-        if entry.git-status != "": Rectangle {
+        if selected-card.entry.git-status != "": Rectangle {
             width: 18px;
             height: 18px;
             x: parent.width / 2 + root.icon-box / 2 - 15px;
@@ -288,12 +290,12 @@ export component FileGrid inherits Rectangle {
             border-radius: 5px;
             border-width: 2px;
             border-color: Theme.selection-bg;
-            background: entry.git-status == "?" ? #8e8e93
-                : entry.git-status == "!" ? #ff3b30
-                : entry.git-status == "A" ? #34c759
+            background: selected-card.entry.git-status == "?" ? #8e8e93
+                : selected-card.entry.git-status == "!" ? #ff3b30
+                : selected-card.entry.git-status == "A" ? #34c759
                 : #ff9500;
             Text {
-                text: entry.git-status;
+                text: selected-card.entry.git-status;
                 color: white;
                 font-size: 11px;
                 font-weight: 800;
@@ -324,40 +326,27 @@ export component FileGrid inherits Rectangle {
         request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
     }
 
-    // 重命名覆盖层：声明在 InputOverlay 之后，使输入框位于输入层之上。
-    // 点击框内由 TextInput 接收（光标落到点击位置，可拖选/双击选词）；
-    // 点击框外才落到 InputOverlay，提交当前编辑并正常选中。
-    // （此前声明在 InputOverlay 之前，输入层拦截一切点击：无论点不点命名区域都会完成重命名。）
-    // 独立于 ListView 虚拟化与卡片 clip，长名按名区宽度换行后向下伸长，完整可见；
+    // 重命名覆盖层：仅在编辑单个条目时实例化（旧实现为全条目 for 循环，
+    // 大目录下 O(N) 个隐藏实例；此处 O(1)）。
+    // 几何与基础卡片名区逐像素对齐（卡片左缘 + 8px 内缩，宽 cell-w - 16px），
+    // 使编辑态的换行位置与正常显示完全一致；编辑框按文本高度向下伸长，
     // 超出可视区由 FileGrid 的 clip 裁剪。
-    for entry[i] in AppState.entries: editing-card := Rectangle {
-        property <int> grid-row: floor(i / root.cols);
-        property <int> grid-col: mod(i, root.cols);
-        property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
-        // 与基础卡片名区逐像素对齐（卡片左缘 + 8px 内缩，宽度 cell-w - 16px），
-        // 使编辑态的换行位置与正常显示完全一致，每行字符数相同。
-        x: 12px + self.grid-col * root.pitch + 8px;
-        y: self.content-y + root.icon-top + root.icon-box + root.name-gap;
+    if AppState.editing-index >= 0 && AppState.editing-index < AppState.entries.length: RenameEdit {
+        property <int> idx: AppState.editing-index;
+        x: 12px + mod(self.idx, root.cols) * root.pitch + 8px;
+        y: 12px + floor(self.idx / root.cols) * root.row-h + list.viewport-y
+            + root.icon-top + root.icon-box + root.name-gap;
         width: root.cell-w - 16px;
-        // 定位容器本身不绘制，高度取 0；输入框按文本高度自行向下伸长（无 clip，正常可见）。
-        height: 0px;
-        // 必须用条件实例化而非 visible 复用实例：复用时退出编辑会多渲染一帧
-        // 「非编辑外观」（透明底 + 普通文字色叠在选中底色上），表现为洗白的中间态。
-        if AppState.editing-index == i: RenameEdit {
-            x: 0px;
-            y: 0px;
-            width: parent.width;
-            multiline: true;   // 网格模式允许按名称区宽度换行
-            text: entry.name;
-            font-size: Theme.fs-small;
-            // 文本变化时保存到全局（供点击外部区域时提交）
-            text-changed(t) => { AppState.rename-text = t; }
-            // 按 Escape 退出重命名
-            cancel => { AppState.editing-index = -1; }
-            commit(t) => {
-                AppState.rename-entry(i, t);
-                AppState.editing-index = -1;
-            }
+        multiline: true;   // 网格模式允许按名称区宽度换行
+        text: AppState.entries[self.idx].name;
+        font-size: Theme.fs-small;
+        // 文本变化时保存到全局（供点击外部区域时提交）
+        text-changed(t) => { AppState.rename-text = t; }
+        // 按 Escape 退出重命名
+        cancel => { AppState.editing-index = -1; }
+        commit(t) => {
+            AppState.rename-entry(self.idx, t);
+            AppState.editing-index = -1;
         }
     }
 }

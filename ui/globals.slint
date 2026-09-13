@@ -114,6 +114,9 @@ export struct NetAccount {
     server: string,  // 服务器地址（\\server\share 或 ftp/webdav/sftp 的友好地址）
     drive: string,   // 已挂载盘符（如 "Z:"，未挂载为空串）
     kind: string,    // smb | ftp | webdav | sftp
+    mounted: bool,   // WebDAV 虚拟磁盘当前是否已挂载（其它 kind 恒为 false）
+    mounting: bool,  // WebDAV 是否正在挂载中（点击挂载后、成功/失败回调前，按钮置灰防重入）
+    mount-setting: string, // WebDAV 已设置的挂载盘符（如 "Z:"，未设置为空串，用于未挂载时提示待挂载盘）
 }
 
 // 用户自定义标签定义（工具栏「标记」下拉与侧栏同步显示）
@@ -130,6 +133,8 @@ export global AppState {
     in-out property <string> current-title;
     in-out property <string> current-subtitle;
     in-out property <string> status-text;
+    // 后台目录枚举完成后唤醒 UI 线程，由 Rust 从线程安全队列取回结果
+    callback directory-load-ready();
     // 当前目录所属 Git 仓库分支名（空串=非仓库，UI 据此隐藏内容头 Git 芯片）
     in-out property <string> git-branch;
     // 布局：仅 "grid" 网格 / "list" 详细信息两种，与是否双面板正交。
@@ -261,6 +266,43 @@ export global AppState {
     in-out property <string> netloc-pass;
     callback add-network-location();
     callback remove-network-location(string);
+    // WebDAV 虚拟磁盘挂载完成/失败（后台 rclone 线程经事件循环回主线程）：
+    // mounted(name, drive, jump)：回写配置盘符并刷新；jump 为真时跳转到盘符
+    // （添加流程），启动自动挂载时为假（仅静默显示，不抢焦点）
+    // mount-failed(name, msg)：按账户名清除挂载中标记并状态栏提示原因
+    callback webdav-mounted(string, string, bool);
+    callback webdav-mount-failed(string, string);
+    // ── WebDAV 挂载设置对话框（设置页「挂载」按钮打开）──
+    in-out property <bool> mount-dialog-open: false;
+    // 目标账户显示名（对话框标题展示与 Rust 侧定位配置）
+    in-out property <string> mount-target-name;
+    // 选中的挂载盘符（单字母如 "Z"；空串=未选择，确认按钮禁用——盘符为必须设置项）
+    in-out property <string> mount-drive;
+    // 只读开关（false=可写）
+    in-out property <bool> mount-readonly: false;
+    // 最大空间上限（GB 数字文本；空串=不限制）
+    in-out property <string> mount-max-size;
+    // 图标取值："" 默认数据盘图标 / 预设 ID（cloud|net|folder|vault|star）/ "file:<路径>"
+    in-out property <string> mount-icon;
+    // 图标是否为自定义文件（Rust 选择文件成功后置真；选预设/默认时 UI 置假）
+    in-out property <bool> mount-icon-custom: false;
+    // 目标账户当前已挂载（决定按钮文案与是否先卸载再挂）
+    in-out property <bool> mount-mounted: false;
+    // 可选盘符列表（Rust 计算：未占用盘符 + 该账户当前挂载盘符）
+    in-out property <[string]> mount-available-drives;
+    // 已占用盘符列表（Rust 计算：D～Z 中已被占用的盘符，当前账户挂载盘符除外，
+    // 对话框中置灰禁用，点击无反应，用于解释“为什么有些盘符没出现/不可点”）
+    in-out property <[string]> mount-busy-drives;
+    // 当前已挂载盘符（如 "Z:"，未挂载为空串，对话框状态行展示用）
+    in-out property <string> mount-current-drive;
+    // 打开挂载设置对话框（参数为账户显示名；Rust 预填设置并推送可选盘符）
+    callback open-mount-dialog(string);
+    // 确认挂载设置并执行挂载（已挂载时先卸载再按新设置重挂）
+    callback apply-mount();
+    // 卸载虚拟磁盘（保留账户与挂载设置，cloud:// 原生浏览不受影响）
+    callback unmount-network-location(string);
+    // 弹出系统文件对话框选择自定义图标文件（.ico/.exe/.dll）
+    callback pick-mount-icon();
     // 已保存的网络位置列表（设置「云存储账号」页展示，Rust 启动/增删时推送）
     in-out property <[NetAccount]> net-locations;
     callback toggle-details();
@@ -285,6 +327,10 @@ export global AppState {
     // 网格视图据此决定选中卡片是否展开完整名称：仅单选时展开，多选保持两行裁切。
     in-out property <int> selected-count: 0;
     in-out property <int> r-selected-count: 0;
+    // 选中条目的下标模型（Rust 维护，网格选中卡片覆盖层据此只实例化选中项，
+    // 而非对全部条目各建一个隐藏实例——大目录下显著降低实例数与内存）
+    in-out property <[int]> selected-indices;
+    in-out property <[int]> r-selected-indices;
     // 右面板正在重命名编辑的条目下标（-1 表示无）。与 editing-index 独立，
     // 避免双面板下同下标条目同时进入编辑
     in-out property <int> r-editing-index: -1;
@@ -364,6 +410,9 @@ export global AppState {
     in-out property <int> ql-kind;
     // 内容仍在后台加载（图片解码 / 视频媒体源解析），预览窗口据此显示加载动画
     in-out property <bool> ql-loading: false;
+    // 慢速文件系统（WebDAV/SMB 挂载盘）上的文本/归档内容异步读取中：
+    // 置真时打开后的一帧不收起加载动画，由后台读取完成时统一收起
+    in-out property <bool> ql-loading-async: false;
     in-out property <string> ql-name;
     in-out property <string> ql-subtitle;     // 类型 + 大小等副标题
     in-out property <image> ql-image;          // 图片预览大图（ql-kind==1）
@@ -401,6 +450,8 @@ export global AppState {
     in-out property <bool> ql-controls-visible: true;
     // 视频静音态（供音量按钮图标切换）
     in-out property <bool> ql-video-muted: false;
+    // 播放速率（音频预览调速用，视频共用同一播放器同样生效；1.0 为正常速度）
+    in-out property <float> ql-video-rate: 1.0;
     // 跳转到 0.0..1.0 比例位置（由进度条拖动/点击触发）
     callback ql-video-seek(float);
     // 播放 / 暂停切换
@@ -409,6 +460,8 @@ export global AppState {
     callback ql-video-replay();
     // 静音切换
     callback ql-video-toggle-mute();
+    // 设置播放速率（如 0.5/1.0/1.5/2.0，不支持的速率保持原速）
+    callback ql-video-set-rate(float);
     // 切换渲染/源码视图（Rust 端启停 WebView2 子窗口并重算卡片尺寸）
     callback ql-set-web-mode(bool);
     // 打开当前选中项的 Quick Look 预览（由空格键触发）
@@ -598,6 +651,10 @@ export global AppState {
     in-out property <float> task-progress;           // 0.0 - 1.0
     in-out property <string> task-speed: "计算中…";
     in-out property <string> task-eta: "计算中…";
+    // 速率记录（资源管理器式）：最近的瞬时速率采样（字节/秒），配合 task-speed-max
+    // 归一化绘制速率曲线；任务开始时由 Rust 重置为空模型
+    in-out property <[float]> task-speed-history;
+    in-out property <float> task-speed-max: 1.0;     // 当前历史窗口内的最大速率（字节/秒）
     in-out property <bool> task-paused: false;
     // 暂停 / 继续切换
     callback task-pause();

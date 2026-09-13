@@ -283,6 +283,33 @@ impl Default for Settings {
     }
 }
 
+/// 挂载图标取值三态（由 NetworkLocation.mount_icon 解析而来）
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MountIconKind {
+    /// 未设置：与本地数据盘（非 Windows 系统盘）同图标
+    Default,
+    /// 预设图标 ID（MOUNT_ICON_PRESETS 之一），应用内矢量字形渲染
+    Preset(String),
+    /// 自定义图标文件（.ico/.exe/.dll）绝对路径
+    File(String),
+}
+
+impl MountIconKind {
+    pub fn parse(raw: &str) -> Self {
+        if let Some(path) = raw.strip_prefix("file:") {
+            if !path.is_empty() {
+                return MountIconKind::File(path.to_string());
+            }
+            return MountIconKind::Default;
+        }
+        if MOUNT_ICON_PRESETS.contains(&raw) {
+            MountIconKind::Preset(raw.to_string())
+        } else {
+            MountIconKind::Default
+        }
+    }
+}
+
 /// 用户保存的网络位置连接（SMB / FTP / WebDAV / SFTP）
 #[derive(Clone, Serialize, Deserialize)]
 pub struct NetworkLocation {
@@ -305,9 +332,30 @@ pub struct NetworkLocation {
     pub use_tls: bool,          // FTP: FTPS；WebDAV: https
     #[serde(default)]
     pub passive: bool,          // FTP 被动模式（默认 true）
+    // ── WebDAV 虚拟磁盘挂载设置（rclone + WinFsp，其它 kind 忽略）──
+    /// 挂载盘符（单字母如 "Z"），挂载的必填项；未设置则不挂载（仅 cloud:// 原生浏览）
+    #[serde(default)]
+    pub mount_drive: Option<String>,
+    /// 只读挂载（rclone --read-only）；false = 可写
+    #[serde(default)]
+    pub mount_readonly: bool,
+    /// 最大空间上限（GB，rclone --vfs-disk-space-total-size）；None = 不限制
+    #[serde(default)]
+    pub mount_max_size_gb: Option<u64>,
+    /// 挂载图标："" = 默认数据盘图标；预设 ID（见 MOUNT_ICON_PRESETS）；
+    /// "file:<绝对路径>" = 自定义 .ico/.exe/.dll 图标文件
+    #[serde(default)]
+    pub mount_icon: String,
 }
 
+/// WebDAV 挂载图标预设 ID 集合（与 ui/file_icon.slint 的 drive-<id> 分支一一对应）
+pub const MOUNT_ICON_PRESETS: [&str; 5] = ["cloud", "net", "folder", "vault", "star"];
+
 impl NetworkLocation {
+    /// mount_icon 的解析结果：默认 / 预设 ID / 自定义图标文件路径
+    pub fn mount_icon_kind(&self) -> crate::config::MountIconKind {
+        crate::config::MountIconKind::parse(&self.mount_icon)
+    }
     /// 用于列表与标题的友好地址展示
     pub fn display_server(&self) -> String {
         if !self.host.is_empty() {

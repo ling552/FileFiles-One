@@ -34,6 +34,11 @@ pub(crate) fn display_size(native: (u32, u32), aspect: (u32, u32)) -> (u32, u32)
     (display_width as u32, display_height as u32)
 }
 
+/// 规范化速率：钳制到 0.25..=4.0 并保留两位小数（纯函数，便于单测）。
+pub(crate) fn normalize_rate(rate: f32) -> f32 {
+    (rate.clamp(0.25, 4.0) * 100.0).round() / 100.0
+}
+
 /// 按像素宽高比（PAR）修正编码帧尺寸。
 ///
 /// 与 `display_size` 的区别：`display_size` 的第二参数是 MFPlay 给出的
@@ -226,6 +231,44 @@ pub fn is_muted() -> bool {
     }
 }
 
+/// 设置播放速率（如 0.5/1.0/1.5/2.0）。MFPlay 对音频/视频共用同一播放器，
+/// 音频预览的调速与视频同样经此生效；不支持的速率保持原速。
+/// 返回实际生效的速率（未在播放时返回 1.0）。
+#[cfg(windows)]
+pub fn set_rate(rate: f32) -> f32 {
+    win_impl::set_rate(rate)
+}
+
+#[cfg(not(windows))]
+pub fn set_rate(_rate: f32) -> f32 {
+    1.0
+}
+
+/// 当前播放速率（未在播放返回 1.0）。
+#[allow(dead_code)]
+#[cfg(windows)]
+pub fn get_rate() -> f32 {
+    win_impl::get_rate()
+}
+
+#[cfg(not(windows))]
+pub fn get_rate() -> f32 {
+    1.0
+}
+
+/// 启动音频播放（无视频画面、无原生控制条，控制条由 Slint 自绘）。
+/// `ready()` 在媒体项就绪、开始播放时回调（UI 线程消息循环内），调用方据此
+/// 收起加载动画并启动进度轮询。返回是否成功启动异步加载。
+#[cfg(windows)]
+pub fn start_audio(path: &str, ready: Box<dyn Fn() + Send>) -> bool {
+    win_impl::start_audio(path, ready)
+}
+
+#[cfg(not(windows))]
+pub fn start_audio(_path: &str, _ready: Box<dyn Fn() + Send>) -> bool {
+    false
+}
+
 #[cfg(windows)]
 mod win_impl {
     use std::cell::{Cell, RefCell};
@@ -283,9 +326,12 @@ mod win_impl {
 
     thread_local! {
         // (播放器, 视频子窗口句柄, 原生控制条句柄)：仅 UI 线程访问
+        // 音频模式（Slint 自绘控制条）下后两项为 0，无原生窗口
         static ACTIVE: RefCell<Option<(IMFPMediaPlayer, isize, isize)>> = const { RefCell::new(None) };
         // 暂停态（仅 UI 线程）：start 时复位为 false，toggle_play 翻转并据此调 Pause/Play
         static PAUSED: Cell<bool> = const { Cell::new(false) };
+        // 播放速率（仅 UI 线程）：start 时复位为 1.0，set_rate 更新
+        static RATE: Cell<f32> = const { Cell::new(1.0) };
         static CONTROL_STATE: Cell<ControlState> = const { Cell::new(ControlState {
             position: 0,
             duration: 0,
@@ -379,6 +425,58 @@ mod win_impl {
         }
     }
 
+    /// 音频事件回调：媒体项异步创建完成 → 装载；装载完成 → 播放 + 通知就绪。
+    /// 音频无画面，不查询视频尺寸，不创建原生窗口，控制条由 Slint 自绘。
+    #[implement(IMFPMediaPlayerCallback)]
+    struct AudioCallback {
+        generation: u64,
+        ready: Box<dyn Fn() + Send>,
+    }
+
+    impl IMFPMediaPlayerCallback_Impl for AudioCallback_Impl {
+        fn OnMediaPlayerEvent(&self, peventheader: *const MFP_EVENT_HEADER) {
+            unsafe {
+                if peventheader.is_null() {
+                    return;
+                }
+                let header = &*peventheader;
+                if self.generation != GENERATION.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Some(player) = header.pMediaPlayer.as_ref() else {
+                    return;
+                };
+                match header.eEventType {
+                    t if t == MFP_EVENT_TYPE_MEDIAITEM_CREATED => {
+                        if header.hrEvent.is_err() {
+                            return;
+                        }
+                        let ev = &*(peventheader as *const MFP_MEDIAITEM_CREATED_EVENT);
+                        if ev.dwUserData as u64 != self.generation {
+                            return;
+                        }
+                        if let Some(item) = ev.pMediaItem.as_ref() {
+                            let _ = player.SetMediaItem(item);
+                        }
+                    }
+                    t if t == MFP_EVENT_TYPE_MEDIAITEM_SET => {
+                        if header.hrEvent.is_err() {
+                            return;
+                        }
+                        let _ = player.Play();
+                        // 恢复上次的速率（start_audio 已复位为 1.0，此处确保生效）
+                        let rate = RATE.with(|r| r.get());
+                        if (rate - 1.0).abs() > f32::EPSILON {
+                            let _ = player.SetRate(rate);
+                        }
+                        (self.ready)();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     pub fn start(
         parent: isize,
         rect: (i32, i32, i32, i32),
@@ -388,8 +486,9 @@ mod win_impl {
     ) -> bool {
         // 先停掉上一次播放（切换视频/重复打开）
         stop();
-        // 新播放从播放态开始（PAUSED 复位）
+        // 新播放从播放态开始（PAUSED/速率复位）
         PAUSED.with(|p| p.set(false));
+        RATE.with(|r| r.set(1.0));
         REVEALED.with(|r| r.set(false));
         LAST_RECT.with(|c| c.set(rect));
         let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
@@ -481,16 +580,99 @@ mod win_impl {
         // 代次自增：在途的异步事件全部作废
         GENERATION.fetch_add(1, Ordering::SeqCst);
         REVEALED.with(|r| r.set(false));
+        PAUSED.with(|p| p.set(false));
+        RATE.with(|r| r.set(1.0));
         ACTIVE.with(|a| {
             if let Some((player, hwnd, controls_hwnd)) = a.borrow_mut().take() {
                 unsafe {
                     let _ = player.Stop();
                     let _ = player.Shutdown();
-                    let _ = DestroyWindow(HWND(controls_hwnd as *mut core::ffi::c_void));
-                    let _ = DestroyWindow(HWND(hwnd as *mut core::ffi::c_void));
+                    // 音频模式下 hwnd 为 0，无原生窗口可销毁
+                    if controls_hwnd != 0 {
+                        let _ = DestroyWindow(HWND(controls_hwnd as *mut core::ffi::c_void));
+                    }
+                    if hwnd != 0 {
+                        let _ = DestroyWindow(HWND(hwnd as *mut core::ffi::c_void));
+                    }
                 }
             }
         });
+    }
+
+    /// 启动音频播放：无视频子窗口、无原生控制条（Slint 自绘控制条）。
+    /// 媒体源异步解析，MEDIAITEM_SET 后自动播放并经 `ready` 通知调用方。
+    pub fn start_audio(path: &str, ready: Box<dyn Fn() + Send>) -> bool {
+        stop();
+        PAUSED.with(|p| p.set(false));
+        RATE.with(|r| r.set(1.0));
+        REVEALED.with(|r| r.set(true));
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let url: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let callback: IMFPMediaPlayerCallback = AudioCallback { generation, ready }.into();
+            let mut player: Option<IMFPMediaPlayer> = None;
+            // 音频无需视频窗口：hwndVideo 传 None
+            let created = MFPCreateMediaPlayer(
+                PCWSTR::null(),
+                false,
+                MFP_OPTION_NONE,
+                Some(&callback),
+                None,
+                Some(&mut player),
+            );
+            let Some(player) = created.ok().and(player) else {
+                return false;
+            };
+            if player
+                .CreateMediaItemFromURL(PCWSTR(url.as_ptr()), false, generation as usize, None)
+                .is_err()
+            {
+                let _ = player.Shutdown();
+                return false;
+            }
+            ACTIVE.with(|a| *a.borrow_mut() = Some((player, 0, 0)));
+            CONTROL_STATE.with(|s| s.set(ControlState {
+                position: 0,
+                duration: 0,
+                paused: false,
+                muted: false,
+                visible: true,
+                volume: 100,
+            }));
+            VOLUME_FLASH_UNTIL.with(|t| t.set(None));
+        }
+        true
+    }
+
+    /// 设置播放速率，返回实际生效的速率。
+    /// 允许范围 0.25..=4.0（覆盖 0.5/1.0/1.25/1.5/2.0 常用档）；
+    /// 播放器不支持时保持原速。未在播放时仅记录目标速率，返回该值
+    /// （start_audio 就绪时会应用）。
+    pub fn set_rate(rate: f32) -> f32 {
+        let want = super::normalize_rate(rate);
+        let applied = ACTIVE.with(|a| {
+            if let Some((player, _, _)) = a.borrow().as_ref() {
+                unsafe {
+                    if player.SetRate(want).is_ok() {
+                        return true;
+                    }
+                }
+                false
+            } else {
+                // 未在播放：记录即可，调用方显示目标值
+                true
+            }
+        });
+        if applied {
+            RATE.with(|r| r.set(want));
+            want
+        } else {
+            RATE.with(|r| r.get())
+        }
+    }
+
+    pub fn get_rate() -> f32 {
+        RATE.with(|r| r.get())
     }
 
     /// 对齐子窗口到新矩形（卡片按视频宽高比自适应后调用）。
@@ -501,6 +683,10 @@ mod win_impl {
         LAST_RECT.with(|c| c.set(rect));
         ACTIVE.with(|a| {
             if let Some((player, hwnd, controls_hwnd)) = a.borrow().as_ref() {
+                // 音频模式无原生窗口，直接返回
+                if *hwnd == 0 || *controls_hwnd == 0 {
+                    return;
+                }
                 unsafe {
                     let _ = MoveWindow(
                         HWND(*hwnd as *mut core::ffi::c_void),
@@ -525,13 +711,26 @@ mod win_impl {
         }
         ACTIVE.with(|a| {
             if let Some((_, _, controls_hwnd)) = a.borrow().as_ref() {
+                if *controls_hwnd == 0 {
+                    return;
+                }
                 position_controls(HWND(*controls_hwnd as *mut core::ffi::c_void), rect);
             }
         });
     }
 
     /// 媒体就绪：显示画面子窗口，并按可见性状态显示控制条
+    /// 音频模式无原生窗口，直接标记就绪返回
     pub fn reveal() {
+        let is_audio = ACTIVE.with(|a| {
+            a.borrow()
+                .as_ref()
+                .is_some_and(|(_, hwnd, _)| *hwnd == 0)
+        });
+        if is_audio {
+            REVEALED.with(|r| r.set(true));
+            return;
+        }
         if REVEALED.with(|r| r.replace(true)) {
             return;
         }
@@ -1003,6 +1202,9 @@ mod win_impl {
         }
         ACTIVE.with(|a| {
             if let Some((_, _, hwnd)) = a.borrow().as_ref() {
+                if *hwnd == 0 {
+                    return;
+                }
                 unsafe {
                     let overlay = HWND(*hwnd as *mut core::ffi::c_void);
                     // 同 reveal：本函数由 250ms 鼠标轮询反复调用，用 SW_SHOW 会
@@ -1029,6 +1231,9 @@ mod win_impl {
         });
         ACTIVE.with(|a| {
             if let Some((_, _, hwnd)) = a.borrow().as_ref() {
+                if *hwnd == 0 {
+                    return;
+                }
                 unsafe {
                     let _ = InvalidateRect(
                         Some(HWND(*hwnd as *mut core::ffi::c_void)),
@@ -1137,7 +1342,7 @@ mod win_impl {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_par, apply_rotation, display_size};
+    use super::{apply_par, apply_rotation, display_size, normalize_rate};
 
     /// 方形像素（Shell 对绝大多数视频报 1:1）必须原样保留编码尺寸。
     /// 回归用例：曾把 PAR 误当显示尺寸喂给 display_size，
@@ -1184,5 +1389,17 @@ mod tests {
     #[test]
     fn display_size_applies_non_square_pixels() {
         assert_eq!(display_size((720, 576), (16, 9)), (1024, 576));
+    }
+
+    /// 速率规范化：常用档原样通过，越界钳制到 0.25..=4.0
+    #[test]
+    fn rate_normalizes_common_steps_and_clamps() {
+        assert_eq!(normalize_rate(0.5), 0.5);
+        assert_eq!(normalize_rate(1.0), 1.0);
+        assert_eq!(normalize_rate(1.25), 1.25);
+        assert_eq!(normalize_rate(1.5), 1.5);
+        assert_eq!(normalize_rate(2.0), 2.0);
+        assert_eq!(normalize_rate(0.1), 0.25);
+        assert_eq!(normalize_rate(10.0), 4.0);
     }
 }

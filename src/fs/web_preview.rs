@@ -242,6 +242,19 @@ pub fn navigate(url: &str) -> bool {
     }
 }
 
+/// 以占位页（about:blank、隐藏）启动渲染层。慢速文件系统上 URL 需要读文件
+/// 才能解析（Markdown 全文 / Office 文本回退 / PDF stat），改为后台解析、
+/// 完成后 navigate() 升级，避免 UI 线程被网络读取卡死。
+#[cfg(windows)]
+pub fn start_placeholder(parent: isize, rect: (i32, i32, i32, i32)) -> bool {
+    win_impl::start_url(parent, rect, "about:blank".to_string(), false, false)
+}
+
+#[cfg(not(windows))]
+pub fn start_placeholder(_parent: isize, _rect: (i32, i32, i32, i32)) -> bool {
+    false
+}
+
 /// Office 文档正文 → 排版 HTML（渲染视图）：pre-wrap 保留段落换行
 pub fn office_to_html(text: &str, dark: bool) -> String {
     let mut body = String::with_capacity(text.len() * 2);
@@ -426,6 +439,19 @@ mod win_impl {
         // Office 待转换：后台创建控制器但保持隐藏，露出 Slint 加载动画；
         // 转好后 navigate() 再显示。其它类型立即显示。
         let visible = !super::should_defer_show(Path::new(&content.path));
+        start_url(parent, rect, url, allow_scripts, visible)
+    }
+
+    /// 以指定 URL 启动渲染层。慢速文件系统（WebDAV/SMB 挂载盘）异步解析
+    /// URL 时使用：先以占位 URL 启动并保持隐藏，解析完成后由 navigate()
+    /// 升级到真实页面（navigate 会恢复可见性并处理挂起导航）。
+    pub fn start_url(
+        parent: isize,
+        rect: (i32, i32, i32, i32),
+        url: String,
+        allow_scripts: bool,
+        visible: bool,
+    ) -> bool {
         let ready = STATE.with(|s| {
             let mut st = s.borrow_mut();
             if st.unavailable {

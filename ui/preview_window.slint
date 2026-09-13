@@ -22,9 +22,16 @@ export struct ArchiveNode {
     has-children: bool,    // 目录是否含子项（决定是否画箭头）
 }
 
-// 加载动画：双向扫动圆环，4 秒一循环 ——
+// 加载动画：圆环沿圆周双向扫动，4 秒一循环 ——
 // 正向画满（0→一整圈）→正向擦除（满→0）→反向画满→反向擦除，如此往复。
-// 弧线两端各一颗与线同宽的实心圆点，保证端点圆角。
+//
+// 端点圆角交给 stroke-line-cap: round（端点圆帽由描边渲染器生成），不再自绘
+// 端点圆点：手绘圆点要按 viewbox→像素手工换算定位，只要与实际贴合映射（含
+// 居中偏移与 DPI 缩放）有一点出入，端点就会溢出圆环或整体偏移，看起来"不圆"。
+//
+// 弧长范围取 [0.04, 0.998] 而非 [0, 1]：0 会缩成看不见的点；1.0 是完整圆周，
+// 而 femtovg 后端填充整圆有缺陷（Slint 官方 SpinnerBase 同样以 0.9999 上限规避），
+// 到整圈时弧线会变形/消失。两端各留余量后，弧段始终落在同一圆周上，恒为正圆。
 // 不用 std-widgets 的 Spinner：它的描边固定为 Fluent 蓝，无法跟随本程序主题色。
 component LoadingRing inherits Rectangle {
     in property <length> ring-size: 34px;
@@ -37,25 +44,23 @@ component LoadingRing inherits Rectangle {
     property <float> ph: floor(self.cyc * 4.0);
     property <float> fr: self.cyc * 4.0 - self.ph;
     property <bool> grow: mod(self.ph, 2.0) < 1.0;
-    property <float> len: self.grow ? self.fr : 1.0 - self.fr;
+    property <float> raw: self.grow ? self.fr : 1.0 - self.fr;
+    property <float> len: 0.04 + self.raw * 0.958;
     property <float> dir: self.ph < 1.5 ? 1.0 : -1.0;
-    // 扫动头匀速 1 圈/秒；尾 = 头 − 方向×弧长（方向切换时弧长为 0，无跳变）
+    // 扫动头匀速 1 圈/秒；尾 = 头 − 方向×弧长（方向切换时弧长最短，无跳变）
     property <angle> head-a: self.cyc * 1440deg;
     property <angle> tail-a: self.head-a - self.dir * self.len * 360deg;
-    // viewBox(100) → px 换算须与 Slint Path 的实际映射一致：
-    // px = 线宽/2 + 坐标 × (元素宽 − 线宽)/100（见 i-slint-core fitted_path_events），
-    // 圆点用同一映射才能精确落在弧线端点上；端点直径 = 线宽 8
-    property <length> vscale: (self.width - 8px) / 100;
-    property <length> voff: 4px;
-    property <length> cap-d: 8px;
 
     Path {
-        width: 100%;
-        height: 100%;
+        // 元素与 viewbox 同为正方形：等比贴合后圆心落在元素中心，弧线不会被拉成椭圆
+        width: root.ring-size;
+        height: root.ring-size;
         viewbox-width: 100;
         viewbox-height: 100;
+        fit: contain;
         stroke: root.ring-stroke;
         stroke-width: 8px;
+        stroke-line-cap: round;
         MoveTo {
             x: 50 + 42 * sin(root.tail-a);
             y: 50 - 42 * cos(root.tail-a);
@@ -68,24 +73,6 @@ component LoadingRing inherits Rectangle {
             sweep: root.dir > 0.0;
             large-arc: root.len > 0.5;
         }
-    }
-    // 头端圆角
-    Rectangle {
-        width: root.cap-d;
-        height: root.cap-d;
-        border-radius: root.cap-d / 2;
-        background: root.ring-stroke;
-        x: root.voff + root.vscale * (50 + 42 * sin(root.head-a)) - self.width / 2;
-        y: root.voff + root.vscale * (50 - 42 * cos(root.head-a)) - self.height / 2;
-    }
-    // 尾端圆角
-    Rectangle {
-        width: root.cap-d;
-        height: root.cap-d;
-        border-radius: root.cap-d / 2;
-        background: root.ring-stroke;
-        x: root.voff + root.vscale * (50 + 42 * sin(root.tail-a)) - self.width / 2;
-        y: root.voff + root.vscale * (50 - 42 * cos(root.tail-a)) - self.height / 2;
     }
 }
 
@@ -141,10 +128,24 @@ export global PreviewState {
     in-out property <bool> office-doc: false;
     in-out property <bool> office-pending: false;
     callback set-web-mode(bool);
-    // 切换视频无边框全屏（仅 kind==4 时按钮可见）
+    // 切换视频无边框全屏（仅 kind==4 视频显示，音频不显示全屏按钮）
     callback toggle-fullscreen();
     // 视频是否处于全屏（按钮图标切换用）
     in-out property <bool> video-fullscreen: false;
+    // 音频播放状态（kind==6 时 Slint 自绘控制条用，由 Rust 定时推送）。
+    // 音频无原生子窗口，播放/暂停/进度/速率全部走 Slint 控件。
+    in-out property <int> audio-position: 0;
+    in-out property <int> audio-duration: 0;
+    in-out property <string> audio-pos-text: "00:00";
+    in-out property <string> audio-dur-text: "00:00";
+    in-out property <bool> audio-paused: false;
+    in-out property <bool> audio-muted: false;
+    in-out property <float> audio-rate: 1.0;
+    callback audio-toggle-play();
+    callback audio-seek(float);
+    callback audio-set-rate(float);
+    callback audio-toggle-mute();
+    callback audio-replay();
     // 归档树：仅包含当前应显示的节点（父目录折叠时其后代由 Rust 过滤掉）
     in-out property <[ArchiveNode]> archive-nodes;
     // 切换第 idx 个节点的展开/折叠（Rust 侧维护展开集合并重算可见节点）
@@ -157,7 +158,8 @@ export component PreviewWindow inherits Window {
     title: PreviewState.name == "" ? "预览" : "预览 - " + PreviewState.name;
     preferred-width: 860px;
     preferred-height: 640px;
-    min-width: 420px;
+    // 竖屏视频窗口偏窄（如 382px 内容宽），下限需容纳竖屏，否则会被钳制出黑边
+    min-width: 320px;
     min-height: 320px;
     background: Theme.bg;
     forward-focus: keys;
@@ -252,10 +254,10 @@ export component PreviewWindow inherits Window {
                             }
                         }
                     }
-                    // 全屏按钮（视频和音频预览显示）。
+                    // 全屏按钮（仅视频预览显示，音频无需全屏）。
                     // 头部不再放关闭按钮：本窗口有系统标题栏，其 X 已是关闭入口，
                     // 再画一个等于同一功能出现两次。
-                    if PreviewState.kind == 4 || PreviewState.kind == 6: Rectangle {
+                    if PreviewState.kind == 4: Rectangle {
                         width: 30px;
                         height: 30px;
                         y: (parent.height - 30px) / 2;
@@ -416,48 +418,203 @@ export component PreviewWindow inherits Window {
                     }
                 }
 
-                // 音频（kind == 6）：显示封面（内嵌图片或通用音符图标）+ 原生控制栏。
-                // Media Foundation 子窗口仅包含音频播放器控制条，覆盖底部区域。
+                // 音频（kind == 6）：Slint 自绘播放器（无原生子窗口）。
+                // 上方封面：内嵌封面（lofty 提取）优先，否则文件列表图标（通用音频图标）；
+                // 下方播放/暂停 + 进度轨道（点击/拖动跳转）+ 速率调节 + 音量。
                 if PreviewState.kind == 6: Rectangle {
                     background: Theme.surface-2;
                     VerticalLayout {
+                        padding: 16px;
+                        padding-top: 12px;
+                        padding-bottom: 12px;
+                        spacing: 10px;
                         alignment: center;
-                        spacing: 20px;
-                        Rectangle {
-                            height: parent.height - 140px;
-                            HorizontalLayout {
-                                alignment: center;
-                                // 音频封面：256×256 圆角卡片
-                                Rectangle {
-                                    width: 256px;
-                                    height: 256px;
-                                    border-radius: 16px;
-                                    background: Theme.surface.with-alpha(0.8);
-                                    border-width: 1px;
-                                    border-color: Theme.border;
-                                    clip: true;
-                                    if PreviewState.has-thumb: Image {
-                                        width: 100%;
-                                        height: 100%;
-                                        source: PreviewState.thumb;
-                                        image-fit: cover;
-                                    }
-                                    if !PreviewState.has-thumb: Path {
-                                        width: 120px;
-                                        height: 120px;
-                                        x: (parent.width - 120px) / 2;
-                                        y: (parent.height - 120px) / 2;
-                                        fill: Theme.primary.with-alpha(0.3);
-                                        commands: "M12 3 V13.55 C11.41 13.21 10.73 13 10 13 C7.79 13 6 14.79 6 17 C6 19.21 7.79 21 10 21 C12.21 21 14 19.21 14 17 V7 H18 V3 H12 Z";
-                                        viewbox-width: 24;
-                                        viewbox-height: 24;
-                                    }
+                        // 封面卡片：220×220 圆角，封面或通用音频图标
+                        HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 220px;
+                                height: 220px;
+                                border-radius: 16px;
+                                background: Theme.surface.with-alpha(0.8);
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                clip: true;
+                                if PreviewState.has-thumb: Image {
+                                    width: 100%;
+                                    height: 100%;
+                                    source: PreviewState.thumb;
+                                    image-fit: cover;
+                                }
+                                // 无缩略图时用通用音频文件图标（与截图中的白底播放页一致），
+                                // 而非音符占位，保证无封面时仍是熟悉的音频图标。
+                                if !PreviewState.has-thumb: FileIcon {
+                                    icon-class: PreviewState.icon-class == "" ? "audio" : PreviewState.icon-class;
+                                    box: 120px;
+                                    radius: 22px;
+                                    x: (parent.width - 120px) / 2;
+                                    y: (parent.height - 120px) / 2;
                                 }
                             }
                         }
-                        // 原生控制条占据底部 120px（由 Rust 侧创建 Media Foundation 子窗口）
-                        Rectangle {
-                            height: 120px;
+                        // 进度行：当前时间 + 轨道（点击/拖动跳转）+ 总时长
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Text {
+                                text: PreviewState.audio-pos-text;
+                                font-size: Theme.fs-tiny;
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                                min-width: 44px;
+                                horizontal-alignment: right;
+                            }
+                            track := Rectangle {
+                                horizontal-stretch: 1;
+                                height: 22px;
+                                property <float> ratio: PreviewState.audio-duration > 0
+                                    ? clamp(PreviewState.audio-position * 1.0 / max(1, PreviewState.audio-duration), 0.0, 1.0)
+                                    : 0.0;
+                                // 底轨：从最左端铺到最右端
+                                Rectangle {
+                                    x: 0;
+                                    width: 100%;
+                                    height: 6px;
+                                    y: (parent.height - 6px) / 2;
+                                    border-radius: 3px;
+                                    background: Theme.border;
+                                }
+                                // 已播部分：固定从 0 开始向右延伸到当前进度
+                                Rectangle {
+                                    x: 0;
+                                    width: track.width * track.ratio;
+                                    height: 6px;
+                                    y: (parent.height - 6px) / 2;
+                                    border-radius: 3px;
+                                    background: Theme.primary;
+                                }
+                                // 滑块：圆心落已播末端，钳制不超出轨道两端
+                                Rectangle {
+                                    width: 12px;
+                                    height: 12px;
+                                    x: clamp(track.width * track.ratio - 6px, -6px, track.width - 6px);
+                                    y: (parent.height - 12px) / 2;
+                                    border-radius: 6px;
+                                    background: Theme.primary;
+                                    border-width: 2px;
+                                    border-color: white;
+                                }
+                                track-ta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => {
+                                        PreviewState.audio-seek(clamp(self.mouse-x * 1.0 / max(1px, track.width), 0.0, 1.0));
+                                    }
+                                    moved => {
+                                        if self.pressed {
+                                            PreviewState.audio-seek(clamp(self.mouse-x * 1.0 / max(1px, track.width), 0.0, 1.0));
+                                        }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: PreviewState.audio-dur-text;
+                                font-size: Theme.fs-tiny;
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                                min-width: 44px;
+                            }
+                        }
+                        // 控制行：重播 + 播放/暂停（大圆钮）+ 静音。
+                        // 两侧 36px 按钮需垂直居中，否则在 52px 行内默认顶对齐而上飘。
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 18px;
+                            Rectangle {
+                                width: 36px;
+                                height: 36px;
+                                y: (parent.height - 36px) / 2;
+                                border-radius: 18px;
+                                background: replay-ta.has-hover ? Theme.primary-hover : transparent;
+                                Text {
+                                    text: "\u{E72C}";
+                                    font-family: "Segoe MDL2 Assets";
+                                    font-size: 15px;
+                                    color: replay-ta.has-hover ? Theme.primary : Theme.muted;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                replay-ta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { PreviewState.audio-replay(); }
+                                }
+                            }
+                            Rectangle {
+                                width: 52px;
+                                height: 52px;
+                                border-radius: 26px;
+                                background: Theme.primary;
+                                Text {
+                                    text: PreviewState.audio-paused ? "\u{E768}" : "\u{E769}";
+                                    font-family: "Segoe MDL2 Assets";
+                                    font-size: 20px;
+                                    color: white;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                play-ta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { PreviewState.audio-toggle-play(); }
+                                }
+                            }
+                            Rectangle {
+                                width: 36px;
+                                height: 36px;
+                                y: (parent.height - 36px) / 2;
+                                border-radius: 18px;
+                                background: mute-ta.has-hover ? Theme.primary-hover : transparent;
+                                Text {
+                                    text: PreviewState.audio-muted ? "\u{E74F}" : "\u{E767}";
+                                    font-family: "Segoe MDL2 Assets";
+                                    font-size: 15px;
+                                    color: mute-ta.has-hover ? Theme.primary : Theme.muted;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                mute-ta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { PreviewState.audio-toggle-mute(); }
+                                }
+                            }
+                        }
+                        // 速率行：0.5x / 1.0x / 1.25x / 1.5x / 2.0x
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 6px;
+                            Text {
+                                text: "速率";
+                                font-size: Theme.fs-tiny;
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                            }
+                            for r[idx] in [0.5, 1.0, 1.25, 1.5, 2.0]: Rectangle {
+                                width: 52px;
+                                height: 26px;
+                                border-radius: 13px;
+                                background: PreviewState.audio-rate == r ? Theme.primary-soft : (rate-ta.has-hover ? Theme.primary-hover : transparent);
+                                border-width: 1px;
+                                border-color: PreviewState.audio-rate == r ? Theme.primary : Theme.border;
+                                Text {
+                                    text: r == 1.0 ? "1.0x" : r == 0.5 ? "0.5x" : r == 1.25 ? "1.25x" : r == 1.5 ? "1.5x" : "2.0x";
+                                    font-size: Theme.fs-tiny;
+                                    font-weight: PreviewState.audio-rate == r ? 700 : 400;
+                                    color: PreviewState.audio-rate == r ? Theme.primary : Theme.muted;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                rate-ta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { PreviewState.audio-set-rate(r); }
+                                }
+                            }
                         }
                     }
                     if PreviewState.loading: LoadingOverlay {

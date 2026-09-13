@@ -46,6 +46,10 @@ pub mod quickaccess;
 pub mod virtualfs;
 // 云存储虚拟文件系统：FTP / WebDAV / SFTP
 pub mod cloud;
+// 无窗口子进程：所有后台 Command 必须经此创建，避免弹出终端黑框
+pub mod hidden;
+// 内嵌 rclone：WebDAV 挂载为虚拟磁盘 + SFTP 真机列表（无终端）
+pub mod rclone;
 
 use std::path::PathBuf;
 

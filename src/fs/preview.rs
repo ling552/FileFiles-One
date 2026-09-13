@@ -66,7 +66,11 @@ const VIDEO_EXTS: &[&str] = &[
 ];
 
 /// 可由 Media Foundation 直接播放的音频扩展名。
-const AUDIO_EXTS: &[&str] = &["mp3", "wav", "flac", "m4a", "aac", "wma", "ogg"];
+/// opus/aiff/aif 在 Win10+ 自带解码器；ape/mka 若系统无解码器则播放失败并提示，
+/// 仍比落入十六进制文本预览更符合预期。
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "wav", "flac", "m4a", "aac", "wma", "ogg", "opus", "aiff", "aif", "ape", "mka",
+];
 
 /// 可作为纯文本预览的扩展名（含常见源码 / 配置 / 文档）
 /// 注意：kind_of 已对非图片/视频/归档/二进制文件统一兜底为文本预览，本表仅供 renderable_web
@@ -508,44 +512,119 @@ fn legacy_office_raw_text(path: &Path) -> Option<String> {
     ole_text_fallback(path)
 }
 
-/// OLE 旧版文档(.doc/.xls/.ppt)极简文本抽取：扫描文件字节中连续可读片段。
-/// 质量不如 Office 转 PDF，但用于源码视图兜底已足够，避免空白/占位。
+/// 旧版 Office 文档（.doc/.xls/.ppt 等 OLE 复合文档）的文本兜底抽取。
+///
+/// 只在未安装 Office、且没有缓存 PDF 时使用；装了 Office 时走转 PDF 高保真预览。
+/// 旧实现把高位字节统一替换成 `·`（怕 GBK 乱码），中文文档整篇变成点阵；
+/// 改为按编码检测解码：含 NUL 的可读区间先试 UTF-16LE（Word 97-2003 正文流即
+/// UTF-16），其余交给通用解码（UTF-8 / BOM / 系统码页 = GBK 等），中文可读。
 fn ole_text_fallback(path: &Path) -> Option<String> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 256 * 1024];
-    let n = f.read(&mut buf).ok()?;
-    buf.truncate(n);
-    // 提取连续 >=4 的可打印 ASCII/中文 GBK 片段，过滤控制字符
+    // 抽取窗口 1MB：旧版文档的正文文本流集中在文件头部
+    const WINDOW: usize = 1024 * 1024;
+    // 输出上限：二进制噪声再多也不该撑爆预览
+    const OUT_LIMIT: usize = 128 * 1024;
+    let f = std::fs::File::open(path).ok()?;
+    // take + read_to_end 循环读满：云盘挂载路径单次 read 允许短读，
+    // 单次 read 会静默截断抽取窗口
+    let mut buf = Vec::with_capacity(WINDOW);
+    if f.take(WINDOW as u64).read_to_end(&mut buf).is_err() {
+        return None;
+    }
+
+    // 复合文档内部由二进制结构分隔各流：以不可读字节切段，逐段解码后按行过滤。
+    // 短于 24 字节的段不值得做编码检测（会产生上万次无效检测）。
     let mut out = String::new();
-    let mut cur = String::new();
-    for &b in &buf {
-        if (0x20..=0x7E).contains(&b) || b == b'\n' || b == b'\r' || b == b'\t' {
-            cur.push(b as char);
-            if cur.len() > 200 {
-                out.push_str(&cur);
-                out.push('\n');
-                cur.clear();
-            }
-        } else if b >= 0x80 {
-            // 可能的 GBK 中文片段，保留但限制长度
-            cur.push('·');
-        } else {
-            if cur.trim().len() >= 4 {
-                // 过滤纯二进制噪点：需含字母/中文/数字
-                if cur.chars().any(|c| c.is_alphanumeric()) {
-                    out.push_str(cur.trim());
+    let mut seg: Vec<u8> = Vec::new();
+    // NUL 并入段内（UTF-16 正文里 ASCII 字符带 0x00 尾字节，切掉就废了），
+    // 因此不能靠链入 NUL 哨兵触发末段解码——循环结束后必须显式 flush，
+    // 否则末段（文档结尾的正文）被静默丢弃
+    fn flush(out: &mut String, seg: &mut Vec<u8>) {
+        if seg.len() >= 24 {
+            for line in ole_decode_segment(seg).lines() {
+                let t = line.trim_matches(|c: char| c.is_control() || c == ' ' || c == '\t');
+                if is_meaningful_line(t) {
+                    out.push_str(t);
                     out.push('\n');
                 }
             }
-            cur.clear();
+        }
+        seg.clear();
+    }
+    for &b in buf.iter() {
+        // 0x1A（DOS EOF 标记）并入可读字节：UTF-16 汉字低位字节可为 0x1A
+        // （如「会」U+4F1A、全角冒号 U+FF1A），在此切断会把正文粉碎成
+        // 不足 24 字节的碎片而被整段丢弃
+        let readable = b == 0
+            || b == 0x1A
+            || (0x20..=0x7E).contains(&b)
+            || b == b'\t'
+            || b == 0x0A
+            || b == 0x0D
+            || b >= 0x80;
+        if readable {
+            seg.push(b);
+            continue;
+        }
+        flush(&mut out, &mut seg);
+        if out.len() >= OUT_LIMIT {
+            break;
         }
     }
-    if cur.trim().len() >= 4 && cur.chars().any(|c| c.is_alphanumeric()) {
-        out.push_str(cur.trim());
+    flush(&mut out, &mut seg);
+    let t = tidy_text(&out);
+    // 至少要有 8 个字母/数字/汉字才认为抽到了真内容（否则全是二进制噪声）
+    if t.chars().filter(|c| c.is_alphanumeric()).count() >= 8 {
+        Some(t)
+    } else {
+        None
     }
-    let t = out.trim().to_string();
-    if t.len() >= 8 { Some(t) } else { None }
+}
+
+/// 单个可读区间的解码：含 NUL 时在 UTF-16LE 与通用解码间按可读字符占比择优
+/// （UTF-16 正文里中文无 NUL、ASCII 有 NUL，一律按 NUL 占比判断会误判）。
+fn ole_decode_segment(seg: &[u8]) -> String {
+    // NUL 字符是复合文档的结构性填充：字节层面必须保留（UTF-16 配对依赖），
+    // 解码输出层面只会拉低可读占比导致正文整行被过滤，故剥离
+    let strip_nul = |s: String| -> String { s.chars().filter(|&c| c != '\0').collect() };
+    let utf16 = || -> String {
+        let units: Vec<u16> = seg
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    if seg.len() >= 16 && seg.iter().filter(|&&b| b == 0).count() >= 4 {
+        let a = strip_nul(utf16());
+        if let Some(b) = decode_text(seg) {
+            return if printable_ratio(&a) > printable_ratio(&b) { a } else { strip_nul(b) };
+        }
+        return a;
+    }
+    decode_text(seg).map(strip_nul).unwrap_or_default()
+}
+
+/// 非控制字符占比：衡量一段解码结果有多"像文本"
+fn printable_ratio(s: &str) -> f32 {
+    let total = s.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let ok = s.chars().filter(|c| !c.is_control()).count();
+    ok as f32 / total as f32
+}
+
+/// 是否值得作为预览行展示：长度够、可见字符占多数、且含字母/数字/汉字
+fn is_meaningful_line(line: &str) -> bool {
+    let total = line.chars().count();
+    if total < 3 {
+        return false;
+    }
+    let visible = line.chars().filter(|c| !c.is_control()).count();
+    if visible * 10 < total * 6 {
+        return false;
+    }
+    line.chars().filter(|c| c.is_alphanumeric()).count() >= 3
 }
 
 fn read_zip_xml(path: &Path, name: &str) -> Result<String, String> {
@@ -616,23 +695,178 @@ fn xlsx_text(path: &Path) -> Result<String, String> {
     Ok(out)
 }
 
+/// 抽取 .pptx 演示文稿文本（Office 高保真转换不可用时的回退内容）。
+///
+/// 与旧实现的差别：
+/// 1. 幻灯片按 slideN.xml 的序号排序 —— ZIP 条目顺序是 slide1/slide10/slide11/…，
+///    逐条遍历会把第 10 页排到第 2 页前面；
+/// 2. 只取 DrawingML 正文 <a:t> 并按段落组织，不再是「剥掉尖括号就当文本」——
+///    后者会把版式、主题、占位符里的内容一并混进正文；
+/// 3. 附演讲者备注：经幻灯片的关系文件定位备注页（备注页编号与幻灯片编号不保证一致）。
 fn pptx_text(path: &Path) -> Result<String, String> {
     use std::io::Read;
+    // 单条目上限：正常幻灯片 XML 只有几十 KB，超大说明不是普通演示文稿
+    const MAX_ENTRY: u64 = 8 * 1024 * 1024;
     let file = std::fs::File::open(path).map_err(|e| format!("无法打开 PPT：{}", e))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("无法读取 PPT 容器：{}", e))?;
-    let mut out = String::new();
-    let mut count = 0;
+
+    let mut slides: Vec<(u32, String)> = Vec::new();
+    let mut rels: Vec<(u32, String)> = Vec::new();
+    let mut notes: Vec<(u32, String)> = Vec::new();
     for i in 0..zip.len() {
-        let entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let Ok(entry) = zip.by_index(i) else { continue };
         let name = entry.name().to_string();
-        if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
-            let mut raw = String::new();
-            entry.take(4 * 1024 * 1024).read_to_string(&mut raw).map_err(|e| e.to_string())?;
-            count += 1;
-            out.push_str(&format!("幻灯片 {}\n{}\n\n", count, xml_text(&raw)));
+        let target = if name.starts_with("ppt/slides/_rels/slide") {
+            "rels"
+        } else if name.starts_with("ppt/slides/slide") {
+            "slide"
+        } else if name.starts_with("ppt/notesSlides/notesSlide") {
+            "notes"
+        } else {
+            continue;
+        };
+        // 页号：slideN.xml / slideN.xml.rels / notesSlideN.xml 的 N
+        // （先后剥 .rels/.xml 后缀，再剥 slide/notesSlide 前缀）
+        let num = name
+            .rsplit(['\\', '/'])
+            .next()
+            .and_then(|base| {
+                let b = base.strip_suffix(".rels").unwrap_or(base);
+                let b = b.strip_suffix(".xml").unwrap_or(b);
+                b.strip_prefix("slide").or_else(|| b.strip_prefix("notesSlide"))
+            })
+            .and_then(|n| n.parse::<u32>().ok());
+        let Some(num) = num else { continue };
+        let mut raw = String::new();
+        if !entry.take(MAX_ENTRY).read_to_string(&mut raw).is_ok() {
+            continue;
+        }
+        // 边遍历边抽取（slides 收集排序后的正文而非原始 XML）：
+        // 异常构造的演示文稿单条目可达 8MB 上限，全量驻留会累积数百 MB
+        match target {
+            "rels" => rels.push((num, raw)),
+            "slide" => slides.push((num, tidy_text(&drawing_text(&raw)))),
+            _ => notes.push((num, tidy_text(&drawing_text(&raw)))),
         }
     }
-    if count == 0 { Err("PowerPoint 文档没有可读取的幻灯片".to_string()) } else { Ok(out) }
+    if slides.is_empty() {
+        return Err("PowerPoint 文档没有可读取的幻灯片".to_string());
+    }
+    slides.sort_by_key(|(n, _)| *n);
+
+    let mut out = String::new();
+    for (num, body) in &slides {
+        // 标签用幻灯片实际页号（slideN 的 N），而非排序后的遍历序号：
+        // 否则 slide10 会显示成“幻灯片 3”
+        out.push_str(&format!("幻灯片 {}\n", num));
+        if body.is_empty() {
+            out.push_str("（本页无文本）\n");
+        } else {
+            out.push_str(body);
+            out.push('\n');
+        }
+        if let Some(notes_num) = rels
+            .iter()
+            .find(|(n, _)| n == num)
+            .and_then(|(_, r)| notes_slide_number(r))
+        {
+            if let Some((_, note)) = notes.iter().find(|(n, _)| *n == notes_num) {
+                if !note.is_empty() {
+                    out.push_str("〔备注〕");
+                    out.push_str(note);
+                    out.push('\n');
+                }
+            }
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// 幻灯片关系文件（slideN.xml.rels）中 notesSlide 的编号
+fn notes_slide_number(rels: &str) -> Option<u32> {
+    for item in rels.split("<Relationship").skip(1) {
+        if !item.contains("notesSlide") {
+            continue;
+        }
+        let Some(target) = item.split("Target=\"").nth(1).and_then(|s| s.split('"').next()) else {
+            continue;
+        };
+        // Target 形如 ../notesSlides/notesSlide3.xml
+        if let Some(n) = target
+            .rsplit("notesSlide")
+            .next()
+            .and_then(|tail| tail.split('.').next())
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// 从 DrawingML（slide / notesSlide）XML 抽取正文：
+/// <a:t> 为文本、</a:p> 段落换行、<a:br> 强制换行、<a:tab> 制表符。
+fn drawing_text(xml: &str) -> String {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut out = String::new();
+    let mut in_text = false;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"a:t" => in_text = true,
+                b"a:br" => out.push('\n'),
+                b"a:tab" => out.push('\t'),
+                _ => {}
+            },
+            // <a:br/>、<a:tab/> 常以自闭合形式出现，不会再有对应的 End 事件
+            Ok(Event::Empty(e)) => match e.name().as_ref() {
+                b"a:br" => out.push('\n'),
+                b"a:tab" => out.push('\t'),
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"a:t" => in_text = false,
+                b"a:p" => out.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Text(t)) => {
+                if in_text {
+                    if let Ok(s) = t.unescape() {
+                        out.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            // 单个条目解析失败不放弃整份文档：保留已抽出的文本
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
+/// 折叠连续空行、去掉行首尾空白：表格与多形状页会产出大片空白
+fn tidy_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut blanks = 0;
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push_str(t);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 fn pdf_text(path: &Path) -> Result<String, String> {
@@ -916,6 +1150,68 @@ mod tests {
         assert_eq!(kind_of(Path::new("a.pptx"), false), PreviewKind::Text);
         // 大小写不敏感
         assert_eq!(kind_of(Path::new("A.PNG"), false), PreviewKind::Image);
+    }
+
+    /// PPT 文本回退：幻灯片按页号排序、只取 <a:t> 正文、备注按关系文件匹配
+    #[test]
+    fn test_pptx_text_order_body_and_notes() {
+        use std::io::Write;
+        let p = std::env::temp_dir().join(format!("filefiles_pptx_{}.pptx", std::process::id()));
+        let slide = |body: &str| {
+            format!(
+                r#"<p:sld xmlns:p="urn:p" xmlns:a="urn:a"><p:cSld><p:spTree><p:sp><p:txBody>{body}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+            )
+        };
+        {
+            let f = std::fs::File::create(&p).unwrap();
+            let mut zip = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            // 条目顺序故意打乱：slide10 → slide2 → slide1
+            zip.start_file("ppt/slides/slide10.xml", opts).unwrap();
+            zip.write_all(slide("<a:p><a:r><a:t>第十页</a:t></a:r></a:p>").as_bytes())
+                .unwrap();
+            zip.start_file("ppt/slides/slide2.xml", opts).unwrap();
+            zip.write_all(slide("<a:p><a:r><a:t>第二页</a:t></a:r></a:p>").as_bytes())
+                .unwrap();
+            zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+            zip.write_all(slide("<a:p><a:r><a:t>第一页</a:t></a:r></a:p>").as_bytes())
+                .unwrap();
+            // 第 1 页的关系文件指向备注页 1
+            zip.start_file("ppt/slides/_rels/slide1.xml.rels", opts).unwrap();
+            zip.write_all(
+                br#"<Relationships><Relationship Id="rId1" Type="http://x/notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>"#,
+            )
+            .unwrap();
+            zip.start_file("ppt/notesSlides/notesSlide1.xml", opts).unwrap();
+            zip.write_all(slide("<a:p><a:r><a:t>讲解要点</a:t></a:r></a:p>").as_bytes())
+                .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let text = pptx_text(&p).expect("应能抽取 pptx 文本");
+        let i1 = text.find("幻灯片 1\n").expect("缺少第 1 页");
+        let i2 = text.find("幻灯片 2\n").expect("缺少第 2 页");
+        let i10 = text.find("幻灯片 10\n").expect("缺少第 10 页");
+        assert!(i1 < i2 && i2 < i10, "幻灯片应按页号排序：{text}");
+        assert!(text.contains("第一页") && text.contains("第二页") && text.contains("第十页"));
+        assert!(text.contains("〔备注〕讲解要点"), "备注应匹配到第 1 页：{text}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 旧版 OLE 回退：UTF-16LE 正文（Word 97-2003 的存储方式）要能解出中文
+    #[test]
+    fn test_ole_text_utf16_chinese() {
+        let p = std::env::temp_dir().join(format!("filefiles_ole_{}.doc", std::process::id()));
+        let mut bytes = vec![0u8; 64];
+        for u in "会议纪要：确认预览方案".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8; 32]);
+        std::fs::write(&p, &bytes).unwrap();
+        let text = ole_text_fallback(&p).expect("UTF-16 正文应可抽取");
+        assert!(text.contains("会议纪要"), "中文应可读而不是点阵：{text}");
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # FileFiles One - Rust + Slint 现代文件管理器
 [package]
 name = "filefiles-one"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 description = "现代化桌面文件管理器，Rust + Slint 实现"
 build = "build.rs"
@@ -63,8 +63,11 @@ pdf-extract = "0.7"
 docx-rs = "0.4"
 # Excel 文件解析：xlsx/xls 读取
 calamine = "0.26"
-# 云存储：FTP / WebDAV / SFTP（SFTP 后端为纯 stub，无额外系统依赖）
-suppaftp = "7.0"
+# 云存储：FTP / WebDAV / SFTP
+# suppaftp 开启 native-tls（Windows 走 SChannel 系统实现，无 openssl 系统依赖），
+# 使 FTPS（显式 TLS）可连接；纯 FTP 不受影响。SFTP 真机传输走内嵌 rclone（见 fs::rclone），
+# 不引入 libssh2/openssl，避免 perl 编译依赖。
+suppaftp = { version = "7.0", features = ["native-tls"] }
 quick-xml = "0.37"
 url = "2"
 base64 = "0.22"
@@ -109,3 +112,11 @@ ico = "0.3"
 opt-level = 3
 lto = true
 codegen-units = 1
+# 剥离调试符号与符号表：减小安装包体积，降低常驻内存（符号表不参与运行）
+strip = true
+
+# debug 构建关闭调试信息：本机 rustc/LLVM 在生成调试信息时内存溢出
+# （out of memory，debug=1 行号表同样超限，仅 debug=0 可过）。代价是 panic
+# 回溯没有行号；需要排查问题时可用 release 构建（已验证可正常编译）
+[profile.dev]
+debug = 0

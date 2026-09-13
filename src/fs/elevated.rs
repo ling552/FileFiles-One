@@ -140,7 +140,9 @@ pub fn retry_if_permission_denied(
 fn run_as_admin(op: ElevatedOp, args: &[OsString]) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    // 提权子进程不创建主窗口（handle_startup_args 直接返回），
+    // 用 SW_HIDE 避免任何窗口/终端闪现；UAC 系统弹窗本身不受影响。
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     fn quote(value: &OsStr) -> Vec<u16> {
         let mut result = vec![b'"' as u16];
@@ -185,7 +187,7 @@ fn run_as_admin(op: ElevatedOp, args: &[OsString]) -> bool {
             exe_w.as_ptr(),
             params.as_ptr(),
             std::ptr::null(),
-            SW_SHOWNORMAL,
+            SW_HIDE,
         )
     };
     result as isize > 32

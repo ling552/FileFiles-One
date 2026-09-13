@@ -12,6 +12,7 @@ import { DualPane } from "dual_pane.slint";
 import { ProgressCard } from "progress_card.slint";
 import { ConflictDialog } from "conflict_dialog.slint";
 import { NetworkLocationDialog } from "network_dialog.slint";
+import { MountDialog } from "mount_dialog.slint";
 import { TagDialog } from "tag_dialog.slint";
 import { ContextMenu } from "context_menu.slint";
 import { SettingsPanel } from "settings_panel.slint";
@@ -749,6 +750,12 @@ export component MainWindow inherits Window {
 
     // 浮层：添加网络位置对话框（SMB 挂载）
     NetworkLocationDialog {
+        width: 100%;
+        height: 100%;
+    }
+
+    // 浮层：WebDAV 挂载设置对话框（盘符/只读/最大空间/图标）
+    MountDialog {
         width: 100%;
         height: 100%;
     }

@@ -230,12 +230,13 @@ component RightGrid inherits Rectangle {
     }
 
     // 选中项目作为完整不透明卡片绘制在列表上层，完整名称覆盖下一行。
-    for entry[i] in AppState.r-entries: selected-card := Rectangle {
-        property <bool> visible-card: entry.selected;
-        property <int> grid-row: floor(i / root.cols);
-        property <int> grid-col: mod(i, root.cols);
+    // 按「选中下标模型」（AppState.r-selected-indices，Rust 维护）渲染：
+    // 只实例化选中卡片而非全条目隐藏实例（旧 for 写法大目录下 O(N)）。
+    for idx in AppState.r-selected-indices: selected-card := Rectangle {
+        property <FileEntry> entry: AppState.r-entries[idx];
+        property <int> grid-row: floor(idx / root.cols);
+        property <int> grid-col: mod(idx, root.cols);
         property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
-        visible: self.visible-card;
         x: 12px + self.grid-col * root.pitch;
         y: self.content-y;
         width: root.cell-w;
@@ -251,20 +252,20 @@ component RightGrid inherits Rectangle {
         FileIcon {
             x: (parent.width - root.icon-box) / 2;
             y: root.icon-top;
-            icon-class: entry.icon-class;
-            label: entry.icon-label;
-            thumb: entry.thumb;
-            has-thumb: entry.has-thumb;
-            has-files: entry.has-files;
+            icon-class: selected-card.entry.icon-class;
+            label: selected-card.entry.icon-label;
+            thumb: selected-card.entry.thumb;
+            has-thumb: selected-card.entry.has-thumb;
+            has-files: selected-card.entry.has-files;
             box: root.icon-box;
         }
         selected-name-text := Text {
-            visible: AppState.r-editing-index != i;
+            visible: AppState.r-editing-index != idx;
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap;
             width: parent.width - 16px;
             height: selected-card.expand-name ? self.preferred-height : root.name-h;
-            text: entry.name;
+            text: selected-card.entry.name;
             font-size: Theme.fs-small;
             color: Theme.text;
             horizontal-alignment: center;
@@ -281,7 +282,7 @@ component RightGrid inherits Rectangle {
             x: 8px;
             y: root.icon-top + root.icon-box + root.name-gap + root.name-h + selected-card.extra-name-h;
             width: parent.width - 16px;
-            text: entry.is-dir ? entry.modified : entry.size;
+            text: selected-card.entry.is-dir ? selected-card.entry.modified : selected-card.entry.size;
             font-size: Theme.fs-tiny;
             color: Theme.subtle;
             height: root.info-h;
@@ -312,29 +313,22 @@ component RightGrid inherits Rectangle {
         request-context-menu(i, mx, my) => { root.request-context-menu(i, mx, my); }
     }
 
-    // 重命名覆盖层：声明在 InputOverlay 之后，使输入框位于输入层之上：
-    // 点击框内由 TextInput 接收（光标随点击定位）；点击框外才提交编辑。
-    for entry[i] in AppState.r-entries: editing-card := Rectangle {
-        property <int> grid-row: floor(i / root.cols);
-        property <int> grid-col: mod(i, root.cols);
-        property <length> content-y: 12px + self.grid-row * root.row-h + list.viewport-y;
-        x: 12px + self.grid-col * root.pitch + 8px;
-        y: self.content-y + root.icon-top + root.icon-box + root.name-gap;
+    // 重命名覆盖层：仅在编辑单个条目时实例化（旧实现为全条目 for 循环，
+    // 大目录下 O(N) 个隐藏实例；此处 O(1)）。几何与基础卡片名区逐像素对齐。
+    if AppState.r-editing-index >= 0 && AppState.r-editing-index < AppState.r-entries.length: RenameEdit {
+        property <int> idx: AppState.r-editing-index;
+        x: 12px + mod(self.idx, root.cols) * root.pitch + 8px;
+        y: 12px + floor(self.idx / root.cols) * root.row-h + list.viewport-y
+            + root.icon-top + root.icon-box + root.name-gap;
         width: root.cell-w - 16px;
-        height: 0px;
-        if AppState.r-editing-index == i: RenameEdit {
-            x: 0px;
-            y: 0px;
-            width: parent.width;
-            multiline: true;   // 网格模式允许按名称区宽度换行
-            text: entry.name;
-            font-size: Theme.fs-small;
-            text-changed(t) => { AppState.r-rename-text = t; }
-            cancel => { AppState.r-editing-index = -1; }
-            commit(t) => {
-                AppState.r-rename-entry(i, t);
-                AppState.r-editing-index = -1;
-            }
+        multiline: true;   // 网格模式允许按名称区宽度换行
+        text: AppState.r-entries[self.idx].name;
+        font-size: Theme.fs-small;
+        text-changed(t) => { AppState.r-rename-text = t; }
+        cancel => { AppState.r-editing-index = -1; }
+        commit(t) => {
+            AppState.r-rename-entry(self.idx, t);
+            AppState.r-editing-index = -1;
         }
     }
 }

@@ -240,8 +240,9 @@ pub fn download(
 }
 
 /// 启动已下载的安装程序（分离进程）。成功后调用方应退出应用以便覆盖安装。
+/// 无窗口启动：经 hidden_command（CREATE_NO_WINDOW），安装更新时不闪终端。
 pub fn run_installer(path: &Path) -> Result<(), String> {
-    std::process::Command::new(path)
+    crate::fs::hidden::hidden_command(path)
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("启动安装程序失败：{e}"))

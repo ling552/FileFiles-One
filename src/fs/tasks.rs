@@ -150,6 +150,47 @@ pub struct Progress {
     pub fraction: f32,
     pub speed: String,
     pub eta: String,
+    /// 滚动窗口瞬时速率（字节/秒），供进度卡片绘制速率曲线；未知时为 0
+    pub speed_bps: f32,
+}
+
+/// 速率滚动窗口：窗口内首尾样本差值即瞬时速率，
+/// 比全程平均速率更贴近资源管理器的「当前速度」语义。
+const SPEED_WINDOW: Duration = Duration::from_millis(2000);
+
+/// 滚动窗口速率计：按 (时刻, 累计字节) 采样，输出最近窗口的瞬时速率。
+struct SpeedMeter {
+    samples: std::collections::VecDeque<(Instant, u64)>,
+}
+
+impl SpeedMeter {
+    fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// 记录一次累计字节采样，返回滚动窗口内的瞬时速率（字节/秒）。
+    fn push(&mut self, total_bytes: u64) -> f32 {
+        let now = Instant::now();
+        self.samples.push_back((now, total_bytes));
+        // 只保留窗口内（外加首个基准点）的样本
+        while self.samples.len() > 2
+            && now
+                .duration_since(self.samples.front().expect("样本队列非空").0)
+                > SPEED_WINDOW
+        {
+            self.samples.pop_front();
+        }
+        let (t0, b0) = self.samples.front().copied().unwrap_or((now, total_bytes));
+        let dt = now.duration_since(t0).as_secs_f64();
+        let bps = if dt > 0.05 {
+            total_bytes.saturating_sub(b0) as f64 / dt
+        } else {
+            0.0
+        };
+        bps as f32
+    }
 }
 
 /// 任务结果
@@ -205,6 +246,7 @@ pub fn run(
         skipped: 0,
         start: Instant::now(),
         last_emit: Instant::now() - Duration::from_secs(1),
+        meter: SpeedMeter::new(),
         remembered: None,
     };
 
@@ -310,6 +352,7 @@ fn run_delete(job: Job, ctrl: Arc<TaskControl>, report: impl Fn(Progress)) -> Ta
             },
             speed: String::new(),
             eta: String::new(),
+            speed_bps: 0.0,
         });
     };
 
@@ -626,6 +669,8 @@ struct Runner<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> {
     skipped: i32,
     start: Instant,
     last_emit: Instant,
+    /// 滚动窗口速率计（瞬时速率采样）
+    meter: SpeedMeter,
     /// 「应用到后续全部」选中后记忆的决策，子项冲突复用以避免逐个询问
     remembered: Option<ConflictDecision>,
 }
@@ -646,6 +691,7 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
             self.done_bytes,
             self.total_bytes,
             self.start,
+            &mut self.meter,
         ));
     }
 
@@ -1367,6 +1413,7 @@ fn name_of(p: &Path) -> String {
 }
 
 /// 组装一帧进度（比例 / 速度 / 剩余时间）。本地任务与便携设备任务共用。
+/// 速率取滚动窗口瞬时值（meter 内部维护采样），而非全程平均值。
 #[allow(clippy::too_many_arguments)]
 fn make_progress(
     op: &str,
@@ -1377,6 +1424,7 @@ fn make_progress(
     done_bytes: u64,
     total_bytes: u64,
     start: Instant,
+    meter: &mut SpeedMeter,
 ) -> Progress {
     let fraction = if total_bytes == 0 {
         if total_files <= 0 {
@@ -1390,13 +1438,13 @@ fn make_progress(
     };
 
     let elapsed = start.elapsed().as_secs_f64();
-    let (speed, eta) = if elapsed > 0.3 && done_bytes > 0 {
-        let bps = done_bytes as f64 / elapsed;
+    let (speed, eta, speed_bps) = if elapsed > 0.3 && done_bytes > 0 {
+        let bps = meter.push(done_bytes);
         let remain = total_bytes.saturating_sub(done_bytes);
-        let eta_secs = if bps > 0.0 { (remain as f64 / bps) as i64 } else { 0 };
-        (format!("{}/s", human_size(bps as u64)), fmt_eta(eta_secs))
+        let eta_secs = if bps > 0.0 { (remain as f64 / bps as f64) as i64 } else { 0 };
+        (format!("{}/s", human_size(bps as u64)), fmt_eta(eta_secs), bps)
     } else {
-        ("计算中…".to_string(), "计算中…".to_string())
+        ("计算中…".to_string(), "计算中…".to_string(), 0.0)
     };
 
     Progress {
@@ -1408,6 +1456,7 @@ fn make_progress(
         fraction: fraction.clamp(0.0, 1.0),
         speed,
         eta,
+        speed_bps,
     }
 }
 
@@ -1442,6 +1491,8 @@ struct MtpRun<'a, F: Fn(Progress)> {
     current: String,
     start: Instant,
     last_emit: Instant,
+    /// 滚动窗口速率计（瞬时速率采样）
+    meter: SpeedMeter,
 }
 
 impl<'a, F: Fn(Progress)> MtpRun<'a, F> {
@@ -1459,6 +1510,7 @@ impl<'a, F: Fn(Progress)> MtpRun<'a, F> {
             self.done_bytes,
             self.total_bytes,
             self.start,
+            &mut self.meter,
         ));
     }
 }
@@ -1550,6 +1602,7 @@ fn run_mtp(
         current: String::new(),
         start: Instant::now(),
         last_emit: Instant::now() - Duration::from_secs(1),
+        meter: SpeedMeter::new(),
     };
     run.current = "统计中…".to_string();
     run.emit(true);

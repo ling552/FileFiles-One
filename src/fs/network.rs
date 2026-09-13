@@ -111,12 +111,14 @@ mod windows_impl {
         }
     }
 
-    /// 找一个未使用的盘符（A-Z）。
+    /// 找一个未使用的盘符：优先 Z→D（A/B 为历史软驱、C 为系统盘，跳过），
+    /// 与 rclone 虚拟磁盘分配一致，避免抢占与软驱冲突。
     fn find_free_drive() -> Option<char> {
         let mask = unsafe { GetLogicalDrives() };
-        for i in 0..26u32 {
+        for c in ('D'..='Z').rev() {
+            let i = (c as u8 - b'A') as u32;
             if mask & (1 << i) == 0 {
-                return Some((b'A' + i as u8) as char);
+                return Some(c);
             }
         }
         None
@@ -151,11 +153,12 @@ pub fn unmount_smb(drive: &str) -> bool {
 
 /// 列出用户保存的网络位置连接（网络视图用）。SMB 已挂载的 path 为盘符，否则为 server；
 /// 云存储（FTP/WebDAV/SFTP）为 cloud:// 虚拟路径。
+/// WebDAV 使用 drive 图标类（虚拟磁盘，与 D:/H: 同图标），其余云存储用 folder。
 pub fn list_saved(locations: &[crate::config::NetworkLocation]) -> Vec<Entry> {
     locations
         .iter()
         .map(|l| {
-            let (path, kind, label) = match l.kind.as_str() {
+            let (path, kind, label, icon_class) = match l.kind.as_str() {
                 "ftp" | "webdav" | "sftp" => (
                     l.cloud_path(),
                     match l.kind.as_str() {
@@ -172,11 +175,18 @@ pub fn list_saved(locations: &[crate::config::NetworkLocation]) -> Vec<Entry> {
                         _ => "云",
                     }
                     .to_string(),
+                    match l.kind.as_str() {
+                        // 挂载图标预设改用 drive-<id> 矢量字形类，默认沿用数据盘图标
+                        "webdav" => super::cloud::mount_icon_class(l)
+                            .unwrap_or_else(|| "drive".to_string()),
+                        _ => "folder".to_string(),
+                    },
                 ),
                 _ => (
                     l.drive.clone().unwrap_or_else(|| l.server.clone()),
                     "网络位置".to_string(),
                     "网".to_string(),
+                    "folder".to_string(),
                 ),
             };
             Entry {
@@ -187,7 +197,7 @@ pub fn list_saved(locations: &[crate::config::NetworkLocation]) -> Vec<Entry> {
                 modified_ts: 0,
                 kind,
                 icon_label: label,
-                icon_class: "folder".into(),
+                icon_class,
             }
         })
         .collect()

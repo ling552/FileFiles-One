@@ -70,7 +70,7 @@ export component NetworkLocationDialog inherits Rectangle {
                     text: AppState.netloc-kind == "smb" ? "SMB 共享 (\\\\server\\share) 将挂载为驱动器"
                         : AppState.netloc-kind == "ftp" ? "FTP 默认端口 21，支持被动模式与 FTPS"
                         : AppState.netloc-kind == "sftp" ? "SFTP 默认端口 22，基于 SSH"
-                        : "WebDAV 默认 http:80 / https:443，支持 Basic 认证";
+                        : "WebDAV 默认 http:80 / https:443，支持 Basic 认证；添加后可在设置中挂载为虚拟硬盘";
                     font-size: 11px; color: Theme.muted; wrap: word-wrap;
                 }
 

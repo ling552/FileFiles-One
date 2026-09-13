@@ -64,9 +64,13 @@ fn is_media(path: &str) -> bool {
 
 /// 根据设置与条目来源生成明确的图标请求。
 /// `device://` 只使用类型/设备请求，不能进入真实路径 Shell 提取器。
+/// `config` 用于 WebDAV 挂载图标三态路由：
+/// 预设 → None（FileIcon 矢量字形）；自定义文件 → 无条件 RealPath 提取；
+/// 默认 → 系统模式取数据盘图标（IconRequest::DataDrive），矢量模式 None。
 fn icon_request_for_entry(
     e: &metadata::Entry,
     system_icons: bool,
+    config: &crate::config::AppConfig,
 ) -> Option<crate::fs::thumbnail::IconRequest> {
     use crate::fs::thumbnail::IconRequest;
 
@@ -88,6 +92,45 @@ fn icon_request_for_entry(
         });
     }
     if e.path.starts_with("cloud://") {
+        // WebDAV 账户根（cloud://webdav/Name，无子路径）：按挂载图标三态路由，
+        // 未挂载也生效（条目即虚拟磁盘预览，默认与 D:/H: 等数据盘同图标）。
+        // 子项（cloud://webdav/Name/子路径）必须走正常文件/文件夹图标，
+        // 不得复用数据盘图标，否则文件与文件夹分不清、全显示为硬盘图标。
+        let is_root = crate::fs::cloud::is_cloud_root(&e.path);
+        if is_root {
+            if let Some(loc) = cloud_webdav_of(config, &e.path) {
+                match loc.mount_icon_kind() {
+                    // 预设：icon_class 已改写为 drive-<id>，由 FileIcon 矢量渲染
+                    crate::config::MountIconKind::Preset(_) => return None,
+                    // 自定义图标文件：两种图标模式都提取位图（用户显式选择）
+                    crate::config::MountIconKind::File(p) => {
+                        return Some(IconRequest::RealPath {
+                            path: p,
+                            is_dir: false,
+                            mtime: 0,
+                        });
+                    }
+                    // 默认：数据盘系统图标（与 D:/H: 同一张）；矢量模式走内置 drive 矢量
+                    crate::config::MountIconKind::Default => {
+                        return if system_icons {
+                            Some(IconRequest::DataDrive)
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+            // 找不到账户的兜底：WebDAV 账户根仍取数据盘图标
+            if e.icon_class == "drive" {
+                return if system_icons {
+                    Some(IconRequest::DataDrive)
+                } else {
+                    None
+                };
+            }
+        }
+        // 子项与非 WebDAV 云存储：内置模式走矢量（icon_class 已由 classify 正确分类，
+        // 文件夹 folder、文件按扩展名），系统图标模式按类型取系统图标
         if !system_icons {
             return None;
         }
@@ -104,6 +147,27 @@ fn icon_request_for_entry(
     if crate::fs::virtualfs::is_virtual(&e.path) {
         return None;
     }
+    // 挂载盘根（如 "Z:\"，WebDAV rclone 虚拟磁盘）：默认态强制数据盘图标
+    // （不提取 WinFsp 卷自身图标，保证与 D:/H: 一致），预设/自定义按设置路由
+    if e.icon_class == "drive" && is_drive_root_path(&e.path) {
+        if let Some(loc) = webdav_of_drive(config, &e.path) {
+            return match loc.mount_icon_kind() {
+                crate::config::MountIconKind::Preset(_) => None, // icon_class 已被改写，防御分支
+                crate::config::MountIconKind::File(p) => Some(IconRequest::RealPath {
+                    path: p,
+                    is_dir: false,
+                    mtime: 0,
+                }),
+                crate::config::MountIconKind::Default => {
+                    if system_icons {
+                        Some(IconRequest::DataDrive)
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
+    }
     if system_icons || (!e.is_dir && is_media(&e.path)) {
         Some(IconRequest::RealPath {
             path: e.path.clone(),
@@ -113,6 +177,43 @@ fn icon_request_for_entry(
     } else {
         None
     }
+}
+
+/// 是否为驱动器根路径（如 "C:\"、"Z:/"）
+fn is_drive_root_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() == 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+/// cloud:// 虚拟路径对应的 WebDAV 账户（仅 kind == webdav 时命中）
+fn cloud_webdav_of<'a>(
+    config: &'a crate::config::AppConfig,
+    cloud_path: &str,
+) -> Option<&'a crate::config::NetworkLocation> {
+    let (kind, name, _) = crate::fs::cloud::parse_cloud_path(cloud_path)?;
+    if kind != "webdav" {
+        return None;
+    }
+    config
+        .network_locations
+        .iter()
+        .find(|l| l.kind == kind && l.name == name)
+}
+
+/// 盘符根路径（如 "Z:\"）对应的 WebDAV 挂载配置
+fn webdav_of_drive<'a>(
+    config: &'a crate::config::AppConfig,
+    drive_root: &str,
+) -> Option<&'a crate::config::NetworkLocation> {
+    let letter = drive_root.chars().next()?;
+    config.network_locations.iter().find(|l| {
+        l.kind == "webdav"
+            && l.drive
+                .as_deref()
+                .and_then(|d| d.chars().next())
+                .map(|c| c.to_ascii_uppercase() == letter.to_ascii_uppercase())
+                .unwrap_or(false)
+    })
 }
 
 /// 由缓存的图标像素构建 Slint 图像（必须在 UI 线程调用）。
@@ -155,6 +256,48 @@ pub(crate) fn image_cached(ic: &Arc<crate::fs::thumbnail::IconPixels>) -> Image 
 /// 被此处持有，旧图标继续显示且内存不释放。
 pub(crate) fn clear_icon_image_cache() {
     ICON_IMAGE_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+// ── 选中状态影子副本：refresh 系列据此只回填变化的行 ──
+// 旧实现对全模型逐行 row_data()（整行克隆，含 7 个字符串与图像句柄），
+// 数千行目录下每次单击/框选都会产生数 MB 的分配抖动与可感延迟。
+thread_local! {
+    static PUSHED_SELECTION: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static R_PUSHED_SELECTION: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 把选中布尔表同步到条目模型：仅对与影子副本不一致的行做 row_data/set_row_data。
+/// `shadow` 记录上次已推送的选中状态，必须在 push_entries/push_right 重建模型后
+/// 同步为当时烘焙进行的选中值。
+fn sync_selection_to_model(
+    model: &slint::ModelRc<FileEntry>,
+    selected: &[bool],
+    shadow: &mut Vec<bool>,
+) {
+    let rows = model.row_count();
+    for fi in 0..rows {
+        let sel = selected.get(fi).copied().unwrap_or(false);
+        if shadow.get(fi).copied() != Some(sel) {
+            if let Some(mut row) = model.row_data(fi) {
+                row.selected = sel;
+                model.set_row_data(fi, row);
+            }
+        }
+    }
+    shadow.clear();
+    shadow.extend_from_slice(&selected[..rows.min(selected.len())]);
+    shadow.resize(rows, false);
+}
+
+/// 由选中布尔表构建「选中下标」模型（网格选中卡片覆盖层的数据源）
+fn selected_indices_model(selected: &[bool]) -> slint::ModelRc<i32> {
+    let idx: Vec<i32> = selected
+        .iter()
+        .enumerate()
+        .filter(|(_, &s)| s)
+        .map(|(i, _)| i as i32)
+        .collect();
+    slint::ModelRc::new(slint::VecModel::from(idx))
 }
 
 // ── 侧栏图标异步加载：build_sidebar 只读缓存不阻塞 UI；未命中项记录到 ──
@@ -207,6 +350,19 @@ fn flush_sidebar_warm() {
                 ) {
                     crate::fs::thumbnail::sidebar_icon_set("__device__", arc);
                 }
+            } else if key == "datadrive:" {
+                // WebDAV 挂载盘默认态：与 D:/H: 同一张数据盘系统图标
+                if let Some(arc) = crate::fs::thumbnail::load_cached_request(
+                    &crate::fs::thumbnail::IconRequest::DataDrive,
+                    128,
+                ) {
+                    crate::fs::thumbnail::sidebar_icon_set("__datadrive__", arc);
+                }
+            } else if let Some(path) = key.strip_prefix("iconfile:") {
+                // 挂载图标自定义文件（.ico/.exe/.dll）：is_dir=false 提取文件自带图标
+                if let Some(arc) = crate::fs::thumbnail::load_cached(path, false, 0, 128) {
+                    crate::fs::thumbnail::sidebar_icon_set(path, arc);
+                }
             } else if let Some(path) = key.strip_prefix("path:") {
                 if let Some(arc) = crate::fs::thumbnail::load_cached(path, true, 0, 128) {
                     crate::fs::thumbnail::sidebar_icon_set(path, arc);
@@ -239,6 +395,56 @@ fn sidebar_icon(path: &str, is_dir: bool) -> (Image, bool) {
             note_sidebar_icon_missing(format!("path:{}", path));
             (Image::default(), false)
         }
+    }
+}
+
+/// 侧栏数据盘图标（WebDAV 挂载盘默认态，与 D:/H: 同一张系统图标）：
+/// 只读缓存不阻塞 UI，未命中记录待加载键由后台线程提取后重建侧栏
+fn sidebar_data_drive() -> (Image, bool) {
+    if let Some(ic) = crate::fs::thumbnail::sidebar_icon_get("__datadrive__") {
+        return (image_cached(&ic), true);
+    }
+    match crate::fs::thumbnail::cached_request(&crate::fs::thumbnail::IconRequest::DataDrive) {
+        Some(ic) => {
+            crate::fs::thumbnail::sidebar_icon_set("__datadrive__", ic.clone());
+            (image_cached(&ic), true)
+        }
+        None => {
+            note_sidebar_icon_missing("datadrive:".into());
+            (Image::default(), false)
+        }
+    }
+}
+
+/// 侧栏自定义图标文件位图（挂载图标 "file:<路径>"）：
+/// 只读缓存不阻塞 UI，未命中记录待加载键由后台线程提取（is_dir=false）
+fn sidebar_icon_file(path: &str) -> (Image, bool) {
+    if crate::fs::virtualfs::is_virtual(path) {
+        return (Image::default(), false);
+    }
+    if let Some(ic) = crate::fs::thumbnail::sidebar_icon_get(path) {
+        return (image_cached(&ic), true);
+    }
+    match crate::fs::thumbnail::cached(path, false, 0) {
+        Some(ic) => {
+            crate::fs::thumbnail::sidebar_icon_set(path, ic.clone());
+            (image_cached(&ic), true)
+        }
+        None => {
+            note_sidebar_icon_missing(format!("iconfile:{}", path));
+            (Image::default(), false)
+        }
+    }
+}
+
+/// 挂载图标预设 ID -> Segoe MDL2 字形（侧栏与 FileIcon 使用同一组字形）
+fn mount_preset_glyph(id: &str) -> &'static str {
+    match id {
+        "cloud" => "\u{E753}",
+        "net" => "\u{E968}",
+        "folder" => "\u{E8B7}",
+        "vault" => "\u{E72E}",
+        _ => "\u{E735}", // star
     }
 }
 
@@ -332,7 +538,7 @@ pub fn push_entries(ui: &MainWindow, core: &AppCore) {
     let icon_requests: Vec<Option<crate::fs::thumbnail::IconRequest>> = tab
         .filtered
         .iter()
-        .map(|&ei| icon_request_for_entry(&tab.entries[ei], system_icons))
+        .map(|&ei| icon_request_for_entry(&tab.entries[ei], system_icons, &core.config))
         .collect();
     let cached_icons: Vec<Option<std::sync::Arc<crate::fs::thumbnail::IconPixels>>> = icon_requests
         .iter()
@@ -400,6 +606,13 @@ pub fn push_entries(ui: &MainWindow, core: &AppCore) {
     }
 
     state.set_entries(ModelRc::new(VecModel::from(rows)));
+    // 模型重建已烘焙选中值，同步影子副本；并推送选中下标供网格覆盖层使用
+    PUSHED_SELECTION.with(|shadow| {
+        let mut s = shadow.borrow_mut();
+        s.clear();
+        s.extend_from_slice(&tab.selected);
+    });
+    state.set_selected_indices(selected_indices_model(&tab.selected));
     // 选中计数：网格选中卡片据此决定是否展开完整名称（仅单选展开）
     state.set_selected_count(
         core.active_tab().selected.iter().filter(|&&s| s).count() as i32,
@@ -722,7 +935,7 @@ pub fn push_right(ui: &MainWindow, core: &AppCore) {
     let icon_requests: Vec<Option<crate::fs::thumbnail::IconRequest>> = tab
         .filtered
         .iter()
-        .map(|&ei| icon_request_for_entry(&tab.entries[ei], system_icons))
+        .map(|&ei| icon_request_for_entry(&tab.entries[ei], system_icons, &core.config))
         .collect();
     let cached_icons: Vec<Option<std::sync::Arc<crate::fs::thumbnail::IconPixels>>> = icon_requests
         .iter()
@@ -783,6 +996,13 @@ pub fn push_right(ui: &MainWindow, core: &AppCore) {
     }
 
     state.set_r_entries(ModelRc::new(VecModel::from(rows)));
+    // 模型重建已烘焙选中值，同步影子副本；并推送选中下标供右面板网格覆盖层使用
+    R_PUSHED_SELECTION.with(|shadow| {
+        let mut s = shadow.borrow_mut();
+        s.clear();
+        s.extend_from_slice(&tab.selected);
+    });
+    state.set_r_selected_indices(selected_indices_model(&tab.selected));
     state.set_r_selected_count(tab.selected.iter().filter(|&&s| s).count() as i32);
 
     // 导航到新目录后重置右面板滚动位置到顶部
@@ -842,16 +1062,11 @@ pub fn refresh_right_selection(ui: &MainWindow, core: &AppCore) {
     let state = ui.global::<AppState>();
     let model = state.get_r_entries();
     let tab = &core.right_pane;
-    for fi in 0..model.row_count() {
-        if let Some(mut row) = model.row_data(fi) {
-            let sel = tab.selected.get(fi).copied().unwrap_or(false);
-            if row.selected != sel {
-                row.selected = sel;
-                model.set_row_data(fi, row);
-            }
-        }
-    }
+    R_PUSHED_SELECTION.with(|shadow| {
+        sync_selection_to_model(&model, &tab.selected, &mut shadow.borrow_mut());
+    });
     state.set_r_selected_count(tab.selected.iter().filter(|&&s| s).count() as i32);
+    state.set_r_selected_indices(selected_indices_model(&tab.selected));
 }
 
 /// 构建面包屑链
@@ -973,6 +1188,12 @@ pub fn update_selection_pane(ui: &MainWindow, core: &AppCore, right: bool) {
             // 切换选中项时重置文件夹大小计算状态：新文件夹需重新点「计算」
             state.set_sel_size_calculating(false);
             state.set_sel_path(e.path.clone().into());
+            // 单选 Office 文档时预热：停留约 1 秒后后台把文档转成 PDF 缓存，
+            // 按空格预览即命中缓存秒开（否则每次都要等 Office 冷启动 10~20 秒）。
+            // 预览已打开时不预热 —— 预览自身已在后台转换，重复投递只会空等锁。
+            if !e.is_dir && !state.get_quicklook_open() {
+                crate::fs::office_preview::request_warmup(Path::new(&e.path));
+            }
             // 设置开启「计算文件夹大小」时选中即自动后台统计（大文件夹期间显示"计算中"）
             if e.is_dir && core.config.settings.calc_folder_size {
                 state.invoke_calculate_folder_size();
@@ -1037,16 +1258,12 @@ pub fn refresh_selection(ui: &MainWindow, core: &AppCore) {
     let state = ui.global::<AppState>();
     let model = state.get_entries();
     let tab = core.active_tab();
-    for fi in 0..model.row_count() {
-        if let Some(mut row) = model.row_data(fi) {
-            let sel = tab.selected.get(fi).copied().unwrap_or(false);
-            if row.selected != sel {
-                row.selected = sel;
-                model.set_row_data(fi, row);
-            }
-        }
-    }
+    PUSHED_SELECTION.with(|shadow| {
+        sync_selection_to_model(&model, &tab.selected, &mut shadow.borrow_mut());
+    });
     state.set_selected_count(tab.selected.iter().filter(|&&s| s).count() as i32);
+    // 网格选中卡片覆盖层按选中下标渲染（O(选中数) 而非 O(条目数)）
+    state.set_selected_indices(selected_indices_model(&tab.selected));
     update_status(ui, core);
     update_selection(ui, core);
 }
@@ -1246,17 +1463,54 @@ pub fn build_sidebar(
             } else {
                 slint::Color::from_rgb_u8(0x00, 0x78, 0xd4)
             };
-            // 系统图标模式下提取盘符真实图标
-            let (disk_thumb, disk_has_thumb) = if system_icons {
-                sidebar_icon(&disk.root, true)
-            } else {
-                (Image::default(), false)
-            };
+            // 挂载盘（WebDAV rclone 虚拟磁盘）：按挂载图标设置路由——
+            // 预设 → drive-<id> 矢量字形；自定义文件 → 提取位图；
+            // 默认 → 数据盘图标（与 D:/H: 一致，不提取 WinFsp 卷自身图标）。
+            // 普通盘保持原策略：系统模式提取真实盘符图标，矢量模式内置 drive 矢量。
+            let mount_loc = config.network_locations.iter().find(|l| {
+                l.kind == "webdav"
+                    && l.drive
+                        .as_deref()
+                        .and_then(|d| d.chars().next())
+                        .map(|c| {
+                            disk.letter
+                                .chars()
+                                .next()
+                                .map(|dl| c.to_ascii_uppercase() == dl.to_ascii_uppercase())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+            });
+            let (disk_class, disk_thumb, disk_has_thumb) =
+                match mount_loc.map(|l| l.mount_icon_kind()) {
+                    Some(crate::config::MountIconKind::Preset(id)) => (
+                        format!("drive-{}", id),
+                        Image::default(),
+                        false,
+                    ),
+                    Some(crate::config::MountIconKind::File(p)) => {
+                        let (t, h) = sidebar_icon_file(&p);
+                        ("drive".to_string(), t, h)
+                    }
+                    _ => {
+                        if system_icons {
+                            if mount_loc.is_some() {
+                                let (t, h) = sidebar_data_drive();
+                                ("drive".to_string(), t, h)
+                            } else {
+                                let (t, h) = sidebar_icon(&disk.root, true);
+                                ("drive".to_string(), t, h)
+                            }
+                        } else {
+                            ("drive".to_string(), Image::default(), false)
+                        }
+                    }
+                };
             items.push(NavItem {
                 label: disk.name.clone().into(),
                 path: disk.root.clone().into(),
                 icon: disk.letter.clone().into(),
-                icon_class: "drive".into(),
+                icon_class: disk_class.into(),
                 badge: "".into(),
                 is_header: false,
                 is_disk: true,
@@ -1306,24 +1560,44 @@ pub fn build_sidebar(
                 has_thumb: device_has_thumb,
             });
         }
-        // 云存储（FTP/WebDAV/SFTP）：在“此电脑”展开时一并列出，便于直达
+        // 云存储（FTP/WebDAV/SFTP）：在“此电脑”展开时一并列出，便于直达。
+        // 已挂载为虚拟磁盘的 WebDAV 不再单列（真实盘符 Z:\ 已在上方磁盘区，
+        // 与 D:/H: 一样带容量条显示，避免同一账户出现磁盘 + 云两项重复）。
         for loc in &config.network_locations {
             if !matches!(loc.kind.as_str(), "ftp" | "webdav" | "sftp") {
                 continue;
             }
+            if crate::fs::cloud::is_webdav_mounted(loc) {
+                continue;
+            }
             let vpath = loc.cloud_path();
-            let glyph = match loc.kind.as_str() {
-                "ftp" => "\u{E968}",   // Network
-                "sftp" => "\u{E8B7}",  // Folder
-                "webdav" => "\u{E753}", // Cloud
-                _ => "\u{E753}",
-            };
-            // 云图标：按系统图标或内置图标
-            let (cloud_thumb, cloud_has_thumb) = if system_icons {
-                // 尝试取侧栏缓存，未命中则用内置字形的 glyph
-                (Image::default(), false)
+            // WebDAV：挂载图标预设换字形、自定义文件提取位图，默认保持云端字形
+            let (glyph, cloud_thumb, cloud_has_thumb) = if loc.kind == "webdav" {
+                match loc.mount_icon_kind() {
+                    crate::config::MountIconKind::Preset(id) => {
+                        (mount_preset_glyph(&id), Image::default(), false)
+                    }
+                    crate::config::MountIconKind::File(p) => {
+                        let (t, h) = sidebar_icon_file(&p);
+                        ("\u{E753}", t, h)
+                    }
+                    crate::config::MountIconKind::Default => {
+                        // 系统图标模式下取数据盘位图，与挂载盘图标一致
+                        if system_icons {
+                            let (t, h) = sidebar_data_drive();
+                            ("\u{E753}", t, h)
+                        } else {
+                            ("\u{E753}", Image::default(), false)
+                        }
+                    }
+                }
             } else {
-                (Image::default(), false)
+                let g = match loc.kind.as_str() {
+                    "ftp" => "\u{E968}",   // Network
+                    "sftp" => "\u{E8B7}",  // Folder
+                    _ => "\u{E753}",
+                };
+                (g, Image::default(), false)
             };
             items.push(NavItem {
                 label: loc.name.clone().into(),
@@ -1463,11 +1737,37 @@ pub fn push_network_locations(ui: &MainWindow, core: &AppCore) {
         .config
         .network_locations
         .iter()
-        .map(|l| NetAccount {
-            name: l.name.clone().into(),
-            server: if !l.host.is_empty() { l.display_server().into() } else { l.server.clone().into() },
-            drive: l.drive.clone().unwrap_or_default().into(),
-            kind: l.kind.clone().into(),
+        .map(|l| {
+            // WebDAV 已挂载判定：内存挂载表或配置盘符真实存在任一即算，
+            // 避免单信号延迟导致按钮在成功瞬间仍显示“挂载”
+            let mounted = l.kind == "webdav" && crate::fs::cloud::is_webdav_mounted(l);
+            let mounting =
+                l.kind == "webdav" && !mounted && crate::fs::rclone::is_mounting(&l.name);
+            // 已设置的挂载盘符（mount_drive 单字母转 "X:" 显示，未设置为空串）
+            let mount_setting = if l.kind == "webdav" {
+                l.mount_drive
+                    .as_deref()
+                    .map(|d| {
+                        let t = d.trim().trim_end_matches(':').to_ascii_uppercase();
+                        if t.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{}:", t.chars().next().unwrap_or('Z'))
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            NetAccount {
+                name: l.name.clone().into(),
+                server: if !l.host.is_empty() { l.display_server().into() } else { l.server.clone().into() },
+                drive: l.drive.clone().unwrap_or_default().into(),
+                kind: l.kind.clone().into(),
+                mounted,
+                mounting,
+                mount_setting: mount_setting.into(),
+            }
         })
         .collect();
     ui.global::<AppState>()
@@ -1839,6 +2139,18 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
     state.set_ql_web_mode(false);
     state.set_ql_office_doc(false);
     state.set_ql_office_pending(false);
+    // 重置上一次内容的图片尺寸：视频/音频不设置宽高，若残留旧值，
+    // 预览窗口会按上一次图片的尺寸打开（视频无法以合适大小预览）。
+    state.set_ql_img_w(0);
+    state.set_ql_img_h(0);
+    // 播放状态复位：上一首的进度/暂停/静音/速率不带到新文件（音频控制条用）
+    state.set_ql_video_position(0);
+    state.set_ql_video_duration(0);
+    state.set_ql_video_paused(false);
+    state.set_ql_video_muted(false);
+    state.set_ql_video_rate(1.0);
+    // 慢速文件系统异步读取标记复位（Text/Archive 分支按需置真）
+    state.set_ql_loading_async(false);
     // 条目的真实缩略图/系统图标（取对应面板列表模型已生成的位图），头部与大图标优先显示
     let model = if right {
         state.get_r_entries()
@@ -1857,6 +2169,9 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
     } else {
         format!("{} · {}", e.kind, metadata::human_size(e.size_bytes))
     };
+    // 慢速文件系统（应用挂载的 WebDAV/rclone 虚拟盘、SMB 网络盘）：
+    // 同步读取实为网络请求，会卡死 UI 线程数秒，文本/音频改为后台读取回填
+    let slow = !e.is_dir && is_slow_preview_fs(&core.config, path);
 
     match kind {
         PreviewKind::Image => {
@@ -1884,82 +2199,122 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
             // 文档源码视图也显示抽取出的可读内容；抽取失败时保留明确错误，而不是十六进制乱码。
             // Office（含旧版 doc/xls/ppt）与 PDF 走 document_text 高保真通道。
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            // Office 文档：标记高保真模式（隐藏渲染/源码切换）。缓存未命中且本机
-            // 装有对应 Office 时挂起显示加载条，文本仅预填供转换失败回退用。
-            if crate::fs::office_preview::is_office_doc(path) {
-                state.set_ql_office_doc(true);
-                let fresh = crate::fs::office_preview::cached_pdf_if_fresh(path).is_some();
-                let installed = crate::fs::office_preview::office_app_for_ext(&ext)
-                    .map(|a| crate::fs::office_preview::is_office_installed(a))
-                    .unwrap_or(false);
-                state.set_ql_office_pending(!fresh && installed);
-            }
+            // Office 文档：标记高保真模式（隐藏渲染/源码切换）。
+            // 类型判定按扩展名（零 IO）；缓存命中/安装检测涉及磁盘访问，
+            // 慢速文件系统时随正文一起放后台（见 spawn_slow_text_fill）。
             let is_office = crate::fs::office_preview::is_office_doc(path);
-            let text = if is_office || ext == "pdf" {
-                preview::document_text(path).unwrap_or_else(|e| format!("文档内容暂时无法预览：{}", e))
+            if is_office {
+                state.set_ql_office_doc(true);
+            }
+            if slow {
+                // 慢速文件系统：正文读取（最长可到数秒）放后台，
+                // 窗口先以加载态显示，读取完成后回填正文并收起加载动画。
+                state.set_ql_loading_async(true);
+                spawn_slow_text_fill(ui, path, ext, is_office);
             } else {
-                preview::read_text_head(path, 64 * 1024)
-            };
-            let layers = crate::fs::highlight::highlight(&text, &ext);
-            state.set_ql_text(layers.base.into());
-            state.set_ql_code_kw(layers.keywords.into());
-            state.set_ql_code_str(layers.strings.into());
-            state.set_ql_code_cmt(layers.comments.into());
+                if is_office {
+                    let fresh = crate::fs::office_preview::cached_pdf_if_fresh(path).is_some();
+                    let installed = crate::fs::office_preview::office_app_for_ext(&ext)
+                        .map(|a| crate::fs::office_preview::is_office_installed(a))
+                        .unwrap_or(false);
+                    state.set_ql_office_pending(!fresh && installed);
+                }
+                let text = if is_office || ext == "pdf" {
+                    preview::document_text(path).unwrap_or_else(|e| format!("文档内容暂时无法预览：{}", e))
+                } else {
+                    preview::read_text_head(path, 64 * 1024)
+                };
+                let layers = crate::fs::highlight::highlight(&text, &ext);
+                state.set_ql_text(layers.base.into());
+                state.set_ql_code_kw(layers.keywords.into());
+                state.set_ql_code_str(layers.strings.into());
+                state.set_ql_code_cmt(layers.comments.into());
+            }
         }
         PreviewKind::Video => {
-            // 视频：画面由 Media Foundation 子窗口处理
-            state.set_ql_subtitle(size_text.into());
+            // 视频：窗口在显示前就按真实画面尺寸定型（与图片分支同理），避免固定窗口。
+            // ql_img_w/h 在本函数开头已清零（防上一次图片尺寸残留），此处探测成功才赋值，
+            // 失败时保持 0，由 MF 就绪回调回填并重定窗口。
+            // 慢速文件系统（WebDAV/SMB 挂载盘）跳过同步探测：Shell 属性读取可能阻塞数秒，
+            // 留待 MF 异步就绪后重定窗口。
+            if slow {
+                state.set_ql_subtitle(size_text.into());
+            } else if let Some((vw, vh)) =
+                crate::fs::video_preview::probe_display_size(&path.to_string_lossy())
+            {
+                if vw > 0 && vh > 0 {
+                    state.set_ql_img_w(vw as i32);
+                    state.set_ql_img_h(vh as i32);
+                    state.set_ql_subtitle(
+                        format!("{}×{} 像素 · {}", vw, vh, size_text).into(),
+                    );
+                } else {
+                    state.set_ql_subtitle(size_text.into());
+                }
+            } else {
+                state.set_ql_subtitle(size_text.into());
+            }
         }
         PreviewKind::Audio => {
             // 音频：提取元数据与封面，显示专用音频播放器 UI
             let mut subtitle = size_text.clone();
-            use lofty::file::{AudioFile, TaggedFileExt};
-            if let Ok(tf) = lofty::probe::read_from_path(path) {
-                let duration = tf.properties().duration();
-                let time_str = format!("{}:{:02}", duration.as_secs() / 60, duration.as_secs() % 60);
+            if slow {
+                // 慢速文件系统：标签/封面读取放后台；加载动画由媒体就绪回调收起
+                spawn_slow_audio_fill(ui, path, size_text);
+            } else {
+                use lofty::file::{AudioFile, TaggedFileExt};
+                if let Ok(tf) = lofty::probe::read_from_path(path) {
+                    let duration = tf.properties().duration();
+                    let time_str = format!("{}:{:02}", duration.as_secs() / 60, duration.as_secs() % 60);
 
-                // 提取标签信息与封面
-                let mut meta_parts = Vec::new();
-                if let Some(tag) = tf.primary_tag() {
-                    if let Some(title) = tag.get_string(&lofty::tag::ItemKey::TrackTitle) {
-                        meta_parts.push(format!("标题：{}", title));
-                    }
-                    if let Some(artist) = tag.get_string(&lofty::tag::ItemKey::TrackArtist) {
-                        meta_parts.push(format!("艺术家：{}", artist));
-                    }
-                    if let Some(album) = tag.get_string(&lofty::tag::ItemKey::AlbumTitle) {
-                        meta_parts.push(format!("专辑：{}", album));
-                    }
+                    // 提取标签信息与封面
+                    let mut meta_parts = Vec::new();
+                    if let Some(tag) = tf.primary_tag() {
+                        if let Some(title) = tag.get_string(&lofty::tag::ItemKey::TrackTitle) {
+                            meta_parts.push(format!("标题：{}", title));
+                        }
+                        if let Some(artist) = tag.get_string(&lofty::tag::ItemKey::TrackArtist) {
+                            meta_parts.push(format!("艺术家：{}", artist));
+                        }
+                        if let Some(album) = tag.get_string(&lofty::tag::ItemKey::AlbumTitle) {
+                            meta_parts.push(format!("专辑：{}", album));
+                        }
 
-                    // 提取内嵌封面图片
-                    let pictures = tag.pictures();
-                    if let Some(pic) = pictures.first() {
-                        if let Ok(img) = image::load_from_memory(pic.data()) {
-                            let rgba = img.to_rgba8();
-                            let (w, h) = (rgba.width(), rgba.height());
-                            let pixels: Vec<u8> = rgba.into_raw();
-                            let slint_img = slint::Image::from_rgba8(
-                                slint::SharedPixelBuffer::clone_from_slice(&pixels, w, h)
-                            );
-                            state.set_ql_thumb(slint_img);
-                            state.set_ql_has_thumb(true);
+                        // 提取内嵌封面图片
+                        let pictures = tag.pictures();
+                        if let Some(pic) = pictures.first() {
+                            if let Ok(img) = image::load_from_memory(pic.data()) {
+                                let rgba = img.to_rgba8();
+                                let (w, h) = (rgba.width(), rgba.height());
+                                let pixels: Vec<u8> = rgba.into_raw();
+                                let slint_img = slint::Image::from_rgba8(
+                                    slint::SharedPixelBuffer::clone_from_slice(&pixels, w, h)
+                                );
+                                state.set_ql_thumb(slint_img);
+                                state.set_ql_has_thumb(true);
+                            }
                         }
                     }
-                }
 
-                subtitle = if meta_parts.is_empty() {
-                    format!("音频 · {} · {}", time_str, size_text)
-                } else {
-                    format!("{} · 音频 · {} · {}", meta_parts.join(" · "), time_str, size_text)
-                };
+                    subtitle = if meta_parts.is_empty() {
+                        format!("音频 · {} · {}", time_str, size_text)
+                    } else {
+                        format!("{} · 音频 · {} · {}", meta_parts.join(" · "), time_str, size_text)
+                    };
+                }
+                state.set_ql_subtitle(subtitle.into());
             }
-            state.set_ql_subtitle(subtitle.into());
         }
         PreviewKind::Archive => {
             // 归档：内容为可展开/折叠的树（kind==5），由 preview_host 读取归档并
             // 生成节点模型；此处只给出「类型 · 压缩包体积」副标题，
             // 归档内统计由 preview_host 追加。
             state.set_ql_subtitle(size_text.into());
+            if slow {
+                // 慢速文件系统：整包读取是网络请求，置异步标记，
+                // preview_host::push_content 据此把归档读取放后台线程
+                state.set_ql_loading_async(true);
+            }
         }
         PreviewKind::Folder => {
             state.set_ql_subtitle("文件夹".into());
@@ -1984,6 +2339,179 @@ pub fn fill_quicklook(ui: &MainWindow, core: &AppCore, right: bool) -> bool {
         }
     }
     true
+}
+
+/// 慢速文件系统判定：应用自身挂载的 WebDAV/rclone 虚拟盘（按配置的盘符匹配）、
+/// SMB/映射网络驱动器（GetDriveTypeW == DRIVE_REMOTE）。这类路径上的文件读取
+/// 实为网络请求，预览内容必须放后台线程，否则 UI 线程被卡死数秒。
+fn is_slow_preview_fs(config: &crate::config::AppConfig, path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    // 应用自身挂载的 WebDAV 虚拟磁盘（drive / mount_drive 任一匹配盘符）
+    let letter = s.chars().next().map(|c| c.to_ascii_uppercase());
+    if letter.is_some()
+        && config.network_locations.iter().any(|l| {
+            l.kind == "webdav"
+                && [
+                    l.drive.as_deref(),
+                    l.mount_drive.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d.chars().next())
+                .any(|c| c.to_ascii_uppercase() == letter.unwrap())
+        })
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+        // 取卷根："X:\a\b.txt" → "X:\"；UNC（\\server\share\...）取 \\server\share。
+        // splitn 产生前导空段（来自 \\ 起始），须按下标取第 3/4 段重组双反斜杠根，
+        // filter+单反斜杠拼接会得到非法根（GetDriveTypeW 误判为本地盘）
+        let root: String = {
+            let b = s.as_bytes();
+            if b.len() >= 2 && b[1] == b':' {
+                format!("{}\\", &s[..2])
+            } else if s.starts_with("\\\\") {
+                let parts: Vec<&str> = s.splitn(4, '\\').collect();
+                let (server, share) = match (parts.get(2), parts.get(3)) {
+                    (Some(sv), Some(sh)) => (*sv, sh.split('\\').next().unwrap_or("")),
+                    _ => return false,
+                };
+                if server.is_empty() || share.is_empty() {
+                    return false;
+                }
+                format!("\\\\{}\\{}", server, share)
+            } else {
+                return false;
+            }
+        };
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY：root 以 NUL 结尾的合法 Windows 路径，GetDriveTypeW 仅读该字符串。
+        // 返回 4 = DRIVE_REMOTE（网络驱动器；windows-sys 0.59 未导出该常量，用文档值）
+        unsafe { GetDriveTypeW(wide.as_ptr()) == 4u32 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// 慢速文件系统上的文本预览：正文读取与 Office 缓存探测放后台线程，
+/// 完成后回填正文/染色层并收起加载动画。预览已关闭或已切换文件时丢弃结果。
+fn spawn_slow_text_fill(ui: &MainWindow, path: &Path, ext: String, is_office: bool) {
+    let path_buf = PathBuf::from(path);
+    let key = path.to_string_lossy().into_owned();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        // Office 缓存命中与安装检测（涉及磁盘/注册表访问）一并放后台
+        let fresh = is_office && crate::fs::office_preview::cached_pdf_if_fresh(&path_buf).is_some();
+        let installed = crate::fs::office_preview::office_app_for_ext(&ext)
+            .map(|a| crate::fs::office_preview::is_office_installed(a))
+            .unwrap_or(false);
+        let text = if is_office || ext == "pdf" {
+            crate::fs::preview::document_text(&path_buf)
+                .unwrap_or_else(|e| format!("文档内容暂时无法预览：{}", e))
+        } else {
+            crate::fs::preview::read_text_head(&path_buf, 64 * 1024)
+        };
+        let layers = crate::fs::highlight::highlight(&text, &ext);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let state = ui.global::<AppState>();
+            // 预览已关闭或已切换到其它文件：丢弃迟到的结果
+            if !state.get_quicklook_open() || state.get_sel_path() != key.as_str() {
+                return;
+            }
+            state.set_ql_office_pending(is_office && !fresh && installed);
+            state.set_ql_text(layers.base.clone().into());
+            state.set_ql_code_kw(layers.keywords.clone().into());
+            state.set_ql_code_str(layers.strings.clone().into());
+            state.set_ql_code_cmt(layers.comments.clone().into());
+            // 正文就绪：收起加载动画（主窗口与独立预览窗口两份状态）
+            state.set_ql_loading(false);
+            state.set_ql_loading_async(false);
+            // 同步到独立预览窗口的源码文本层（渲染/源码切换即时生效）
+            if let Some(pw) = crate::preview_host::window() {
+                let dst = pw.global::<crate::PreviewState>();
+                dst.set_text_content(layers.base.into());
+                dst.set_code_kw(layers.keywords.into());
+                dst.set_code_str(layers.strings.into());
+                dst.set_code_cmt(layers.comments.into());
+                crate::preview_host::set_loading(&pw, false);
+            }
+        });
+    });
+}
+
+/// 慢速文件系统上的音频预览：标签/封面读取放后台线程，
+/// 完成后回填副标题与封面（主窗口与独立预览窗口同步）。加载动画由音频就绪回调收起。
+fn spawn_slow_audio_fill(ui: &MainWindow, path: &Path, size_text: String) {
+    let path_buf = PathBuf::from(path);
+    let key = path.to_string_lossy().into_owned();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        use lofty::file::{AudioFile, TaggedFileExt};
+
+        let mut subtitle = size_text.clone();
+        let mut cover: Option<(Vec<u8>, u32, u32)> = None;
+        if let Ok(tf) = lofty::probe::read_from_path(&path_buf) {
+            let duration = tf.properties().duration();
+            let time_str = format!("{}:{:02}", duration.as_secs() / 60, duration.as_secs() % 60);
+
+            let mut meta_parts = Vec::new();
+            if let Some(tag) = tf.primary_tag() {
+                if let Some(title) = tag.get_string(&lofty::tag::ItemKey::TrackTitle) {
+                    meta_parts.push(format!("标题：{}", title));
+                }
+                if let Some(artist) = tag.get_string(&lofty::tag::ItemKey::TrackArtist) {
+                    meta_parts.push(format!("艺术家：{}", artist));
+                }
+                if let Some(album) = tag.get_string(&lofty::tag::ItemKey::AlbumTitle) {
+                    meta_parts.push(format!("专辑：{}", album));
+                }
+                if let Some(pic) = tag.pictures().first() {
+                    if let Ok(img) = image::load_from_memory(pic.data()) {
+                        let rgba = img.to_rgba8();
+                        let (w, h) = (rgba.width(), rgba.height());
+                        cover = Some((rgba.into_raw(), w, h));
+                    }
+                }
+            }
+
+            subtitle = if meta_parts.is_empty() {
+                format!("音频 · {} · {}", time_str, size_text)
+            } else {
+                format!("{} · 音频 · {} · {}", meta_parts.join(" · "), time_str, size_text)
+            };
+        }
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let state = ui.global::<AppState>();
+            // 预览已关闭或已切换到其它文件：丢弃迟到的结果
+            if !state.get_quicklook_open() || state.get_sel_path() != key.as_str() {
+                return;
+            }
+            state.set_ql_subtitle(subtitle.clone().into());
+            if let Some((pixels, w, h)) = cover {
+                let img = slint::Image::from_rgba8(slint::SharedPixelBuffer::clone_from_slice(
+                    &pixels, w, h,
+                ));
+                state.set_ql_thumb(img.clone());
+                state.set_ql_has_thumb(true);
+                // 同步到独立预览窗口（封面卡片即时换成内嵌封面）
+                if let Some(pw) = crate::preview_host::window() {
+                    pw.global::<crate::PreviewState>().set_thumb(img);
+                    pw.global::<crate::PreviewState>().set_has_thumb(true);
+                }
+            }
+            // 副标题同步到独立预览窗口头部
+            if let Some(pw) = crate::preview_host::window() {
+                crate::preview_host::set_subtitle(&pw, &subtitle);
+            }
+        });
+    });
 }
 
 /// 推送标签页列表到 UI
@@ -2035,18 +2563,41 @@ mod icon_request_tests {
         }
     }
 
+    fn webdav_config(mount_icon: &str, drive: Option<&str>) -> crate::config::AppConfig {
+        let mut config = crate::config::AppConfig::default();
+        config.network_locations.push(crate::config::NetworkLocation {
+            name: "PikPak".into(),
+            server: String::new(),
+            kind: "webdav".into(),
+            drive: drive.map(|d| d.to_string()),
+            host: "dav.example.com".into(),
+            port: 0,
+            remote_path: "/".into(),
+            username: String::new(),
+            password: String::new(),
+            use_tls: false,
+            passive: true,
+            mount_drive: drive.map(|d| d.to_string()),
+            mount_readonly: false,
+            mount_max_size_gb: None,
+            mount_icon: mount_icon.into(),
+        });
+        config
+    }
+
     #[test]
     fn device_entries_never_become_real_path_requests() {
+        let cfg = crate::config::AppConfig::default();
         let device = entry("手机", "device://id", true, "device");
         assert_eq!(
-            icon_request_for_entry(&device, true),
+            icon_request_for_entry(&device, true, &cfg),
             Some(IconRequest::Device)
         );
-        assert_eq!(icon_request_for_entry(&device, false), None);
+        assert_eq!(icon_request_for_entry(&device, false, &cfg), None);
 
         let file = entry("报告.PDF", "device://id\u{1}object", false, "document");
         assert_eq!(
-            icon_request_for_entry(&file, true),
+            icon_request_for_entry(&file, true, &cfg),
             Some(IconRequest::Type {
                 extension: "PDF".into(),
                 is_dir: false,
@@ -2056,14 +2607,113 @@ mod icon_request_tests {
 
     #[test]
     fn local_and_other_virtual_entries_keep_existing_policy() {
+        let cfg = crate::config::AppConfig::default();
         let local = entry("readme.txt", r"C:\readme.txt", false, "document");
         assert!(matches!(
-            icon_request_for_entry(&local, true),
+            icon_request_for_entry(&local, true, &cfg),
             Some(IconRequest::RealPath { .. })
         ));
-        assert_eq!(icon_request_for_entry(&local, false), None);
+        assert_eq!(icon_request_for_entry(&local, false, &cfg), None);
 
         let tag = entry("重要", "tag://important", true, "folder");
-        assert_eq!(icon_request_for_entry(&tag, true), None);
+        assert_eq!(icon_request_for_entry(&tag, true, &cfg), None);
+    }
+
+    #[test]
+    fn webdav_drive_uses_data_drive_icon_not_folder() {
+        // 无账户配置的兜底：WebDAV 账户根仍取数据盘系统图标，与 D:/H: 一致，而非文件夹
+        let cfg = crate::config::AppConfig::default();
+        let dav = entry("PikPak", "cloud://webdav/PikPak", true, "drive");
+        assert_eq!(
+            icon_request_for_entry(&dav, true, &cfg),
+            Some(IconRequest::DataDrive)
+        );
+        assert_eq!(icon_request_for_entry(&dav, false, &cfg), None);
+        // 子项不得复用数据盘图标：文件夹走文件夹类型，文件走扩展名类型，
+        // 否则云端目录全显示为硬盘图标、文件与文件夹分不清
+        let child_dir = entry("My Pack", "cloud://webdav/PikPak/My Pack", true, "folder");
+        assert_eq!(
+            icon_request_for_entry(&child_dir, true, &cfg),
+            Some(IconRequest::Type {
+                extension: "".into(),
+                is_dir: true,
+            })
+        );
+        assert_eq!(icon_request_for_entry(&child_dir, false, &cfg), None);
+        let child_file = entry(
+            "report.pdf",
+            "cloud://webdav/PikPak/report.pdf",
+            false,
+            "default",
+        );
+        assert_eq!(
+            icon_request_for_entry(&child_file, true, &cfg),
+            Some(IconRequest::Type {
+                extension: "pdf".into(),
+                is_dir: false,
+            })
+        );
+        // FTP 仍走文件夹类型图标
+        let ftp = entry("MyFTP", "cloud://ftp/MyFTP", true, "folder");
+        assert_eq!(
+            icon_request_for_entry(&ftp, true, &cfg),
+            Some(IconRequest::Type {
+                extension: "".into(),
+                is_dir: true,
+            })
+        );
+    }
+
+    #[test]
+    fn webdav_mount_icon_three_states_route() {
+        // cloud:// 账户条目：默认 → 数据盘；预设 → 矢量（None）；自定义文件 → 无条件提取
+        let dav = entry("PikPak", "cloud://webdav/PikPak", true, "drive");
+
+        let cfg = webdav_config("", None);
+        assert_eq!(
+            icon_request_for_entry(&dav, true, &cfg),
+            Some(IconRequest::DataDrive)
+        );
+        assert_eq!(icon_request_for_entry(&dav, false, &cfg), None);
+
+        let cfg = webdav_config("cloud", None);
+        assert_eq!(icon_request_for_entry(&dav, true, &cfg), None);
+        assert_eq!(icon_request_for_entry(&dav, false, &cfg), None);
+
+        let cfg = webdav_config(r"file:C:\icons\cloud.ico", None);
+        assert_eq!(
+            icon_request_for_entry(&dav, false, &cfg),
+            Some(IconRequest::RealPath {
+                path: r"C:\icons\cloud.ico".into(),
+                is_dir: false,
+                mtime: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn webdav_mounted_drive_root_routes_by_icon() {
+        // 挂载盘根（"Z:\"）：默认 → 数据盘而非提取 WinFsp 卷图标；自定义文件 → 提取
+        let root = entry("PikPak (Z:)", r"Z:\", true, "drive");
+
+        let cfg = webdav_config("", Some("Z:"));
+        assert_eq!(
+            icon_request_for_entry(&root, true, &cfg),
+            Some(IconRequest::DataDrive)
+        );
+        assert_eq!(icon_request_for_entry(&root, false, &cfg), None);
+
+        // 非挂载盘（无对应配置）保持原策略：系统模式提取真实盘符图标
+        let plain_cfg = crate::config::AppConfig::default();
+        assert!(matches!(
+            icon_request_for_entry(&root, true, &plain_cfg),
+            Some(IconRequest::RealPath { .. })
+        ));
+
+        let cfg = webdav_config(r"file:C:\icons\dav.ico", Some("Z:"));
+        assert!(matches!(
+            icon_request_for_entry(&root, false, &cfg),
+            Some(IconRequest::RealPath { path, .. }) if path == r"C:\icons\dav.ico"
+        ));
     }
 }

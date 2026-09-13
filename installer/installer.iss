@@ -1,7 +1,7 @@
 ; FileFiles One Windows 安装程序脚本(Inno Setup 6)
 ; CI 中通过 /DAppVersion=x.y.z 传入版本号;本地手动编译时使用下方默认值
 #ifndef AppVersion
-  #define AppVersion "0.5.4"
+  #define AppVersion "0.5.5"
 #endif
 
 [Setup]
@@ -40,6 +40,14 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\target\release\filefiles-one.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; 离线恢复入口：应用无法启动时也可安全恢复仍由本应用持有的文件管理器关联。
 Source: "Restore-DefaultFileManager.ps1"; DestDir: "{app}"; Flags: ignoreversion
+; 内嵌 rclone（WebDAV 挂载为虚拟磁盘，挂载后图标与 D:/H: 等数据盘一致）：
+; 构建机如已备好 thirdparty\rclone.exe 则一并打包到程序目录随装机落地；
+; 若构建时缺失也不阻断安装——应用首次挂载 WebDAV 时会自动后台下载
+; （ureq 直链 + zip 解压，全程 CREATE_NO_WINDOW 无终端窗口）到用户目录，
+; 用户无需手动安装 rclone。
+Source: "..\thirdparty\rclone.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; WinFsp（rclone mount Windows 必需的系统驱动）不在此捆绑：需管理员安装且涉及重启，
+; 应用在挂载前会检测并指引到官网（https://winfsp.dev/rel/），缺失时自动回退原生 WebDAV 浏览。
 
 [Icons]
 Name: "{group}\FileFiles One"; Filename: "{app}\filefiles-one.exe"

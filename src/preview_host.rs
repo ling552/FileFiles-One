@@ -123,18 +123,122 @@ pub fn push_content(main: &MainWindow, win: &PreviewWindow, path: &str) {
     dst.set_office_doc(src.get_ql_office_doc());
     dst.set_office_pending(src.get_ql_office_pending());
     dst.set_video_fullscreen(src.get_ql_video_fullscreen());
+    // 音频播放状态镜像（kind==6 时 Slint 自绘控制条用；其它类型复位防残留）
+    if kind == 6 {
+        dst.set_audio_position(src.get_ql_video_position());
+        dst.set_audio_duration(src.get_ql_video_duration());
+        dst.set_audio_paused(src.get_ql_video_paused());
+        dst.set_audio_muted(src.get_ql_video_muted());
+        dst.set_audio_rate(src.get_ql_video_rate());
+        dst.set_audio_pos_text(fmt_mm_ss(src.get_ql_video_position()).into());
+        dst.set_audio_dur_text(fmt_mm_ss(src.get_ql_video_duration()).into());
+    } else {
+        dst.set_audio_position(0);
+        dst.set_audio_duration(0);
+        dst.set_audio_paused(false);
+        dst.set_audio_muted(false);
+        dst.set_audio_rate(1.0);
+        dst.set_audio_pos_text("00:00".into());
+        dst.set_audio_dur_text("00:00".into());
+    }
 
     if kind == 5 {
-        load_archive(win, path);
+        if src.get_ql_loading_async() {
+            // 慢速文件系统（WebDAV/SMB 挂载盘）：归档读取是整包网络请求，
+            // 放后台线程，窗口先以加载态显示，读取完成后回填树模型
+            ARCHIVE.with(|a| *a.borrow_mut() = ArchiveView::default());
+            dst.set_archive_nodes(ModelRc::new(VecModel::from(Vec::<ArchiveNode>::new())));
+            spawn_slow_archive_load(main, path.to_string());
+        } else {
+            load_archive(win, path);
+        }
     } else {
         ARCHIVE.with(|a| *a.borrow_mut() = ArchiveView::default());
         dst.set_archive_nodes(ModelRc::new(VecModel::from(Vec::<ArchiveNode>::new())));
     }
 }
 
+/// 慢速文件系统上的归档预览：读取放后台线程，完成后回填树模型并收起加载动画。
+/// 预览已关闭或已切换文件时丢弃结果（与 fill_quicklook 的守卫一致）。
+fn spawn_slow_archive_load(main: &MainWindow, path: String) {
+    let key = path.clone();
+    let weak = main.as_weak();
+    std::thread::spawn(move || {
+        let result = crate::fs::preview::archive_tree(std::path::Path::new(&path));
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(main) = weak.upgrade() else { return };
+            let st = main.global::<crate::AppState>();
+            if !st.get_quicklook_open() || st.get_sel_path() != key.as_str() {
+                return;
+            }
+            st.set_ql_loading(false);
+            st.set_ql_loading_async(false);
+            let Some(win) = window() else { return };
+            let pw = win.global::<PreviewState>();
+            match result {
+                Ok(nodes) => {
+                    let (dirs, files, total) = crate::fs::preview::archive_summary(&nodes);
+                    let base = pw.get_subtitle().to_string();
+                    pw.set_subtitle(
+                        format!(
+                            "{}{}{} 个文件夹 · {} 个文件 · 解压后 {}",
+                            base,
+                            if base.is_empty() { "" } else { " · " },
+                            dirs,
+                            files,
+                            metadata::human_size(total)
+                        )
+                        .into(),
+                    );
+                    ARCHIVE.with(|a| {
+                        let mut a = a.borrow_mut();
+                        a.source = path;
+                        a.nodes = nodes;
+                        a.expanded.clear();
+                    });
+                    refresh_archive_model(&win);
+                }
+                Err(e) => {
+                    ARCHIVE.with(|a| *a.borrow_mut() = ArchiveView::default());
+                    pw.set_archive_nodes(ModelRc::new(VecModel::from(Vec::<ArchiveNode>::new())));
+                    pw.set_kind(0);
+                    pw.set_info(format!("无法读取归档：{}", e).into());
+                }
+            }
+            set_loading(&win, false);
+        });
+    });
+}
+
 /// 更新副标题（视频分辨率就绪、文件夹统计完成等）
 pub fn set_subtitle(win: &PreviewWindow, text: &str) {
     win.global::<PreviewState>().set_subtitle(text.into());
+}
+
+/// 秒数格式化为 mm:ss（音频进度/时长显示用，小时折入分钟，如 65:10）
+pub fn fmt_mm_ss(total_secs: i32) -> String {
+    let s = total_secs.max(0) as i64;
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// 同步音频播放状态到预览窗口（进度轮询每 250ms 调用）。
+/// 切换文件/关闭时由 push_content/hide 复位，不会残留上一首的进度。
+pub fn sync_audio_state(
+    win: &PreviewWindow,
+    position: i32,
+    duration: i32,
+    paused: bool,
+    muted: bool,
+    rate: f32,
+) {
+    let st = win.global::<PreviewState>();
+    st.set_audio_position(position);
+    st.set_audio_duration(duration);
+    st.set_audio_paused(paused);
+    st.set_audio_muted(muted);
+    st.set_audio_rate(rate);
+    st.set_audio_pos_text(fmt_mm_ss(position).into());
+    st.set_audio_dur_text(fmt_mm_ss(duration).into());
 }
 
 /// 更新加载态（图片解码 / 视频媒体源解析完成后置 false，收起加载动画）
@@ -265,6 +369,13 @@ pub fn hide() {
         st.set_code_cmt("".into());
         st.set_has_thumb(false);
         st.set_thumb(slint::Image::default());
+        st.set_audio_position(0);
+        st.set_audio_duration(0);
+        st.set_audio_paused(false);
+        st.set_audio_muted(false);
+        st.set_audio_rate(1.0);
+        st.set_audio_pos_text("00:00".into());
+        st.set_audio_dur_text("00:00".into());
         let _ = w.hide();
     }
     ARCHIVE.with(|a| *a.borrow_mut() = ArchiveView::default());
@@ -273,6 +384,16 @@ pub fn hide() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mm:ss 格式化：补零、负数归零、小时折入分钟
+    #[test]
+    fn fmt_mm_ss_pads_and_clamps() {
+        assert_eq!(fmt_mm_ss(0), "00:00");
+        assert_eq!(fmt_mm_ss(5), "00:05");
+        assert_eq!(fmt_mm_ss(65), "01:05");
+        assert_eq!(fmt_mm_ss(-3), "00:00");
+        assert_eq!(fmt_mm_ss(600), "10:00");
+    }
 
     fn node(name: &str, full: &str, level: i32, is_dir: bool, has_children: bool) -> ArchiveTreeNode {
         ArchiveTreeNode {

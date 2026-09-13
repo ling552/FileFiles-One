@@ -15,59 +15,80 @@ pub fn default_app_name(path: &Path) -> Option<String> {
     use windows::Win32::UI::Shell::{
         AssocQueryStringW, ASSOCF_NONE, ASSOCSTR_EXECUTABLE, ASSOCSTR_FRIENDLYAPPNAME,
     };
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
     let ext = path.extension().and_then(|e| e.to_str())?;
     if ext.is_empty() {
         return None;
     }
-    let dotted = format!(".{}", ext);
-    let wide: Vec<u16> = dotted.encode_utf16().chain(std::iter::once(0)).collect();
 
-    // 先取友好名（如「照片」「Visual Studio Code」），失败再退回可执行文件路径
-    for assoc in [ASSOCSTR_FRIENDLYAPPNAME, ASSOCSTR_EXECUTABLE] {
-        unsafe {
-            // 第一次调用取所需长度
-            let mut len: u32 = 0;
-            let _ = AssocQueryStringW(
-                ASSOCF_NONE,
-                assoc,
-                PCWSTR(wide.as_ptr()),
-                PCWSTR::null(),
-                None,
-                &mut len,
-            );
-            if len == 0 {
-                continue;
-            }
-            let mut buf = vec![0u16; len as usize];
-            let res = AssocQueryStringW(
-                ASSOCF_NONE,
-                assoc,
-                PCWSTR(wide.as_ptr()),
-                PCWSTR::null(),
-                Some(windows::core::PWSTR(buf.as_mut_ptr())),
-                &mut len,
-            );
-            if res.is_ok() {
-                // len 含结尾 NUL，去掉
-                let s = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
-                let s = s.trim().to_string();
-                if !s.is_empty() {
-                    // 可执行路径退化情形只取文件名，更易读
-                    if assoc == ASSOCSTR_EXECUTABLE {
-                        return Some(
+    let query = |association: &str| -> Option<String> {
+        let wide: Vec<u16> = association
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // 先取友好名（如「照片」「Visual Studio Code」），失败再退回可执行文件路径
+        for assoc in [ASSOCSTR_FRIENDLYAPPNAME, ASSOCSTR_EXECUTABLE] {
+            unsafe {
+                let mut len: u32 = 0;
+                let _ = AssocQueryStringW(
+                    ASSOCF_NONE,
+                    assoc,
+                    PCWSTR(wide.as_ptr()),
+                    PCWSTR::null(),
+                    None,
+                    &mut len,
+                );
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len as usize];
+                if AssocQueryStringW(
+                    ASSOCF_NONE,
+                    assoc,
+                    PCWSTR(wide.as_ptr()),
+                    PCWSTR::null(),
+                    Some(windows::core::PWSTR(buf.as_mut_ptr())),
+                    &mut len,
+                )
+                .is_ok()
+                {
+                    let s = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
+                    let s = s.trim().to_string();
+                    if !s.is_empty() {
+                        return Some(if assoc == ASSOCSTR_EXECUTABLE {
                             Path::new(&s)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or(s),
-                        );
+                                .unwrap_or(s)
+                        } else {
+                            s
+                        });
                     }
-                    return Some(s);
                 }
             }
         }
+        None
+    };
+
+    let dotted = format!(".{}", ext);
+    let user_choice: Option<String> = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(format!(
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{}\UserChoice",
+            dotted
+        ))
+        .ok()
+        .and_then(|key| key.get_value("ProgId").ok());
+
+    if let Some(prog_id) = user_choice {
+        if let Some(name) = query(&prog_id) {
+            return Some(name);
+        }
+        if let Some(exe) = prog_id.strip_prefix("Applications\\") {
+            return Some(exe.to_string());
+        }
     }
-    None
+    query(&dotted)
 }
 
 #[cfg(not(windows))]
