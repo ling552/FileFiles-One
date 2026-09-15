@@ -98,12 +98,19 @@ export component Toolbar inherits Rectangle {
             border-color: Theme.border;
             background: Theme.surface.with-alpha(Theme.card-alpha);
 
-            // 路径模式：面包屑（点击空白处进入编辑模式）
+            // 路径模式：面包屑（点击空白处进入编辑模式；右键打开命令面板）
             if AppState.omni-mode == "path": Rectangle {
                 // 底层：点击空白区域进入路径编辑（面包屑分段的 TouchArea 在其上层优先）
                 path-edit-touch := TouchArea {
                     mouse-cursor: text;
                     clicked => { AppState.set-omni-mode("edit"); }
+                    // 右键地址栏：快捷打开命令面板（与 Ctrl+P 等效入口）
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.right && e.kind == PointerEventKind.down) {
+                            AppState.command-palette-open = true;
+                            AppState.palette-query("");
+                        }
+                    }
                 }
                 HorizontalLayout {
                     padding-left: 12px;
@@ -131,6 +138,13 @@ export component Toolbar inherits Rectangle {
                             seg-touch := TouchArea {
                                 mouse-cursor: pointer;
                                 clicked => { AppState.navigate(crumb.path); }
+                                // 右键面包屑分段：快捷打开命令面板（与空白处一致）
+                                pointer-event(e) => {
+                                    if (e.button == PointerEventButton.right && e.kind == PointerEventKind.down) {
+                                        AppState.command-palette-open = true;
+                                        AppState.palette-query("");
+                                    }
+                                }
                             }
                         }
                         if i < root.cur-crumbs.length - 1: Text {

@@ -437,17 +437,6 @@ fn sidebar_icon_file(path: &str) -> (Image, bool) {
     }
 }
 
-/// 挂载图标预设 ID -> Segoe MDL2 字形（侧栏与 FileIcon 使用同一组字形）
-fn mount_preset_glyph(id: &str) -> &'static str {
-    match id {
-        "cloud" => "\u{E753}",
-        "net" => "\u{E968}",
-        "folder" => "\u{E8B7}",
-        "vault" => "\u{E72E}",
-        _ => "\u{E735}", // star
-    }
-}
-
 /// 为"此电脑"平铺视图构建驱动器容量字段：(已用比例, 副标题, 容量条颜色)。
 /// 非"此电脑"视图或非驱动器条目返回 (0.0, 空, 透明)，平铺视图据此不绘制容量条。
 fn disk_fields(
@@ -1563,6 +1552,9 @@ pub fn build_sidebar(
         // 云存储（FTP/WebDAV/SFTP）：在“此电脑”展开时一并列出，便于直达。
         // 已挂载为虚拟磁盘的 WebDAV 不再单列（真实盘符 Z:\ 已在上方磁盘区，
         // 与 D:/H: 一样带容量条显示，避免同一账户出现磁盘 + 云两项重复）。
+        // 未挂载图标统一：WebDAV=与 D:/H: 等非 Windows 磁盘同款数据盘图标；
+        // FTP/SFTP=网格地球（Globe）。SMB 未挂载时不进侧栏（cloud://smb 不可浏览），
+        // 其挂载后以盘符形式出现在上方磁盘区。
         for loc in &config.network_locations {
             if !matches!(loc.kind.as_str(), "ftp" | "webdav" | "sftp") {
                 continue;
@@ -1571,39 +1563,26 @@ pub fn build_sidebar(
                 continue;
             }
             let vpath = loc.cloud_path();
-            // WebDAV：挂载图标预设换字形、自定义文件提取位图，默认保持云端字形
-            let (glyph, cloud_thumb, cloud_has_thumb) = if loc.kind == "webdav" {
-                match loc.mount_icon_kind() {
-                    crate::config::MountIconKind::Preset(id) => {
-                        (mount_preset_glyph(&id), Image::default(), false)
-                    }
-                    crate::config::MountIconKind::File(p) => {
-                        let (t, h) = sidebar_icon_file(&p);
-                        ("\u{E753}", t, h)
-                    }
-                    crate::config::MountIconKind::Default => {
-                        // 系统图标模式下取数据盘位图，与挂载盘图标一致
-                        if system_icons {
-                            let (t, h) = sidebar_data_drive();
-                            ("\u{E753}", t, h)
-                        } else {
-                            ("\u{E753}", Image::default(), false)
-                        }
-                    }
+            // 侧栏图标分支说明（sidebar.slint）：has_thumb=位图；icon_class=="qa-glyph"
+            // =MDL2 字形；其余=「首字符色块」。FTP/SFTP 必须走 qa-glyph 分支才能画出
+            // 地球形，落空会变成空白色块；WebDAV 统一取数据盘位图（与 D:/H: 同源），
+            // 位图未就绪时回退云端字形并登记后台加载
+            let (glyph, class, cloud_thumb, cloud_has_thumb) = if loc.kind == "webdav" {
+                let (t, h) = sidebar_data_drive();
+                if h {
+                    (String::new(), String::new(), t, h)
+                } else {
+                    ("\u{E753}".to_string(), "qa-glyph".to_string(), Image::default(), false)
                 }
             } else {
-                let g = match loc.kind.as_str() {
-                    "ftp" => "\u{E968}",   // Network
-                    "sftp" => "\u{E8B7}",  // Folder
-                    _ => "\u{E753}",
-                };
-                (g, Image::default(), false)
+                // FTP / SFTP：网格地球（Globe）
+                ("\u{E774}".to_string(), "qa-glyph".to_string(), Image::default(), false)
             };
             items.push(NavItem {
                 label: loc.name.clone().into(),
                 path: vpath.clone().into(),
                 icon: glyph.into(),
-                icon_class: "".into(),
+                icon_class: class.into(),
                 badge: "".into(),
                 is_header: false,
                 is_disk: false,

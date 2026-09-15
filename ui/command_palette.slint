@@ -1,7 +1,19 @@
 // 命令面板：Ctrl+P 快速导航、切换视图、执行操作
+//
+// 设计取向 apple-design（Spotlight 式）：
+// - 材质分层：中性遮罩压暗背景 + 近实心浮层面板（浅色纯白 / 深色沿用原深蓝灰），
+//   大圆角 + 深投影表达浮层厚度；内容与 chrome 同层，搜索行仅用细分隔线分区。
+// - 即时反馈：行悬停即选中、按下即加深（pointer-down 反馈，不等释放）。
+// - 排版层级：标题加重、描述降灰、快捷键弱化右对齐，长文本省略号截断。
+// - 逃离路径：Esc 键与右上角 Esc 徽标（可点击）双出口，徽标与搜索行严格垂直居中。
+//
+// 交互修复说明：此前面板底部有一个「阻止点击穿透」的 TouchArea 排在最后（z 序
+// 最上层），把列表的点击 / 悬停 / 滚动手势全部拦截——表现为「能看不能点、不能滚」。
+// 现改为面板首个子元素（z 序最底层），列表项与其上的手势优先响应。
+// 搜索框弃用标准 LineEdit（自带白色底框、无法适配主题，且把 Esc 挤出居中），
+// 改用项目内 rename_edit / toolbar 先例的无装饰 TextInput，颜色全部走 Theme。
 import { Theme } from "theme.slint";
 import { AppState, Command } from "globals.slint";
-import { LineEdit } from "std-widgets.slint";
 
 export component CommandPalette inherits Rectangle {
     in-out property <bool> open: false;
@@ -10,14 +22,27 @@ export component CommandPalette inherits Rectangle {
     callback execute-command(string);  // action -> 执行
     callback query-changed(string);    // 搜索框输入变化 -> Rust 过滤
 
+    // 列表行几何常量：行高 44 + 行距 2 = 步进 46，上下内边距 8
+    // （键盘上下导航把选中项滚入视口时按此计算内容坐标）
+    property <length> row-h: 44px;
+    property <length> row-stride: 46px;
+    property <length> list-pad: 8px;
+
+    // 面板期望高度：搜索行 64 + 列表内容（空态 56），随结果数收放（Spotlight 式），
+    // 超出窗口可用空间或 640px 上限时由列表内滚动承接。
+    // 列表内容 = 上下内边距 16 + n*行高 + (n-1)*行距 = n*步进 + 14
+    property <length> list-want: root.commands.length == 0
+        ? 56px
+        : root.commands.length * row-stride + 14px;
+
     width: 100%;
     height: 100%;
 
-    // 半透明遮罩
+    // 半透明遮罩：中性黑压暗背景（dim to focus），点击空白处关闭
     if open: backdrop := Rectangle {
         width: 100%;
         height: 100%;
-        background: rgba(18, 34, 52, 0.3);
+        background: Theme.dark ? rgba(18, 34, 52, 0.3) : rgba(0, 0, 0, 0.18);
 
         TouchArea {
             clicked => {
@@ -28,149 +53,209 @@ export component CommandPalette inherits Rectangle {
 
         // 命令面板主体
         panel := Rectangle {
-            x: (parent.width - 580px) / 2;
-            y: 118px;
+            x: (parent.width - self.width) / 2;
+            y: 112px;
             width: 580px;
-            // 高度随窗口自适应（下缘至少留 60px），并裁切内容：
-            // 之前固定 438px 且无 clip，列表溢出部分"看得见点不到"（绘制在
-            // Flickable 命中区之外）；clip 后配合滚动，所有命令都可直接点击
-            max-height: max(300px, root.height - 178px);
+            height: max(120px, min(min(root.height - 136px, 640px), 64px + root.list-want));
             clip: true;
             border-radius: 16px;
-            background: rgba(33, 42, 56, 0.92);
+            background: Theme.dark ? #212a38eb : #fffffff2;
             border-width: 1px;
-            border-color: rgba(255, 255, 255, 0.16);
-            drop-shadow-blur: 80px;
-            drop-shadow-color: rgba(0, 0, 0, 0.34);
+            border-color: Theme.border;
+            drop-shadow-blur: 48px;
+            drop-shadow-offset-y: 10px;
+            drop-shadow-color: Theme.dark ? rgba(0, 0, 0, 0.45) : rgba(0, 0, 0, 0.18);
+
+            // 拦截面板空白区域的点击，避免落到遮罩上误关闭。
+            // 必须排在子元素最前（z 序最底层）：列表项、搜索框在顶层优先响应，
+            // 只有真正空白的区域才落到这里
+            TouchArea {
+                width: 100%;
+                height: 100%;
+            }
 
             VerticalLayout {
                 spacing: 0px;
 
-                // 搜索输入框
+                // ── 搜索行：图标 + 无装饰输入框 + Esc 徽标，64px 内绝对定位保证垂直居中 ──
                 search-bar := Rectangle {
-                    height: 58px;
-                    HorizontalLayout {
-                        padding-left: 18px;
-                        padding-right: 18px;
-                        spacing: 12px;
+                    height: 64px;
+                    // 延迟聚焦装填标记：面板由 if open 条件实例化，每次打开都是
+                    // 新实例、本标记自动复位（放在根组件上则不会复位）
+                    property <bool> focus-armed: true;
+
+                    Text {
+                        x: 20px;
+                        y: (parent.height - self.preferred-height) / 2;
+                        text: "\u{E721}";  // Search
+                        font-family: "Segoe MDL2 Assets";
+                        font-size: 18px;
+                        color: Theme.muted;
+                    }
+
+                    esc-chip := Rectangle {
+                        x: parent.width - 20px - self.width;
+                        y: (parent.height - self.height) / 2;
+                        width: 44px;
+                        height: 26px;
+                        border-radius: 7px;
+                        background: esc-ta.pressed
+                            ? (Theme.dark ? #ffffff26 : #7676803d)
+                            : esc-ta.has-hover
+                                ? (Theme.dark ? #ffffff1f : #7676802e)
+                                : (Theme.dark ? #ffffff12 : #7676801a);
+                        border-width: 1px;
+                        border-color: Theme.border;
 
                         Text {
-                            text: "\u{E721}";  // Search
-                            font-family: "Segoe MDL2 Assets";
-                            font-size: 18px;
-                            color: white;
+                            text: "Esc";
+                            font-size: Theme.fs-tiny;
+                            color: Theme.muted;
+                            horizontal-alignment: center;
                             vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
                         }
 
-                        search-input := LineEdit {
-                            placeholder-text: "输入命令或路径...";
-                            font-size: 16px;
-                            horizontal-stretch: 1;
-                            // 面板由 if open 条件实例化：每次打开都重建本元素，
-                            // init 聚焦让 Ctrl+P 后直接可输入，无需再点一次输入框
-                            init => {
-                                self.focus();
-                                AppState.input-active = true;
-                            }
-                            changed has-focus => { AppState.input-active = self.has-focus; }
-                            edited(t) => { root.query-changed(t); }
-                            // 回车执行当前选中项（默认首个匹配；鼠标悬停/键盘上下可改选中项）
-                            accepted => {
-                                if (root.commands.length > 0) {
-                                    root.execute-command(root.commands[min(root.selected-index, root.commands.length - 1)].action);
-                                    root.open = false;
-                                    AppState.input-active = false;
-                                }
-                            }
-                            // 键盘上下箭头导航选中项 + Esc 关闭。
-                            // LineEdit 支持 key-pressed（见 rename_edit.slint / main.slint key-scope 先例）。
-                            key-pressed(ev) => {
-                                if (ev.text == Key.UpArrow) {
-                                    if (root.commands.length > 0) {
-                                        root.selected-index = max(0, root.selected-index - 1);
-                                        // 选中项顶部滚入视口：viewport-y 为内容相对视口偏移，负值=向下滚动。
-                                        // 项顶在内容坐标 10px(padding) + i*42px，可见要求 viewport-y >= -(该项顶)。
-                                        command-scroll.viewport-y = max(command-scroll.viewport-y, -(10px + root.selected-index * 42px));
-                                    }
-                                    return accept;
-                                }
-                                if (ev.text == Key.DownArrow) {
-                                    if (root.commands.length > 0) {
-                                        root.selected-index = min(root.commands.length - 1, root.selected-index + 1);
-                                        // 选中项底部滚入视口：可见要求 viewport-y <= height - (项底)。
-                                        command-scroll.viewport-y = min(command-scroll.viewport-y, command-scroll.height - (10px + (root.selected-index + 1) * 42px));
-                                    }
-                                    return accept;
-                                }
-                                if (ev.text == Key.Escape) {
-                                    root.open = false;
-                                    AppState.input-active = false;
-                                    return accept;
-                                }
-                                return reject;
-                            }
-                        }
-
-                        Rectangle {
-                            width: 56px;
-                            height: 24px;
-                            border-radius: 6px;
-                            background: rgba(255, 255, 255, 0.12);
-                            border-width: 1px;
-                            border-color: rgba(255, 255, 255, 0.12);
-
-                            Text {
-                                text: "Esc";
-                                font-size: 11px;
-                                color: rgba(255, 255, 255, 0.72);
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
+                        esc-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.open = false;
+                                AppState.input-active = false;
                             }
                         }
                     }
+
+                    search-input := TextInput {
+                        x: 52px;
+                        // 高度取内容固有高度再整体垂直居中：若不约束高度会撑满
+                        // 整行，光标与文字贴向底部（vertical-alignment 只影响文字
+                        // 不影响光标绘制位置），约束后光标与输入位置严格居中
+                        height: self.preferred-height;
+                        y: (parent.height - self.preferred-height) / 2;
+                        width: esc-chip.x - 12px - self.x;
+                        text: "";
+                        font-size: 16px;
+                        color: Theme.text;
+                        single-line: true;
+                        vertical-alignment: center;
+                        selection-background-color: Theme.accent.with-alpha(0.35);
+                        selection-foreground-color: Theme.text;
+                        // 面板由 if open 条件实例化：每次打开都是新实例，输入从空开始
+                        init => { AppState.input-active = true; }
+                        changed has-focus => { AppState.input-active = self.has-focus; }
+                        edited => {
+                            root.query-changed(self.text);
+                            // 新查询后选中项回到首位，视口同步回顶
+                            command-scroll.viewport-y = 0;
+                        }
+                        // 回车执行当前选中项（默认首个匹配；鼠标悬停/键盘上下可改选中项）
+                        accepted => {
+                            if (root.commands.length > 0) {
+                                root.execute-command(root.commands[min(root.selected-index, root.commands.length - 1)].action);
+                                root.open = false;
+                                AppState.input-active = false;
+                            }
+                        }
+                        // 键盘上下箭头导航选中项 + Esc 关闭
+                        key-pressed(ev) => {
+                            if (ev.text == Key.UpArrow) {
+                                if (root.commands.length > 0) {
+                                    root.selected-index = max(0, root.selected-index - 1);
+                                    // 选中项顶部滚入视口：viewport-y 为内容相对视口偏移，负值=向下滚动。
+                                    // 项顶在内容坐标 list-pad + i*row-stride，可见要求 viewport-y >= -(该项顶)
+                                    command-scroll.viewport-y = max(command-scroll.viewport-y,
+                                        -(root.list-pad + root.selected-index * root.row-stride));
+                                }
+                                return accept;
+                            }
+                            if (ev.text == Key.DownArrow) {
+                                if (root.commands.length > 0) {
+                                    root.selected-index = min(root.commands.length - 1, root.selected-index + 1);
+                                    // 选中项底部滚入视口：可见要求 viewport-y <= height - (项底)
+                                    command-scroll.viewport-y = min(command-scroll.viewport-y,
+                                        command-scroll.height - (root.list-pad + (root.selected-index + 1) * root.row-stride));
+                                }
+                                return accept;
+                            }
+                            if (ev.text == Key.Escape) {
+                                root.open = false;
+                                AppState.input-active = false;
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+
+                    // 占位文字（TextInput 无内置 placeholder，空文本时垫在输入层下方）
+                    if search-input.text == "": Text {
+                        x: search-input.x;
+                        y: (parent.height - self.preferred-height) / 2;
+                        width: search-input.width;
+                        text: "输入命令或路径...";
+                        font-size: 16px;
+                        color: Theme.subtle;
+                        overflow: elide;
+                    }
+
                     Rectangle {
                         y: parent.height - 1px;
                         height: 1px;
-                        background: rgba(255, 255, 255, 0.12);
+                        background: Theme.separator;
+                    }
+
+                    // 延迟聚焦：1ms Timer 把 focus() 推迟到条目树构建完成之后
+                    Timer {
+                        interval: 1ms;
+                        running: search-bar.focus-armed;
+                        triggered => {
+                            search-bar.focus-armed = false;
+                            search-input.focus();
+                        }
                     }
                 }
 
-                // 命令列表
+                // ── 命令列表：Flickable 支持滚轮与拖拽滑动，行可点击 / 悬停选中 ──
                 command-scroll := Flickable {
                     vertical-stretch: 1;
                     viewport-height: max(content-layout.preferred-height, self.height);
 
                     content-layout := VerticalLayout {
-                        padding: 10px;
-                        spacing: 0px;
+                        padding-left: root.list-pad;
+                        padding-right: root.list-pad;
+                        padding-top: root.list-pad;
+                        padding-bottom: root.list-pad;
+                        spacing: 2px;
 
                         // 无匹配命令时的空态提示
                         if root.commands.length == 0: Rectangle {
-                            height: 42px;
+                            height: 40px;
                             Text {
                                 text: "未找到匹配的命令";
-                                font-size: 13px;
-                                color: rgba(255, 255, 255, 0.5);
+                                font-size: Theme.fs-body;
+                                color: Theme.muted;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
                             }
                         }
 
                         for cmd[i] in root.commands: cmd-row := Rectangle {
-                            height: 42px;
+                            height: root.row-h;
                             border-radius: 10px;
                             background: i == root.selected-index ? Theme.primary : transparent;
 
                             HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                spacing: 10px;
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 12px;
 
                                 Text {
                                     text: cmd.icon;
                                     font-family: "Segoe MDL2 Assets";
                                     font-size: 16px;
-                                    color: white;
+                                    color: i == root.selected-index ? white : Theme.muted;
                                     vertical-alignment: center;
                                     width: 26px;
                                 }
@@ -178,39 +263,44 @@ export component CommandPalette inherits Rectangle {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     alignment: center;
+                                    spacing: 1px;
 
                                     Text {
                                         text: cmd.title;
                                         font-size: 14px;
-                                        color: white;
-                                        font-weight: 700;
+                                        font-weight: 600;
+                                        color: i == root.selected-index ? white : Theme.text;
+                                        overflow: elide;
                                     }
 
                                     if cmd.description != "": Text {
                                         text: cmd.description;
-                                        font-size: 12px;
-                                        color: rgba(255, 255, 255, 0.58);
+                                        font-size: Theme.fs-small;
+                                        color: i == root.selected-index
+                                            ? rgba(255, 255, 255, 0.78)
+                                            : Theme.muted;
+                                        overflow: elide;
                                     }
                                 }
 
-                                if cmd.shortcut != "": Rectangle {
-                                    width: 86px;
-                                    HorizontalLayout {
-                                        alignment: end;
-                                        Text {
-                                            text: cmd.shortcut;
-                                            font-size: 11px;
-                                            color: rgba(255, 255, 255, 0.58);
-                                            vertical-alignment: center;
-                                        }
-                                    }
+                                if cmd.shortcut != "": Text {
+                                    text: cmd.shortcut;
+                                    font-size: Theme.fs-small;
+                                    color: i == root.selected-index
+                                        ? rgba(255, 255, 255, 0.75)
+                                        : Theme.subtle;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
                                 }
                             }
 
+                            // 点击直接执行；悬停即切换选中（与键盘导航共用同一高亮）
                             cmd-touch := TouchArea {
+                                mouse-cursor: pointer;
                                 clicked => {
                                     root.execute-command(cmd.action);
                                     root.open = false;
+                                    AppState.input-active = false;
                                 }
                                 pointer-event(e) => {
                                     if e.kind == PointerEventKind.move {
@@ -218,15 +308,15 @@ export component CommandPalette inherits Rectangle {
                                     }
                                 }
                             }
+
+                            // 按下即时的加深反馈（pointer-down，不等释放）
+                            if cmd-touch.pressed: Rectangle {
+                                border-radius: 10px;
+                                background: rgba(0, 0, 0, 0.10);
+                            }
                         }
                     }
                 }
-            }
-
-            // 阻止点击穿透到背景
-            TouchArea {
-                width: 100%;
-                height: 100%;
             }
         }
     }

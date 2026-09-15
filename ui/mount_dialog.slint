@@ -93,10 +93,15 @@ component IconChoice inherits Rectangle {
         padding: 4px;
         alignment: center;
         spacing: 2px;
-        FileIcon {
-            icon-class: root.icon-class;
-            box: 38px;
-            radius: 9px;
+        // 定宽的 FileIcon 在 VerticalLayout 交叉轴默认左对齐（图标框偏左），
+        // 套一层主轴居中的 HorizontalLayout 使其水平居中
+        HorizontalLayout {
+            alignment: center;
+            FileIcon {
+                icon-class: root.icon-class;
+                box: 38px;
+                radius: 9px;
+            }
         }
         Text {
             text: root.caption;

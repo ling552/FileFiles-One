@@ -820,7 +820,8 @@ export component SettingsPanel inherits Rectangle {
                             ShortcutRow { action: "刷新"; keys: "F5"; }
                             ShortcutRow { action: "上级目录"; keys: "Backspace"; }
                             ShortcutRow { action: "搜索"; keys: "Ctrl+F"; }
-                            ShortcutRow { action: "命令面板"; keys: "Ctrl+P"; last: true; }
+                            ShortcutRow { action: "命令面板"; keys: "Ctrl+P"; }
+                            ShortcutRow { action: "命令面板（地址栏右键）"; keys: "右键"; last: true; }
                         }
 
                         Card {
@@ -985,6 +986,8 @@ export component SettingsPanel inherits Rectangle {
                                     alignment: center;
                                     // WebDAV：挂载中显示禁用态防重入；未挂载显示「挂载」；
                                     // 已挂载必须显示「取消挂载（X:)」，不得继续显示为挂载。
+                                    // 修改/移除要求先取消挂载：挂载中或已挂载时隐藏这两个按钮
+                                    // （改配置或删账号作用于 rclone 挂载源，挂载期间操作会失同步）
                                     if acc.kind == "webdav": HorizontalLayout {
                                         spacing: 8px;
                                         if acc.mounting: Btn {
@@ -996,6 +999,10 @@ export component SettingsPanel inherits Rectangle {
                                             primary: true;
                                             clicked => { AppState.open-mount-dialog(acc.name); }
                                         }
+                                        if !acc.mounted && !acc.mounting: Btn {
+                                            label: "修改";
+                                            clicked => { AppState.edit-network-location(i); }
+                                        }
                                         if acc.mounted && !acc.mounting: Btn {
                                             label: acc.drive != "" ? "取消挂载 (" + acc.drive + ")" : "取消挂载";
                                             clicked => { AppState.unmount-network-location(acc.name); }
@@ -1004,14 +1011,32 @@ export component SettingsPanel inherits Rectangle {
                                             label: "挂载设置";
                                             clicked => { AppState.open-mount-dialog(acc.name); }
                                         }
-                                        Btn {
+                                        if !acc.mounted && !acc.mounting: Btn {
                                             label: "移除";
                                             clicked => { AppState.remove-network-location(acc.name); }
                                         }
                                     }
-                                    if acc.kind != "webdav": Btn {
-                                        label: acc.kind == "smb" ? "断开并移除" : "移除";
-                                        clicked => { AppState.remove-network-location(acc.name); }
+                                    if acc.kind == "smb": HorizontalLayout {
+                                        spacing: 8px;
+                                        Btn {
+                                            label: "修改";
+                                            clicked => { AppState.edit-network-location(i); }
+                                        }
+                                        Btn {
+                                            label: "断开并移除";
+                                            clicked => { AppState.remove-network-location(acc.name); }
+                                        }
+                                    }
+                                    if acc.kind == "ftp" || acc.kind == "sftp": HorizontalLayout {
+                                        spacing: 8px;
+                                        Btn {
+                                            label: "修改";
+                                            clicked => { AppState.edit-network-location(i); }
+                                        }
+                                        Btn {
+                                            label: "移除";
+                                            clicked => { AppState.remove-network-location(acc.name); }
+                                        }
                                     }
                                 }
                             }

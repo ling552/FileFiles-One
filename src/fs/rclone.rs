@@ -613,12 +613,22 @@ pub fn mount_webdav(loc: &NetworkLocation) -> Result<String, String> {
 }
 
 /// 按显示名卸载（kill rclone 进程 + 清理记录）。盘符由 WinFsp 自动回收。
+/// 以进程真正消失为成功标准：taskkill 命令执行成功但进程未被杀死时，
+/// 记录放回表中保留重试机会，否则 UI 显示已卸载而盘符仍挂着且无法再卸载
 pub fn unmount_by_name(name: &str) -> bool {
     let info = mounts().lock().ok().and_then(|mut m| m.remove(name));
     let Some(info) = info else { return false };
-    if kill_pid(info.pid).is_err() {
-        // taskkill 启动失败（非 kill 失败）：记录放回表中，保留稍后重试卸载的机会，
-        // 否则 UI 显示已卸载而盘符仍挂着，且表中已无记录无法再次卸载
+    // taskkill 发出 TerminateProcess 后内核收尾是异步的，立即查活可能仍读到
+    // STILL_ACTIVE；给最多 1 秒让进程消失，避免杀成功却报失败
+    let mut gone = kill_pid(info.pid).is_ok();
+    if gone {
+        let start = Instant::now();
+        while process_alive(info.pid) && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        gone = !process_alive(info.pid);
+    }
+    if !gone {
         if let Ok(mut m) = mounts().lock().map_err(|e| e.into_inner()) {
             m.insert(name.to_string(), info);
         }
@@ -626,6 +636,194 @@ pub fn unmount_by_name(name: &str) -> bool {
     }
     // 日志保留供排查，不删除
     true
+}
+
+/// 进程是否仍然存活（taskkill 成功与否以进程消失为准，而非命令是否执行成功）
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE;
+        CloseHandle(handle);
+        alive
+    }
+}
+
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// 兜底强杀：按盘符匹配 rclone 进程命令行（挂载表无记录时使用，典型场景是
+/// 应用重启后残留的孤儿 rclone 进程仍占着盘符）。命令行形如
+/// `rclone mount :webdav: X: --volname ...`，以「 X: 」片段匹配避免误杀其它盘。
+/// 返回是否已无匹配进程（是否真被本调用杀死不作区分）
+pub fn kill_rclone_by_drive(drive: &str) -> bool {
+    #[cfg(windows)]
+    {
+        // 盘符必须形如单个字母（+可选冒号）：该值来自用户可编辑的配置，拼接
+        // 进 PowerShell 前先校验，防止命令注入
+        let t = drive.trim();
+        let t = t.strip_suffix(':').unwrap_or(t);
+        let b = t.as_bytes();
+        if b.len() != 1 || !b[0].is_ascii_alphabetic() {
+            return false;
+        }
+        // 盘符形如 "X:"；命令行中它前后都有空格（build_mount_args 恒以 --volname 跟随）
+        let pat = format!(" {}:", (b[0].to_ascii_uppercase() as char));
+        // 只认本应用挂载命令形态（mount + :webdav:），与 adopt_orphan_mounts
+        // 同口径，避免误杀用户手工执行的其它 rclone 任务
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | Where-Object {{ $_.CommandLine -like '* mount *' -and $_.CommandLine -like '*:webdav:*' -and $_.CommandLine -like '*{}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
+            pat
+        );
+        hidden_command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = drive;
+        false
+    }
+}
+
+/// 轮询等待盘符释放（最长 max），立即返回首次探测结果。
+fn wait_drive_free(letter: char, max: Duration) -> bool {
+    let start = Instant::now();
+    while drive_in_use(letter) && start.elapsed() < max {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    !drive_in_use(letter)
+}
+
+/// 确保盘符被释放：先按挂载表卸载；表中无记录（孤儿进程）时按盘符强杀；
+/// 然后轮询等待 WinFsp 回收盘符。返回盘符是否已释放。
+/// WinFsp 回收盘符有数百毫秒延迟，先短轮询给正常卸载留出时间，确认真的
+/// 未释放才触发 PowerShell 强杀（其冷启动本身可达 1 秒）。
+pub fn release_drive(drive: &str) -> bool {
+    let Some(letter) = drive.trim_end_matches(':').chars().next() else {
+        return false;
+    };
+    let letter = letter.to_ascii_uppercase();
+    if !drive_in_use(letter) {
+        return true;
+    }
+    unmount_drive(drive);
+    if wait_drive_free(letter, Duration::from_secs(1)) {
+        return true;
+    }
+    kill_rclone_by_drive(drive);
+    wait_drive_free(letter, Duration::from_secs(3))
+}
+
+/// 从命令行取某标志后的参数词（支持带引号的含空格参数）
+fn token_after(cmd: &str, flag: &str) -> Option<String> {
+    let idx = cmd.find(flag)?;
+    let rest = cmd[idx + flag.len()..].trim_start();
+    if rest.starts_with('"') {
+        let end = rest[1..].find('"')?;
+        Some(rest[1..1 + end].to_string())
+    } else {
+        Some(rest.split_whitespace().next()?.to_string())
+    }
+}
+
+/// 启动期收养/清理孤儿 rclone 挂载进程：应用重启后内存挂载表为空，但上次
+/// 未卸载的 rclone 进程仍占着盘符——此时「取消挂载」无记录可杀，表现为
+/// 盘符永远卸不掉。此处扫描 rclone 进程命令行（形如
+/// `rclone mount :webdav: X: --volname <账户名> ...`）还原挂载记录：
+/// - 账户仍存在且配置登记的盘符一致 → 收养（写回挂载表，之后可正常卸载）
+/// - 否则（账户已删 / 盘符已更换 / 配置未登记挂载）→ 视为陈旧孤儿，强杀释放
+pub fn adopt_orphan_mounts(locations: &[crate::config::NetworkLocation]) {
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let script = "@(Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress";
+        let Ok(out) = hidden_command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .stdin(Stdio::null())
+            .output()
+        else {
+            return;
+        };
+        if !out.status.success() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+            return;
+        };
+        let items = match v {
+            serde_json::Value::Array(a) => a,
+            serde_json::Value::Null => return,
+            other => vec![other],
+        };
+        let Ok(mut table) = mounts().lock() else {
+            return;
+        };
+        for item in items {
+            let Some(pid) = item.get("ProcessId").and_then(|x| x.as_u64()) else {
+                continue;
+            };
+            let Some(cmd) = item.get("CommandLine").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            // 只认本应用的挂载命令形态，避免误碰用户手工起的其它 rclone 任务
+            if !cmd.contains(" mount ") || !cmd.contains(":webdav:") {
+                continue;
+            }
+            let Some(drive) = token_after(cmd, ":webdav:") else {
+                continue;
+            };
+            let db = drive.as_bytes();
+            if db.len() != 2 || db[1] != b':' || !db[0].is_ascii_alphabetic() {
+                continue;
+            }
+            let Some(name) = token_after(cmd, "--volname") else {
+                continue;
+            };
+            if table.contains_key(&name) {
+                continue;
+            }
+            let owned = locations.iter().any(|l| {
+                l.kind == "webdav"
+                    && l.name == name
+                    && l.drive
+                        .as_deref()
+                        .map(|d| d.eq_ignore_ascii_case(&drive))
+                        .unwrap_or(false)
+            });
+            if owned && drive_in_use(db[0] as char) {
+                // 收养：登记挂载记录，使「取消挂载」此后可用
+                table.insert(
+                    name.clone(),
+                    MountInfo {
+                        drive: drive.clone(),
+                        pid: pid as u32,
+                        log: log_path_for(&name),
+                    },
+                );
+            } else {
+                // 陈旧孤儿：配置已不认领（账户删除 / 已取消挂载 / 盘符更换）→ 强杀
+                let _ = kill_pid(pid as u32);
+            }
+        }
+    }
 }
 
 /// 按盘符卸载（遍历挂载表匹配）

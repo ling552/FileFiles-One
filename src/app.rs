@@ -78,17 +78,28 @@ impl TabSession {
         let key = self.sort_key.clone();
         let asc = self.sort_asc;
         let folders_first = self.folders_first;
-        // 「此电脑」视图：本机硬盘/移动硬盘/U盘等真实盘符在前，便携设备(手机等)在最后。
-        // 若沿用按名称排序，卷标（如 "Data (D:)" < "Windows (C:)"）会导致 D 盘排在 C 盘前；
-        // 若仅按路径字典序，device://（'d'）会插到 E:\ F:\ 等 U 盘前面。故先按是否便携设备分组。
+        // 「此电脑」视图：分三组排序——
+        // 0=本地磁盘（真实盘符 + 已挂载的 rclone 虚拟盘，它们在 disk_entries 里
+        //   就是 X:\ 这样的盘符路径）按盘符顺序 → 1=WebDAV 位置（未挂载的云根）→
+        // 2=其他（FTP/SFTP 等云根、便携设备）。
+        // 旧逻辑按路径字典序：cloud://（'cl'）会插到 C:\（'c:'）与 D:\ 之间，
+        // 造成云盘条目混进本地磁盘中间。
         let is_this_pc =
             self.history.current().to_string_lossy() == crate::fs::virtualfs::THIS_PC_PATH;
         if is_this_pc {
+            let group = |path: &str| -> u8 {
+                if path.starts_with("device://") {
+                    return 2;
+                }
+                if let Some(rest) = path.strip_prefix("cloud://") {
+                    return if rest.starts_with("webdav/") { 1 } else { 2 };
+                }
+                0
+            };
             self.entries.sort_by(|a, b| {
-                let a_dev = a.path.starts_with("device://");
-                let b_dev = b.path.starts_with("device://");
-                if a_dev != b_dev {
-                    return a_dev.cmp(&b_dev); // 便携设备(true)排在后面
+                let ord = group(&a.path).cmp(&group(&b.path));
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
                 }
                 a.path.to_lowercase().cmp(&b.path.to_lowercase())
             });

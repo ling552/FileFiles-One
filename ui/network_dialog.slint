@@ -32,7 +32,8 @@ export component NetworkLocationDialog inherits Rectangle {
         width: 100%;
         height: 100%;
         background: #12223433;
-        TouchArea { clicked => { AppState.netloc-dialog-open = false; } }
+        // 统一经 close-netloc-dialog 关闭：复位编辑索引并清空表单（背景与取消共用）
+        TouchArea { clicked => { AppState.close-netloc-dialog(); } }
 
         Rectangle {
             width: 520px;
@@ -53,18 +54,42 @@ export component NetworkLocationDialog inherits Rectangle {
                 spacing: 12px;
 
                 Text {
-                    text: "添加网络位置";
+                    text: AppState.netloc-edit-index >= 0 ? "修改网络位置" : "添加网络位置";
                     font-size: 16px;
                     font-weight: 700;
                     color: Theme.text;
                 }
-                // 类型选择
-                HorizontalLayout {
+                // 类型选择（编辑模式锁定类型：改类型等于删了重建，避免映射混乱）
+                if AppState.netloc-edit-index < 0: HorizontalLayout {
                     spacing: 8px;
                     KindChip { label: "SMB"; selected: AppState.netloc-kind == "smb"; clicked => { AppState.netloc-kind = "smb"; } }
                     KindChip { label: "FTP"; selected: AppState.netloc-kind == "ftp"; clicked => { AppState.netloc-kind = "ftp"; } }
                     KindChip { label: "SFTP"; selected: AppState.netloc-kind == "sftp"; clicked => { AppState.netloc-kind = "sftp"; } }
                     KindChip { label: "WebDAV"; selected: AppState.netloc-kind == "webdav"; clicked => { AppState.netloc-kind = "webdav"; } }
+                }
+                if AppState.netloc-edit-index >= 0: HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Rectangle {
+                        height: 28px;
+                        border-radius: 8px;
+                        background: Theme.surface-2;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        HorizontalLayout {
+                            padding-left: 12px; padding-right: 12px;
+                            Text {
+                                text: AppState.netloc-kind == "smb" ? "SMB"
+                                    : AppState.netloc-kind == "ftp" ? "FTP"
+                                    : AppState.netloc-kind == "sftp" ? "SFTP" : "WebDAV";
+                                font-size: 12px;
+                                font-weight: 700;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
                 }
                 Text {
                     text: AppState.netloc-kind == "smb" ? "SMB 共享 (\\\\server\\share) 将挂载为驱动器"
@@ -174,12 +199,15 @@ export component NetworkLocationDialog inherits Rectangle {
                         background: cancel-touch.has-hover ? Theme.primary-hover : Theme.surface;
                         border-width: 1px; border-color: Theme.border;
                         Text { text: "取消"; color: Theme.text; horizontal-alignment: center; vertical-alignment: center; }
-                        cancel-touch := TouchArea { clicked => { AppState.netloc-dialog-open = false; AppState.input-active = false; } }
+                        cancel-touch := TouchArea { clicked => { AppState.close-netloc-dialog(); } }
                     }
                     Rectangle {
                         width: 100px; height: 34px; border-radius: 6px;
                         background: ok-touch.has-hover ? #1a86e0 : Theme.primary;
-                        Text { text: "添加并连接"; color: white; horizontal-alignment: center; vertical-alignment: center; }
+                        Text {
+                            text: AppState.netloc-edit-index >= 0 ? "保存修改" : "添加并连接";
+                            color: white; horizontal-alignment: center; vertical-alignment: center;
+                        }
                         ok-touch := TouchArea { clicked => { AppState.add-network-location(); } }
                     }
                 }

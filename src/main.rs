@@ -223,6 +223,10 @@ fn main() -> Result<(), slint::PlatformError> {
         restore_window_geometry(&ui, x, y, w, h, maximized, 20);
     }
 
+    // OLE 拖入注册：等 winit 窗口创建后撤销 winit 默认拖放目标并注册本应用目标，
+    // 使微信/资源管理器/浏览器等拖来的文件可复制到当前目录
+    install_drag_in(&ui, &core, 50);
+
     // 启动目录优先使用其已保存布局；未记录目录才使用全局默认视图。
     apply_folder_layout(&ui, &core);
 
@@ -319,12 +323,15 @@ fn auto_mount_saved_webdav(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         .filter(|l| l.kind == "webdav" && l.mount_drive.is_some())
         .cloned()
         .collect();
-    if saved.is_empty() {
-        return;
-    }
+    // 收养/清理孤儿挂载进程需要全量账户（对照账户名与登记盘符）
+    let all_locations: Vec<crate::config::NetworkLocation> =
+        core.borrow().config.network_locations.clone();
     let w = ui.as_weak();
     // 后台线程仅持有 owned 数据（Send），不持有 Rc<RefCell>（!Send）
     std::thread::spawn(move || {
+        // 先收养/清理上次未卸载的孤儿 rclone 进程（含应用重启后盘符残留场景），
+        // 收养记录后「取消挂载」才可用；陈旧孤儿被强杀后自动挂载才不会被占用挡住
+        crate::fs::rclone::adopt_orphan_mounts(&all_locations);
         // 缺 rclone 时先供给一次（失败则整批跳过，下次添加/启动再试）
         if crate::fs::rclone::rclone_exe().is_none() {
             let _ = crate::fs::rclone::ensure_rclone();
@@ -332,7 +339,7 @@ fn auto_mount_saved_webdav(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         if crate::fs::rclone::rclone_exe().is_none() {
             return;
         }
-        if !crate::fs::rclone::winfsp_installed() {
+        if !crate::fs::rclone::winfsp_installed() || saved.is_empty() {
             return;
         }
         for loc in saved {
@@ -2269,6 +2276,123 @@ fn reload_active_pane(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     }
 }
 
+/// 按组件忽略 ASCII 大小写判断 path 是否以 prefix 开头（等价
+/// Path::starts_with）。Windows 文件系统大小写不敏感（C:\DATA 与 C:\data
+/// 是同一目录），拖入的自复制/自递归防护必须按此语义比较。
+#[cfg(windows)]
+fn starts_with_ci(path: &std::path::Path, prefix: &std::path::Path) -> bool {
+    let mut it = path.components();
+    prefix
+        .components()
+        .all(|c| it.next().is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(c.as_os_str())))
+}
+
+/// OLE 拖入：接收其他应用拖来的文件（微信图片/资源管理器/浏览器等），
+/// 放下后复制到活动面板当前目录。winit 窗口延迟创建（事件循环启动后
+/// 80-250ms），用重试等 HWND 就绪（模式同 restore_window_geometry）。
+#[cfg(windows)]
+fn install_drag_in(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, retries_left: u32) {
+    let mut hwnd: isize = 0;
+    ui.window().with_winit_window(|w| {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = w.window_handle() {
+            if let RawWindowHandle::Win32(h) = handle.as_raw() {
+                hwnd = isize::from(h.hwnd);
+            }
+        }
+    });
+    if hwnd == 0 {
+        if retries_left > 0 {
+            let w_ui = ui.as_weak();
+            let c = core.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(40), move || {
+                if let Some(ui) = w_ui.upgrade() {
+                    install_drag_in(&ui, &c, retries_left - 1);
+                }
+            });
+        }
+        return;
+    }
+
+    let w_dst = ui.as_weak();
+    let c_dst = core.clone();
+    let w_copy = ui.as_weak();
+    let c_copy = core.clone();
+    let w_done = ui.as_weak();
+    let c_done = core.clone();
+    let host = fs::drag_in::DropHost {
+        // Drop 时刻取活动面板当前目录；虚拟目录（此电脑/云存储/设备/回收站等）
+        // 与已失效路径不接受拖入
+        dst: Box::new(move || {
+            let ui = w_dst.upgrade()?;
+            let dir = if toolbar_routes_right(&ui) {
+                c_dst.borrow().right_pane.history.current().clone()
+            } else {
+                c_dst.borrow().active_tab().history.current().clone()
+            };
+            let s = dir.to_string_lossy().to_string();
+            if !fs::virtualfs::is_virtual(&s) && dir.is_dir() {
+                Some(dir)
+            } else {
+                if let Some(ui) = w_dst.upgrade() {
+                    ui.global::<AppState>()
+                        .set_status_text("当前目录不支持接收拖放的文件".into());
+                }
+                None
+            }
+        }),
+        // 真实文件：走任务管线复制，带进度 UI 与同名冲突询问
+        enqueue_copy: Box::new(move |srcs, dst| {
+            if let Some(ui) = w_copy.upgrade() {
+                // 过滤：拖到源项自身所在目录（自己拖给自己）与拖进自身内部
+                // （文件夹拖入其子目录会导致无限递归）。Windows 路径大小写
+                // 不敏感（C:\DATA 与 C:\data 是同一目录），按组件忽略大小写比较
+                let srcs: Vec<PathBuf> = srcs
+                    .into_iter()
+                    .filter(|p| {
+                        let parent_eq = p.parent().map_or(false, |par| {
+                            starts_with_ci(par, &dst) && starts_with_ci(&dst, par)
+                        });
+                        parent_eq || starts_with_ci(&dst, p)
+                    })
+                    .collect();
+                if srcs.is_empty() {
+                    return;
+                }
+                ui.global::<AppState>()
+                    .set_status_text(format!("收到拖入的 {} 项，开始复制…", srcs.len()).into());
+                c_copy.borrow_mut().task_queue.push_back(fs::tasks::Job {
+                    kind: fs::tasks::TaskKind::Copy,
+                    srcs,
+                    dst,
+                });
+                start_next_job(&ui, &c_copy);
+            }
+        }),
+        // 虚拟文件（浏览器拖图等）由 drag_in 直接写入：提示结果并刷新视图
+        virtual_done: Box::new(move |ok, fail| {
+            if let Some(ui) = w_done.upgrade() {
+                ui.global::<AppState>().set_status_text(
+                    if fail > 0 {
+                        format!("拖入完成：{} 项成功，{} 项失败", ok, fail)
+                    } else {
+                        format!("已复制 {} 项拖入文件到当前目录", ok)
+                    }
+                    .into(),
+                );
+                reload_active_pane(&ui, &c_done);
+            }
+        }),
+    };
+    if !fs::drag_in::install(hwnd, host) {
+        ui.global::<AppState>()
+            .set_status_text("外部拖放接收初始化失败".into());
+    }
+}
+
+#[cfg(not(windows))]
+fn install_drag_in(_ui: &MainWindow, _core: &Rc<RefCell<AppCore>>, _retries_left: u32) {}
+
 /// 在指定延迟点补刷活动面板。删除/系统菜单命令等 Shell 操作可能异步收尾，
 /// 立即 reload 仍读到旧目录内容；延迟补刷保证视图最终与磁盘一致。
 fn schedule_pane_reloads(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, delays_ms: &[u64]) {
@@ -2964,6 +3088,114 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             let user = st.get_netloc_user().to_string();
             let pass = st.get_netloc_pass().to_string();
 
+            // —— 修改模式：按编辑索引更新既有条目（不改 kind / 挂载状态 / 挂载设置）——
+            // WebDAV 挂载期间入口按钮已隐藏，此处天然只处理未挂载账号
+            let edit_index = st.get_netloc_edit_index();
+            // SMB 编辑 server 后需要重挂盘符，结果附加到保存提示
+            let mut smb_remap_note = String::new();
+            if edit_index >= 0 {
+                if kind == "smb" {
+                    if server.is_empty() {
+                        st.set_status_text("请输入服务器地址（如 \\\\server\\share）".into());
+                        return;
+                    }
+                } else {
+                    if host.is_empty() {
+                        st.set_status_text("请输入主机地址".into());
+                        return;
+                    }
+                    if name.is_empty() {
+                        st.set_status_text("请输入显示名称".into());
+                        return;
+                    }
+                }
+                {
+                    let mut core = c.borrow_mut();
+                    if edit_index as usize >= core.config.network_locations.len() {
+                        drop(core);
+                        st.set_netloc_edit_index(-1);
+                        st.set_status_text("要修改的网络位置不存在，请重试".into());
+                        return;
+                    }
+                    // 重名检查（跳过自身；SMB 允许名称为空回落为服务器地址）——
+                    // 先于可变借用完成，避免与 get_mut 的借用冲突
+                    let kind_now = core.config.network_locations[edit_index as usize].kind.clone();
+                    let final_name = if kind_now == "smb" && name.is_empty() { server.clone() } else { name.clone() };
+                    if core
+                        .config
+                        .network_locations
+                        .iter()
+                        .enumerate()
+                        .any(|(idx, l)| idx != edit_index as usize && l.name == final_name)
+                    {
+                        st.set_status_text("名称已存在，请更换显示名称".into());
+                        return;
+                    }
+                    let loc = &mut core.config.network_locations[edit_index as usize];
+                    if kind_now == "smb" {
+                        // server 变更时旧映射仍指向旧共享：断开旧盘符、按新地址
+                        // 重挂并回写盘符，保持配置与实际挂载一致（重挂沿用配置
+                        // 中登记的凭据）；失败则清空盘符登记并在提示中说明
+                        let server_changed = loc.server != server;
+                        let old_drive = loc.drive.clone();
+                        loc.name = final_name;
+                        loc.server = server.clone();
+                        if server_changed {
+                            if let Some(d) = &old_drive {
+                                let _ = crate::fs::network::unmount_smb(d);
+                            }
+                            match crate::fs::network::mount_smb(
+                                &server,
+                                &loc.username,
+                                &loc.password,
+                            ) {
+                                Some(d) => {
+                                    smb_remap_note = format!("，已重新挂载到 {}", d);
+                                    loc.drive = Some(d);
+                                }
+                                None => {
+                                    smb_remap_note =
+                                        "，重新挂载失败，请检查服务器地址后重新添加".into();
+                                    loc.drive = None;
+                                }
+                            }
+                        }
+                    } else {
+                        loc.name = final_name;
+                        loc.host = host.clone();
+                        loc.port = port;
+                        loc.remote_path = if remote_path.is_empty() { "/".into() } else { remote_path.clone() };
+                        loc.username = user.clone();
+                        loc.password = pass.clone();
+                        loc.use_tls = use_tls;
+                        loc.server = loc.display_server();
+                    }
+                    core.config.save();
+                }
+                // 统一复位表单 / 编辑索引并关闭对话框
+                st.invoke_close_netloc_dialog();
+                ui_bridge::push_network_locations(&ui, &c.borrow());
+                // 刷新侧栏与当前目录（改名后侧栏显示项同步）
+                {
+                    let core = c.borrow();
+                    ui.global::<AppState>().set_nav_items(ui_bridge::build_sidebar(
+                        core.active_tab().history.current(),
+                        &core.collapsed_sections,
+                        &core.config,
+                    ));
+                }
+                load_current(&ui, &c);
+                st.set_status_text(
+                    format!(
+                        "已保存修改：{}{}",
+                        if name.is_empty() { server } else { name },
+                        smb_remap_note
+                    )
+                    .into(),
+                );
+                return;
+            }
+
             if kind == "smb" {
                 if server.is_empty() {
                     st.set_status_text("请输入服务器地址（如 \\\\server\\share）".into());
@@ -2993,14 +3225,7 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                             });
                             core.config.save();
                         }
-                        st.set_netloc_dialog_open(false);
-                        st.set_netloc_name("".into());
-                        st.set_netloc_server("".into());
-                        st.set_netloc_host("".into());
-                        st.set_netloc_remote_path("".into());
-                        st.set_netloc_port(0);
-                        st.set_netloc_user("".into());
-                        st.set_netloc_pass("".into());
+                        st.invoke_close_netloc_dialog();
                         ui_bridge::push_network_locations(&ui, &c.borrow());
                         navigate_to(&ui, &c, PathBuf::from(drive));
                     }
@@ -3052,15 +3277,7 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                     core.config.network_locations.push(loc.clone());
                     core.config.save();
                 }
-                st.set_netloc_dialog_open(false);
-                st.set_netloc_name("".into());
-                st.set_netloc_server("".into());
-                st.set_netloc_host("".into());
-                st.set_netloc_remote_path("".into());
-                st.set_netloc_port(0);
-                st.set_netloc_user("".into());
-                st.set_netloc_pass("".into());
-                st.set_netloc_use_tls(false);
+                st.invoke_close_netloc_dialog();
                 ui_bridge::push_network_locations(&ui, &c.borrow());
                 // 刷新 此电脑 与 侧栏（新增云存储即时可见）
                 {
@@ -3089,6 +3306,51 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         }
     });
 
+    // 点「修改」：按行索引预填对话框表单并进入编辑模式（保存仍走 add-network-location）
+    let w = ui.as_weak();
+    let c = core.clone();
+    state.on_edit_network_location(move |index| {
+        if let Some(ui) = w.upgrade() {
+            let st = ui.global::<AppState>();
+            let core = c.borrow();
+            let Some(loc) = core.config.network_locations.get(index as usize) else {
+                drop(core);
+                st.set_status_text("要修改的网络位置不存在，请重试".into());
+                return;
+            };
+            st.set_netloc_kind(loc.kind.clone().into());
+            st.set_netloc_name(loc.name.clone().into());
+            st.set_netloc_server(loc.server.clone().into());
+            st.set_netloc_host(loc.host.clone().into());
+            st.set_netloc_remote_path(loc.remote_path.clone().into());
+            st.set_netloc_port(loc.port as i32);
+            st.set_netloc_use_tls(loc.use_tls);
+            st.set_netloc_user(loc.username.clone().into());
+            st.set_netloc_pass(loc.password.clone().into());
+            st.set_netloc_edit_index(index);
+            st.set_netloc_dialog_open(true);
+        }
+    });
+
+    // 关闭网络位置对话框：复位编辑索引并清空表单（背景点击 / 取消 / 保存后共用）
+    let w = ui.as_weak();
+    state.on_close_netloc_dialog(move || {
+        if let Some(ui) = w.upgrade() {
+            let st = ui.global::<AppState>();
+            st.set_netloc_dialog_open(false);
+            st.set_netloc_edit_index(-1);
+            st.set_netloc_name("".into());
+            st.set_netloc_server("".into());
+            st.set_netloc_host("".into());
+            st.set_netloc_remote_path("".into());
+            st.set_netloc_port(0);
+            st.set_netloc_user("".into());
+            st.set_netloc_pass("".into());
+            st.set_netloc_use_tls(false);
+            st.set_input_active(false);
+        }
+    });
+
     // 移除网络位置：卸载盘符（SMB/rclone WebDAV 虚拟磁盘）+ 删除配置
     let w = ui.as_weak();
     let c = core.clone();
@@ -3110,10 +3372,11 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             }
             if let Some(loc) = removed {
                 if loc.kind == "webdav" {
-                    // rclone 虚拟磁盘卸载（无终端，后台 kill）
+                    // rclone 虚拟磁盘卸载：release_drive 内含孤儿进程兜底强杀与
+                    // 盘符释放轮询（与「取消挂载」同路径，避免移除账号后盘符残留）
                     crate::fs::rclone::unmount_by_name(&loc.name);
                     if let Some(d) = loc.drive {
-                        crate::fs::rclone::unmount_drive(&d);
+                        crate::fs::rclone::release_drive(&d);
                     }
                 } else if let Some(d) = loc.drive {
                     crate::fs::network::unmount_smb(&d);
@@ -3312,12 +3575,13 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 }
             }
             crate::fs::rclone::unmount_by_name(&name);
+            // 确保盘符真正释放：挂载表无记录（应用重启后的孤儿 rclone）时按盘符
+            // 兜底强杀，并轮询等待 WinFsp 回收（最长约 3 秒，代替原先固定 400ms）
+            let mut release_failed = false;
             if let Some(d) = &removed_drive {
-                crate::fs::rclone::unmount_drive(d);
+                release_failed = !crate::fs::rclone::release_drive(d);
             }
-            // 卸载后 WinFsp 回收盘符需短暂延时，稍等后刷新磁盘缓存再重建侧栏，
-            // 否则侧栏仍残留已卸载的盘符（cached_disks 快照未更新）
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            // 卸载后刷新磁盘缓存再重建侧栏（cached_disks 快照未更新会残留盘符）
             let _ = crate::fs::disk::list_disks();
             ui_bridge::push_network_locations(&ui, &c.borrow());
             {
@@ -3330,9 +3594,9 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             }
             // 正停留在被卸载盘符内（含子目录）→ 跳回该账户 cloud:// 根
             let cur = c.borrow().active_tab().history.current().to_string_lossy().to_string();
-            if let Some(d) = removed_drive {
+            if let Some(d) = &removed_drive {
                 // get(..2) 防止多字节字符路径按字节切片越界 panic
-                if cur.get(..2).map_or(false, |two| two.eq_ignore_ascii_case(&d)) {
+                if cur.get(..2).map_or(false, |two| two.eq_ignore_ascii_case(d)) {
                     let cloud_root = {
                         let core = c.borrow();
                         core.config
@@ -3350,7 +3614,13 @@ fn bind_navigation(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             if cur == fs::virtualfs::THIS_PC_PATH || cur == "network://" {
                 load_current(&ui, &c);
             }
-            st.set_status_text(format!("已卸载 {} 的虚拟磁盘", name).into());
+            st.set_status_text(if release_failed {
+                format!("已执行卸载，但 {} 尚未释放；请稍候查看，若持续存在请重启应用", 
+                    removed_drive.as_deref().unwrap_or("盘符"))
+            } else {
+                format!("已卸载 {} 的虚拟磁盘", name)
+            }
+            .into());
         }
     });
 

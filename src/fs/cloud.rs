@@ -472,13 +472,17 @@ impl FtpConn {
         }
         Ok(())
     }
-    /// 优先 MLSD（机器可读，无 POSIX/DOS 歧义），不支持时回退 None 由调用方走 LIST
-    fn try_mlsd(&mut self, path: &str) -> Option<Vec<String>> {
+    /// 优先 MLSD（机器可读，无 POSIX/DOS 歧义）。
+    /// Ok(Some)：列出成功；Ok(None)：服务器接受但目录为空（回退 LIST 由调用方定）；
+    /// Err：命令被拒/中断。失败时 suppaftp 内部 data_connection_open 标志不会复位，
+    /// 同一连接上的后续数据命令必然误报「Data connection is already open」，
+    /// 调用方收到 Err 后必须重建连接再发其他数据命令
+    fn try_mlsd(&mut self, path: &str) -> Result<Option<Vec<String>>, String> {
         let lines = match self {
-            FtpConn::Plain(f) => f.mlsd(Some(path)).ok()?,
-            FtpConn::Secure(f) => f.mlsd(Some(path)).ok()?,
+            FtpConn::Plain(f) => f.mlsd(Some(path)).map_err(|e| map_ftp_err(&e))?,
+            FtpConn::Secure(f) => f.mlsd(Some(path)).map_err(|e| map_ftp_err(&e))?,
         };
-        if lines.is_empty() { None } else { Some(lines) }
+        if lines.is_empty() { Ok(None) } else { Ok(Some(lines)) }
     }
     fn list(&mut self) -> Result<Vec<String>, String> {
         match self {
@@ -612,21 +616,36 @@ fn list_ftp(loc: &NetworkLocation, sub: &str) -> Result<Vec<Entry>, String> {
     let sub_prefix = if sub.is_empty() { String::new() } else { format!("/{}", sub.trim_matches('/')) };
     let base_path = format!("{}{}", prefix, sub_prefix);
     // 1) 优先 MLSD：机器可读（type=dir/file;size=;modify=），无解析歧义
-    if let Some(lines) = ftp.try_mlsd(&remote) {
-        let mut entries = Vec::new();
-        for line in lines {
-            if let Ok(f) = suppaftp::list::ListParser::parse_mlsd(&line) {
-                let name = f.name().to_string();
-                let is_dir = f.is_directory();
-                let size = f.size() as u64;
-                let mtime = unix_ts_from_system(f.modified());
-                if let Some(e) = ftp_file_to_entry(name, is_dir, size, mtime, &base_path) {
-                    entries.push(e);
+    match ftp.try_mlsd(&remote) {
+        Ok(Some(lines)) => {
+            let mut entries = Vec::new();
+            for line in lines {
+                if let Ok(f) = suppaftp::list::ListParser::parse_mlsd(&line) {
+                    let name = f.name().to_string();
+                    let is_dir = f.is_directory();
+                    let size = f.size() as u64;
+                    let mtime = unix_ts_from_system(f.modified());
+                    if let Some(e) = ftp_file_to_entry(name, is_dir, size, mtime, &base_path) {
+                        entries.push(e);
+                    }
                 }
             }
+            ftp.quit();
+            return Ok(entries);
         }
-        ftp.quit();
-        return Ok(entries);
+        Ok(None) => {
+            // 服务器接受 MLSD 但目录为空：连接状态干净，按空目录返回（不再 LIST）
+            ftp.quit();
+            return Ok(Vec::new());
+        }
+        Err(_mlsd_err) => {
+            // MLSD 被拒（500/502 不支持）或数据连接异常：suppaftp 内部标志未复位，
+            // 原连接上的 LIST 会误报「Data connection is already open」——必须重建连接
+            ftp.quit();
+            ftp = connect_ftp(loc)?;
+            ftp.login(&user, &pass)?;
+            ftp.cwd(&remote)?;
+        }
     }
     // 2) 回退 LIST：逐行先 POSIX 后 DOS（覆盖 IIS 等 Windows FTP 的 <DIR> 格式）
     let list = ftp.list()?;

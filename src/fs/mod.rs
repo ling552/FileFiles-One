@@ -4,6 +4,8 @@ pub mod clipboard;
 pub mod disk;
 // OLE 拖出：把选中文件拖拽到其他应用（DoDragDrop + Shell 数据对象）
 pub mod drag_out;
+// OLE 拖入：接收其他应用拖来的文件（微信图片/资源管理器/浏览器），复制到当前目录
+pub mod drag_in;
 // 受保护目录文件操作：权限被拒绝时按需请求 UAC
 pub mod elevated;
 pub mod hash;

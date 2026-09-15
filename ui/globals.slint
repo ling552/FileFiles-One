@@ -266,6 +266,12 @@ export global AppState {
     in-out property <string> netloc-pass;
     callback add-network-location();
     callback remove-network-location(string);
+    // 修改已保存的网络位置：index >= 0 表示正在编辑该行（-1 = 新增模式）。
+    // 点「修改」→ edit-network-location 预填表单并打开对话框；保存走 add-network-location
+    // （Rust 侧按 edit-index 分流为更新）；关闭对话框统一走 close-netloc-dialog 复位
+    in-out property <int> netloc-edit-index: -1;
+    callback edit-network-location(int);
+    callback close-netloc-dialog();
     // WebDAV 虚拟磁盘挂载完成/失败（后台 rclone 线程经事件循环回主线程）：
     // mounted(name, drive, jump)：回写配置盘符并刷新；jump 为真时跳转到盘符
     // （添加流程），启动自动挂载时为假（仅静默显示，不抢焦点）
