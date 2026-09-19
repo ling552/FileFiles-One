@@ -31,6 +31,12 @@ pub enum TaskKind {
     Delete,
     /// 永久删除（不可逆）：srcs 为待删项，dst 未用
     DeletePermanent,
+    /// 云端复制：srcs 为本地路径（上传）或 cloud:// 路径（下载/云内/跨账号），
+    /// dst 为目标目录（cloud:// 或本地路径）
+    CloudCopy,
+    /// 云端移动：同 CloudCopy，源端在目标写入成功后删除（本地源删文件，
+    /// 云端源走服务端删除）
+    CloudMove,
 }
 
 impl TaskKind {
@@ -42,6 +48,8 @@ impl TaskKind {
             TaskKind::Compress => "压缩文件",
             TaskKind::Delete => "删除文件",
             TaskKind::DeletePermanent => "永久删除",
+            TaskKind::CloudCopy => "云端复制",
+            TaskKind::CloudMove => "云端移动",
         }
     }
 }
@@ -127,12 +135,14 @@ impl TaskControl {
         self.cancelled.store(true, Ordering::Relaxed);
     }
 
-    fn is_cancelled(&self) -> bool {
+    /// 供云端传输模块（fs::cloud）在流式读写循环中检查取消
+    pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    /// 处于暂停时自旋等待（每 80ms 检查一次），被取消则立即返回
-    fn wait_if_paused(&self) {
+    /// 处于暂停时自旋等待（每 80ms 检查一次），被取消则立即返回。
+    /// 供任务运行器与云端传输模块共用。
+    pub fn wait_if_paused(&self) {
         while self.paused.load(Ordering::Relaxed) && !self.is_cancelled() {
             std::thread::sleep(Duration::from_millis(80));
         }
@@ -205,17 +215,24 @@ pub struct TaskResult {
 }
 
 /// 在工作线程中执行任务。
+/// `config` 为应用配置（云端任务按账号凭据执行，其余任务忽略）；
 /// `report` 用于回送进度（每次约 ≥40ms 一帧）；
 /// `ask` 在遇到顶层同名冲突时被调用，阻塞直到用户在主线程做出处置选择。
 pub fn run(
     job: Job,
     ctrl: Arc<TaskControl>,
+    config: crate::config::AppConfig,
     report: impl Fn(Progress),
     ask: impl Fn(ConflictQuery) -> ConflictReply,
 ) -> TaskResult {
     // 任一端落在便携设备上：std::fs 不可用，整体改走 WPD 传输
     if matches!(job.kind, TaskKind::Copy | TaskKind::Move) && job_touches_device(&job) {
         return run_mtp(job, ctrl, report, ask);
+    }
+
+    // 云端任务：src/dst 至少一端在 cloud://，按协议直传或本地中转
+    if matches!(job.kind, TaskKind::CloudCopy | TaskKind::CloudMove) {
+        return run_cloud_transfer(job, ctrl, config, report, ask);
     }
 
     // 删除类任务：逐项执行并按项数上报进度（不走字节扫描/冲突流程）
@@ -257,6 +274,8 @@ pub fn run(
         TaskKind::Extract => return runner.run_extract(&job),
         TaskKind::Compress => return runner.run_compress(&job),
         TaskKind::Copy | TaskKind::Move => {}
+        // 云端任务在 run 顶部已由 run_cloud_transfer 处理，不会到达这里
+        TaskKind::CloudCopy | TaskKind::CloudMove => unreachable!("cloud handled before runner"),
         // 删除类在 runner 构建前已由 run_delete 处理，不会到达这里
         TaskKind::Delete | TaskKind::DeletePermanent => {
             unreachable!("delete handled before runner")
@@ -329,6 +348,307 @@ pub fn run(
 
 /// 删除类任务执行器：逐项删除（回收站或永久），按顶层项数上报进度。
 /// 在后台线程运行，UI 线程不再被 Shell 删除阻塞（修复大文件夹删除卡死）。
+/// 云端任务运行：上传（本地→cloud://）、下载（cloud://→本地）、
+/// 云内复制/移动与跨账号本地中转。逐项执行，单项失败即整体失败返回错误。
+///
+/// 进度口径：本地侧字节经 scan 精确计入；云端侧大小在传输中逐步可知
+/// （WebDAV Content-Length / FTP SIZE / rclone 完成值），动态累加进总量，
+/// 比例随之收敛；纯云端目录任务退化为按项数计。
+fn run_cloud_transfer(
+    job: Job,
+    ctrl: Arc<TaskControl>,
+    config: crate::config::AppConfig,
+    report: impl Fn(Progress),
+    _ask: impl Fn(ConflictQuery) -> ConflictReply,
+) -> TaskResult {
+    use super::cloud::CLOUD_CANCELLED;
+    let delete_src = job.kind == TaskKind::CloudMove;
+    let op = job.kind.label();
+    let target = job.dst.to_string_lossy().to_string();
+    // 本地侧源可精确扫描；文件总数按顶层项计（云端不可便宜预扫）
+    let local_srcs: Vec<PathBuf> = job
+        .srcs
+        .iter()
+        .filter(|p| !super::cloud::is_cloud_path(&p.to_string_lossy()))
+        .cloned()
+        .collect();
+    let (_, local_bytes) = scan(&local_srcs);
+    let total_files = job.srcs.len() as i32;
+    let total_bytes = local_bytes;
+
+    let mut runner = Runner {
+        ctrl: &ctrl,
+        report: &report,
+        ask: &_ask,
+        op,
+        target: &target,
+        total_files,
+        total_bytes,
+        done_files: 0,
+        done_bytes: 0,
+        skipped: 0,
+        start: Instant::now(),
+        last_emit: Instant::now() - Duration::from_secs(1),
+        meter: SpeedMeter::new(),
+        remembered: None,
+    };
+    runner.emit("准备中…", true);
+
+    let mut completed_paths: Vec<PathBuf> = Vec::new();
+    let mut error = String::new();
+    let mut cancelled = false;
+    for src in &job.srcs {
+        if runner.ctrl.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+        ctrl.wait_if_paused();
+        let src_str = src.to_string_lossy().to_string();
+        let src_cloud = super::cloud::is_cloud_path(&src_str);
+        let dst_cloud = super::cloud::is_cloud_path(&target);
+        let name = if src_cloud {
+            src_str
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(&src_str)
+                .to_string()
+        } else {
+            name_of(src)
+        };
+        runner.emit(&name, false);
+        let r = match (src_cloud, dst_cloud) {
+            (false, true) => {
+                cloud_upload_tree(&mut runner, &ctrl, &config, src, &target, delete_src)
+            }
+            (true, false) => {
+                cloud_download_tree(&mut runner, &ctrl, &config, &src_str, &job.dst, delete_src)
+            }
+            (true, true) => cloud_to_cloud(&mut runner, &ctrl, &config, &src_str, &target, delete_src),
+            (false, false) => Err("云端任务不包含云端路径".into()),
+        };
+        match r {
+            Ok(dst_path) => {
+                runner.done_files += 1;
+                completed_paths.push(dst_path);
+                runner.emit(&name, true);
+            }
+            Err(e) => {
+                if runner.ctrl.is_cancelled() || e == CLOUD_CANCELLED {
+                    cancelled = true;
+                } else {
+                    error = e;
+                }
+                break;
+            }
+        }
+    }
+    if !cancelled && error.is_empty() {
+        runner.emit("完成", true);
+    }
+    TaskResult {
+        ok: runner.done_files,
+        skipped: runner.skipped,
+        error,
+        cancelled,
+        completed_paths,
+    }
+}
+
+/// 上传单项（文件或目录树）到云端目录。返回目标项路径（供完成后选中）。
+fn cloud_upload_tree<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply>(
+    runner: &mut Runner<'a, F, G>,
+    ctrl: &Arc<TaskControl>,
+    config: &crate::config::AppConfig,
+    src: &Path,
+    dst_dir: &str,
+    delete_src: bool,
+) -> Result<PathBuf, String> {
+    use super::cloud::CLOUD_CANCELLED;
+    if src.is_file() {
+        let name = name_of(src);
+        // 本地源字节已由 scan 计入总量，进度只累计 done_bytes
+        let mut last: u64 = 0;
+        let mut prog = |done: u64, _total: u64| {
+            runner.done_bytes += done.saturating_sub(last);
+            last = done;
+            runner.emit(&name, false);
+        };
+        super::cloud::upload_to_cloud(src, dst_dir, config, ctrl, &mut prog)?;
+        if delete_src {
+            let _ = std::fs::remove_file(src);
+        }
+        Ok(PathBuf::from(format!(
+            "{}/{}",
+            dst_dir.trim_end_matches('/'),
+            name
+        )))
+    } else if src.is_dir() {
+        let name = name_of(src);
+        let sub = format!("{}/{}", dst_dir.trim_end_matches('/'), name);
+        super::cloud::cloud_mkdir_full(&sub, config)?;
+        let mut children: Vec<PathBuf> = Vec::new();
+        for ent in std::fs::read_dir(src).map_err(|e| format!("读取目录失败：{}", e))? {
+            children.push(ent.map_err(|e| e.to_string())?.path());
+        }
+        children.sort();
+        for p in children {
+            if runner.ctrl.is_cancelled() {
+                return Err(CLOUD_CANCELLED.to_string());
+            }
+            cloud_upload_tree(runner, ctrl, config, &p, &sub, delete_src)?;
+        }
+        if delete_src {
+            let _ = std::fs::remove_dir_all(src);
+        }
+        Ok(PathBuf::from(&sub))
+    } else {
+        Err("本地路径不存在".into())
+    }
+}
+
+/// 下载单项（文件或目录树）到本地目录。返回目标项路径。
+fn cloud_download_tree<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply>(
+    runner: &mut Runner<'a, F, G>,
+    ctrl: &Arc<TaskControl>,
+    config: &crate::config::AppConfig,
+    src: &str,
+    dst_dir: &Path,
+    delete_src: bool,
+) -> Result<PathBuf, String> {
+    use super::cloud::CLOUD_CANCELLED;
+    // 先 stat 判定文件/目录（单次往返），目录再列内容
+    let stat = super::cloud::cloud_stat(src, config)?;
+    let name = src
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return Err("云端路径缺少名称".into());
+    }
+    if stat.is_dir {
+        let local_dir = dst_dir.join(&name);
+        std::fs::create_dir_all(&local_dir).map_err(|e| format!("创建目录失败：{}", e))?;
+        let children = super::cloud::list_cloud_dir_result(src, &config.network_locations)?;
+        for child in children {
+            if runner.ctrl.is_cancelled() {
+                return Err(CLOUD_CANCELLED.to_string());
+            }
+            cloud_download_tree(runner, ctrl, config, &child.path, &local_dir, delete_src)?;
+        }
+        if delete_src {
+            super::cloud::delete_cloud(src, config)?;
+        }
+        Ok(local_dir)
+    } else {
+        // Content-Length 到手后动态计入总量，比例随传输收敛
+        let mut last: u64 = 0;
+        let mut counted: u64 = 0;
+        let mut prog = |done: u64, total: u64| {
+            if total > 0 && counted < total {
+                runner.total_bytes += total - counted;
+                counted = total;
+            }
+            runner.done_bytes += done.saturating_sub(last);
+            last = done;
+            runner.emit(&name, false);
+        };
+        super::cloud::download_from_cloud(src, dst_dir, config, ctrl, &mut prog)?;
+        if delete_src {
+            super::cloud::delete_cloud(src, config)?;
+        }
+        Ok(dst_dir.join(&name))
+    }
+}
+
+/// 云到云单项：同账号走服务端操作；跨账号文件经本地临时中转（目录报错提示）。
+fn cloud_to_cloud<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply>(
+    runner: &mut Runner<'a, F, G>,
+    ctrl: &Arc<TaskControl>,
+    config: &crate::config::AppConfig,
+    src: &str,
+    dst_dir: &str,
+    delete_src: bool,
+) -> Result<PathBuf, String> {
+    use super::cloud::CLOUD_CANCELLED;
+    let name = src
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return Err("云端路径缺少名称".into());
+    }
+    let target = PathBuf::from(format!(
+        "{}/{}",
+        dst_dir.trim_end_matches('/'),
+        name
+    ));
+    let r = if delete_src {
+        // 云内移动即服务端 MOVE：源端已随之消失，无需再删
+        super::cloud::cloud_move_same(src, dst_dir, None, config)
+    } else {
+        let mut last: u64 = 0;
+        let mut counted: u64 = 0;
+        let mut prog = |done: u64, total: u64| {
+            if total > 0 && counted < total {
+                runner.total_bytes += total - counted;
+                counted = total;
+            }
+            runner.done_bytes += done.saturating_sub(last);
+            last = done;
+            runner.emit(&name, false);
+        };
+        super::cloud::cloud_copy_same(src, dst_dir, config, ctrl, &mut prog)
+    };
+    match r {
+        Ok(()) => Ok(target),
+        Err(e) if e.contains("跨账号") => {
+            // 跨账号：stat 判定，文件走本地中转，目录明确报错（v1 限制）
+            let stat = super::cloud::cloud_stat(src, config)?;
+            if stat.is_dir {
+                return Err("跨账号暂不支持直接复制/移动文件夹，请逐个文件操作".into());
+            }
+            // 本地中转两段各计一次，字节翻倍
+            if stat.size > 0 {
+                runner.total_bytes += stat.size * 2;
+            }
+            let dir = std::env::temp_dir()
+                .join("FileFiles One")
+                .join("xfer_tmp");
+            std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{}", e))?;
+            let tmp_file = dir.join(format!("xfer_{}", name));
+            let base = stat.size;
+            let mut last: u64 = 0;
+            // Cell：闭包内只读快照，段切换在外部写入
+            let phase = std::cell::Cell::new(0u64); // 0=下载段 1=上传段
+            let mut prog = |done: u64, _total: u64| {
+                // 下载段 0..base，上传段 base..2*base
+                let abs = if phase.get() == 0 { done } else { base + done };
+                runner.done_bytes += abs.saturating_sub(last);
+                last = abs;
+                runner.emit(&name, false);
+            };
+            if let Err(e) = super::cloud::download_from_cloud(src, &dir, config, ctrl, &mut prog) {
+                let _ = std::fs::remove_file(&tmp_file);
+                return Err(e);
+            }
+            phase.set(1);
+            let up = super::cloud::upload_to_cloud(&tmp_file, dst_dir, config, ctrl, &mut prog);
+            let _ = std::fs::remove_file(&tmp_file);
+            up?;
+            if delete_src {
+                super::cloud::delete_cloud(src, config)?;
+            }
+            Ok(target)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn run_delete(job: Job, ctrl: Arc<TaskControl>, report: impl Fn(Progress)) -> TaskResult {
     let op = job.kind.label();
     let permanent = job.kind == TaskKind::DeletePermanent;
@@ -655,6 +975,81 @@ impl<R: Read> Read for GatedReader<'_, R> {
     }
 }
 
+/// CopyFileExW 进度回调的上下文：仅持有裸指针与值拷贝。
+/// 回调在发起拷贝的同一线程内被系统同步调用（CopyFileExW 不另起线程），
+/// 回调期间调用方阻塞在 CopyFileExW 内、不会触碰这些字段，指针全程有效。
+#[cfg(windows)]
+struct NativeCopyCtx<'r> {
+    ctrl: *const TaskControl,
+    done_bytes: *mut u64,
+    meter: *mut SpeedMeter,
+    last_emit: *mut Instant,
+    report: *const (dyn Fn(Progress) + 'r),
+    op: &'static str,
+    target: String,
+    name: String,
+    done_files: i32,
+    total_files: i32,
+    total_bytes: u64,
+    start: Instant,
+    /// 上次回调已传输的字节数（增量喂给速率计）
+    last_transferred: u64,
+}
+
+/// CopyFileExW 进度回调：逐块累计 done_bytes、上报进度帧；
+/// 取消时返回 PROGRESS_CANCEL（系统删除目标半成品）；
+/// 暂停时原地自旋等待，与分块循环的语义一致。
+#[cfg(windows)]
+unsafe extern "system" fn native_copy_progress(
+    _total_file_size: i64,
+    total_bytes_transferred: i64,
+    _stream_size: i64,
+    _stream_bytes_transferred: i64,
+    _stream_number: u32,
+    _reason: windows::Win32::Storage::FileSystem::LPPROGRESS_ROUTINE_CALLBACK_REASON,
+    _src: windows::Win32::Foundation::HANDLE,
+    _dst: windows::Win32::Foundation::HANDLE,
+    lp_data: *const core::ffi::c_void,
+) -> windows::Win32::Storage::FileSystem::COPYPROGRESSROUTINE_PROGRESS {
+    use windows::Win32::Storage::FileSystem::{PROGRESS_CANCEL, PROGRESS_CONTINUE};
+    // SAFETY: lp_data 指向调用方栈上的 NativeCopyCtx（见结构体注释）
+    let ctx = &mut *(lp_data as *mut NativeCopyCtx);
+    let ctrl = &*ctx.ctrl;
+    if ctrl.is_cancelled() {
+        return PROGRESS_CANCEL;
+    }
+    ctrl.wait_if_paused();
+    if ctrl.is_cancelled() {
+        return PROGRESS_CANCEL;
+    }
+    let transferred = total_bytes_transferred.max(0) as u64;
+    let delta = transferred.saturating_sub(ctx.last_transferred);
+    if delta > 0 {
+        ctx.last_transferred = transferred;
+        let done = &mut *ctx.done_bytes;
+        *done = done.saturating_add(delta);
+        let meter = &mut *ctx.meter;
+        meter.push(*done);
+        let now = Instant::now();
+        if now.duration_since(*ctx.last_emit) >= Duration::from_millis(40) {
+            *ctx.last_emit = now;
+            let report = &*ctx.report;
+            report(make_progress(
+                ctx.op,
+                &ctx.name,
+                &ctx.target,
+                ctx.done_files,
+                ctx.total_files,
+                *done,
+                ctx.total_bytes,
+                ctx.start,
+                meter,
+            ));
+        }
+    }
+    PROGRESS_CONTINUE
+}
+
 struct Runner<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> {
     ctrl: &'a TaskControl,
     report: &'a F,
@@ -858,6 +1253,16 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
             return Ok(true);
         }
         let name = name_of(from);
+        // Windows 原生内核拷贝优先（CopyFileExW）：内核级流水线比用户态
+        // 分块循环更快，保留时间戳/属性，进度经回调逐块上报；取消经
+        // PROGRESS_CANCEL 由系统自动清理目标半成品。大文件不再整段卡在
+        // 用户态循环里。
+        #[cfg(windows)]
+        {
+            if let Some(res) = self.copy_file_native(from, &to, &name) {
+                return res;
+            }
+        }
         let mut reader = fs::File::open(from)?;
         let mut writer = fs::File::create(&to)?;
         let mut buf = vec![0u8; 1024 * 1024];
@@ -879,6 +1284,75 @@ impl<'a, F: Fn(Progress), G: Fn(ConflictQuery) -> ConflictReply> Runner<'a, F, G
         self.done_files += 1;
         self.emit(&name, true);
         Ok(true)
+    }
+
+    /// Windows 原生拷贝（CopyFileExW）。
+    /// 返回 `None` 表示未尝试原生路径（非 Windows），调用方回退到分块循环；
+    /// `Some(result)` 为最终结论（成功/失败/取消）。
+    #[cfg(windows)]
+    fn copy_file_native(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        name: &str,
+    ) -> Option<io::Result<bool>> {
+        use windows::Win32::Storage::FileSystem::{CopyFileExW, COPYFILE_FLAGS};
+
+        let existing = windows::core::HSTRING::from(from.as_os_str());
+        let new = windows::core::HSTRING::from(to.as_os_str());
+        // 冲突已在 decide 处理（Overwrite 删除 / Rename 改名），此处直接覆盖
+        let flags = COPYFILE_FLAGS(0);
+        let mut ctx = NativeCopyCtx {
+            ctrl: self.ctrl,
+            done_bytes: &mut self.done_bytes,
+            meter: &mut self.meter,
+            last_emit: &mut self.last_emit,
+            report: self.report as *const (dyn Fn(Progress) + 'a),
+            op: self.op,
+            target: self.target.to_string(),
+            name: name.to_string(),
+            done_files: self.done_files,
+            total_files: self.total_files,
+            total_bytes: self.total_bytes,
+            start: self.start,
+            last_transferred: 0,
+        };
+        // 先以显式类型绑定完成 fn item → fn pointer 的协变；
+        // windows crate 的参数为 Option<Option<fn>> 双层包装
+        let cb: windows::Win32::Storage::FileSystem::LPPROGRESS_ROUTINE =
+            Some(native_copy_progress);
+        let result = unsafe {
+            CopyFileExW(
+                &existing,
+                &new,
+                Some(cb),
+                Some(&mut ctx as *mut NativeCopyCtx as *const core::ffi::c_void),
+                None,
+                flags,
+            )
+        };
+        match result {
+            Ok(()) => {
+                self.done_files += 1;
+                self.emit(name, true);
+                Some(Ok(true))
+            }
+            Err(e) => {
+                if self.ctrl.is_cancelled() {
+                    // PROGRESS_CANCEL 已由系统删除目标半成品
+                    return Some(Ok(false));
+                }
+                // HRESULT 还原 Win32 错误码（FACILITY_WIN32=7 时低 16 位即错误码），
+                // 与分块循环的 io::Error 语义一致
+                let code = e.code().0 as u32;
+                let os_err = if (code >> 16) & 0x1FFF == 7 {
+                    io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+                } else {
+                    io::Error::new(io::ErrorKind::Other, e.to_string())
+                };
+                Some(Err(os_err))
+            }
+        }
     }
 
     // ──────────────────────── 解压 ────────────────────────
@@ -1937,6 +2411,7 @@ mod tests {
         run(
             job,
             Arc::new(TaskControl::new()),
+            crate::config::AppConfig::default(),
             |_| {},
             move |_| ConflictReply {
                 decision,
@@ -2170,6 +2645,7 @@ mod tests {
                 dst: dir.join("归档.zip"),
             },
             ctrl,
+            crate::config::AppConfig::default(),
             |_| {},
             |_| ConflictReply {
                 decision: ConflictDecision::Skip,

@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod fs;
 mod git;
+mod memguard;
 mod preview_host;
 mod ui_bridge;
 mod update;
@@ -230,6 +231,15 @@ fn main() -> Result<(), slint::PlatformError> {
     // 启动目录优先使用其已保存布局；未记录目录才使用全局默认视图。
     apply_folder_layout(&ui, &core);
 
+    // 启动时先用真实盘符校正 WebDAV 挂载记录，再推送账号列表：
+    // 上次会话回写丢失（崩溃 / 回调未执行）会让配置盘符与实际不符，
+    // 从而把已挂载的账户显示成未挂载的 WebDAV 位置
+    {
+        let mut core_mut = core.borrow_mut();
+        if crate::fs::cloud::reconcile_webdav_mount_state(&mut core_mut.config) {
+            core_mut.config.save();
+        }
+    }
     // 启动时推送已保存的网络位置列表（设置「云存储账号」页展示）
     ui_bridge::push_network_locations(&ui, &core.borrow());
     // 启动时推送自定义标签定义（工具栏「标记」下拉与侧栏同步）
@@ -332,6 +342,11 @@ fn auto_mount_saved_webdav(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         // 先收养/清理上次未卸载的孤儿 rclone 进程（含应用重启后盘符残留场景），
         // 收养记录后「取消挂载」才可用；陈旧孤儿被强杀后自动挂载才不会被占用挡住
         crate::fs::rclone::adopt_orphan_mounts(&all_locations);
+        // 收养只改内存挂载表，必须回主线程刷新一次：否则设置页与「此电脑」
+        // 仍按配置里的旧盘符判断，已收养的挂载会被当作未挂载的 WebDAV 位置
+        let _ = w
+            .clone()
+            .upgrade_in_event_loop(|ui| ui.global::<AppState>().invoke_devices_changed());
         // 缺 rclone 时先供给一次（失败则整批跳过，下次添加/启动再试）
         if crate::fs::rclone::rclone_exe().is_none() {
             let _ = crate::fs::rclone::ensure_rclone();
@@ -486,6 +501,20 @@ fn bind_device_polling(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     let c = core.clone();
     ui.global::<AppState>().on_devices_changed(move || {
         let Some(ui) = w.upgrade() else { return };
+        // 先用真实盘符校正 WebDAV 挂载记录：外部卸载、挂载进程异常退出、
+        // 上次回写丢失都会让配置与真实状态分叉，使同一账户在设置页显示
+        // 「已挂载」而「此电脑」里却是 WebDAV 位置。这里统一到真实状态。
+        let reconciled = {
+            let mut core = c.borrow_mut();
+            crate::fs::cloud::reconcile_webdav_mount_state(&mut core.config)
+        };
+        if reconciled {
+            let core = c.borrow();
+            core.config.save();
+            // 盘符记录变化意味着磁盘集合也变了，刷新快照后再重建侧栏/此电脑
+            let _ = crate::fs::disk::list_disks();
+            ui_bridge::push_network_locations(&ui, &core);
+        }
         let path = c.borrow().active_tab().history.current().clone();
         {
             let cc = c.borrow();
@@ -1801,6 +1830,58 @@ fn bind_command_palette(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
 }
 
 /// 从队列取出下一个任务并在工作线程执行；空闲时才启动，进度经事件循环回填 UI。
+/// 按云端/本地拆分复制移动任务并入队并启动：
+/// - 源或目标任一端在 cloud:// 的项走云端任务（CloudCopy/CloudMove，
+///   WebDAV/FTP/SFTP 直传或本地中转）
+/// - 其余走普通本地任务（std::fs / CopyFileExW / WPD）
+/// 便携设备源在云端目标上不可传输，剔除并提示。
+/// 撤销记录由调用方处理（仅纯本地移动可撤销）。
+fn enqueue_transfer_jobs(
+    ui: &MainWindow,
+    core: &Rc<RefCell<AppCore>>,
+    kind: fs::tasks::TaskKind,
+    srcs: Vec<PathBuf>,
+    dst: PathBuf,
+) {
+    let dst_cloud = fs::cloud::is_cloud_path(&dst.to_string_lossy());
+    let mut cloud_srcs: Vec<PathBuf> = Vec::new();
+    let mut local_srcs: Vec<PathBuf> = Vec::new();
+    let mut skipped_device = 0usize;
+    for p in srcs {
+        let s = p.to_string_lossy().to_string();
+        if fs::cloud::is_cloud_path(&s) || dst_cloud {
+            if fs::devices::is_device_path(&s) {
+                skipped_device += 1;
+                continue;
+            }
+            cloud_srcs.push(p);
+        } else {
+            local_srcs.push(p);
+        }
+    }
+    let cloud_kind = if kind == fs::tasks::TaskKind::Move {
+        fs::tasks::TaskKind::CloudMove
+    } else {
+        fs::tasks::TaskKind::CloudCopy
+    };
+    {
+        let mut c = core.borrow_mut();
+        if !cloud_srcs.is_empty() {
+            c.task_queue
+                .push_back(fs::tasks::Job { kind: cloud_kind, srcs: cloud_srcs, dst: dst.clone() });
+        }
+        if !local_srcs.is_empty() {
+            c.task_queue.push_back(fs::tasks::Job { kind, srcs: local_srcs, dst });
+        }
+    }
+    if skipped_device > 0 {
+        ui.global::<AppState>().set_status_text(
+            format!("{} 项便携设备内容暂不支持传输到云存储，已跳过", skipped_device).into(),
+        );
+    }
+    start_next_job(ui, core);
+}
+
 fn start_next_job(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     use std::sync::Arc;
 
@@ -1848,6 +1929,8 @@ fn start_next_job(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     // 后台索引开关在启动时读取并捕获（Rc 非 Send，不能进事件循环闭包）；
     // 任务期间用户改设置属极小概率，偏差由下次全量重建修正。
     let bg_index = core.borrow().config.settings.background_index;
+    // 云端任务按账号凭据执行：整份配置克隆进工作线程（AppConfig 为小结构）
+    let cloud_cfg = core.borrow().config.clone();
     std::thread::spawn(move || {
         // catch_unwind 包裹 run：任务执行或内部库 panic 时仍构造错误结果，保证
         // 下方 task-finished 一定触发、task_control 一定清理。否则一次 panic 会让
@@ -1857,6 +1940,7 @@ fn start_next_job(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             fs::tasks::run(
                 job,
                 ctrl,
+                cloud_cfg,
                 move |p| {
                     let w = w_progress.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -2199,6 +2283,43 @@ fn rename_in_pane(
             }
             return;
         }
+        // 云存储对象：走协议重命名（WebDAV MOVE / FTP RNFR+RNTO / rclone moveto）。
+        // 网络同步调用不能上 UI 线程：转后台执行，完成后刷新并保持新名选中。
+        if !trimmed.is_empty() && !unchanged && fs::cloud::is_cloud_path(&old_str) {
+            let cfg = c.borrow().config.clone();
+            let parent = fs::cloud::parent_cloud_path(&old_str)
+                .unwrap_or_else(|| old_str.clone());
+            let weak = ui.as_weak();
+            let old_clone = old_str.clone();
+            let new_name = trimmed.to_string();
+            std::thread::spawn(move || {
+                let res = fs::cloud::cloud_move_same(&old_clone, &parent, Some(&new_name), &cfg);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    match res {
+                        Ok(_) => {
+                            let new_path = format!(
+                                "{}/{}",
+                                parent.trim_end_matches('/'),
+                                new_name
+                            );
+                            queue_selection_after_load(
+                                right,
+                                vec![PathBuf::from(new_path)],
+                                false,
+                            );
+                            ui.global::<AppState>().invoke_refresh();
+                        }
+                        Err(e) => {
+                            ui.global::<AppState>()
+                                .set_status_text(format!("重命名失败：{}", e).into());
+                            ui.global::<AppState>().invoke_refresh();
+                        }
+                    }
+                });
+            });
+            ui.invoke_clear_editing();
+            return;
+        }
         if !trimmed.is_empty() && !unchanged {
             match ops::rename(&old, new_name) {
                 Ok(new_path) => {
@@ -2361,12 +2482,8 @@ fn install_drag_in(ui: &MainWindow, core: &Rc<RefCell<AppCore>>, retries_left: u
                 }
                 ui.global::<AppState>()
                     .set_status_text(format!("收到拖入的 {} 项，开始复制…", srcs.len()).into());
-                c_copy.borrow_mut().task_queue.push_back(fs::tasks::Job {
-                    kind: fs::tasks::TaskKind::Copy,
-                    srcs,
-                    dst,
-                });
-                start_next_job(&ui, &c_copy);
+                // 云端/本地拆分入队并启动：拖入 cloud:// 目录即上传
+                enqueue_transfer_jobs(&ui, &c_copy, fs::tasks::TaskKind::Copy, srcs, dst);
             }
         }),
         // 虚拟文件（浏览器拖图等）由 drag_in 直接写入：提示结果并刷新视图
@@ -4128,38 +4245,35 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             } else {
                 fs::tasks::TaskKind::Copy
             };
-            {
-                let mut core = c.borrow_mut();
-                // 剪切=移动：仅本地文件系统任务记录传统路径撤销；设备操作不可经 std::fs 撤销。
-                if is_cut
-                    && !clips
-                        .iter()
-                        .any(|p| fs::devices::is_device_path(&p.to_string_lossy()))
-                    && !fs::devices::is_device_path(&dst.to_string_lossy())
-                {
-                    let pairs: Vec<(PathBuf, PathBuf)> = clips
-                        .iter()
-                        .filter_map(|src| src.file_name().map(|n| (src.clone(), dst.join(n))))
-                        .collect();
-                    core.record_undo(app::UndoAction::Move { pairs });
+            // 剪切=移动：仅纯本地文件系统任务记录传统路径撤销；
+            // 云端目标/云端源/设备项不可经 std::fs 撤销。
+            let dst_cloud = fs::cloud::is_cloud_path(&dst.to_string_lossy());
+            if is_cut && !dst_cloud {
+                let pairs: Vec<(PathBuf, PathBuf)> = clips
+                    .iter()
+                    .filter(|src| {
+                        !fs::devices::is_device_path(&src.to_string_lossy())
+                            && !fs::cloud::is_cloud_path(&src.to_string_lossy())
+                    })
+                    .filter_map(|src| src.file_name().map(|n| (src.clone(), dst.join(n))))
+                    .collect();
+                if !pairs.is_empty() {
+                    c.borrow_mut().record_undo(app::UndoAction::Move { pairs });
                 }
-                core.task_queue.push_back(fs::tasks::Job {
-                    kind,
-                    srcs: clips,
-                    dst,
-                });
-                // 剪切粘贴后清空剪贴板，避免重复移动
-                if is_cut {
+            }
+            // 剪切粘贴后清空剪贴板，避免重复移动
+            if is_cut {
+                {
+                    let mut core = c.borrow_mut();
                     core.clipboard.clear();
                     core.clip_mode = ClipMode::None;
                 }
-            }
-            if is_cut {
                 // 清空系统剪贴板中的文件数据，避免重复移动
                 fs::clipboard::clear_files();
                 ui.global::<AppState>().set_can_paste(false);
             }
-            start_next_job(&ui, &c);
+            // 云端/本地拆分入队并启动（云端项转 CloudCopy/CloudMove）
+            enqueue_transfer_jobs(&ui, &c, kind, clips, dst);
         }
     });
 
@@ -4185,9 +4299,11 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 (srcs, dst)
             };
             // 源为空或目标非可写入目录时忽略。
-            // 便携设备目录（device://）不是真实文件系统路径，is_dir() 为 false，
-            // 但它是合法的写入目标，需单独放行。
-            let dst_ok = dst.is_dir() || fs::devices::is_device_path(&dst.to_string_lossy());
+            // 便携设备目录（device://）与云存储目录（cloud://）不是真实文件
+            // 系统路径，is_dir() 为 false，但都是合法写入目标，需单独放行。
+            let dst_ok = dst.is_dir()
+                || fs::devices::is_device_path(&dst.to_string_lossy())
+                || fs::cloud::is_cloud_path(&dst.to_string_lossy());
             if srcs.is_empty() || !dst_ok {
                 return;
             }
@@ -4196,10 +4312,8 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             } else {
                 fs::tasks::TaskKind::Copy
             };
-            c.borrow_mut()
-                .task_queue
-                .push_back(fs::tasks::Job { kind, srcs, dst });
-            start_next_job(&ui, &c);
+            // 云端/本地拆分入队并启动
+            enqueue_transfer_jobs(&ui, &c, kind, srcs, dst);
         }
     });
 
@@ -4308,50 +4422,56 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 .filter(|p| fs::devices::is_device_path(&p.to_string_lossy()))
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
-            let device_msg = if device_paths.is_empty() {
-                None
-            } else {
-                Some(match fs::devices::delete(&device_paths) {
-                    Ok(()) => format!("已从设备删除 {} 个项目", device_paths.len()),
-                    Err(e) => format!("设备删除失败：{}", e),
-                })
-            };
+            // 设备删除（WPD COM 调用）与云删除（网络请求，单项最长 15s）
+            // 都是同步阻塞调用，绝不能在 UI 线程执行——否则操作慢服务器时
+            // 整个界面卡死。分组后交后台线程，完成回调回事件循环刷新。
             let cloud_paths: Vec<String> = paths
                 .iter()
                 .filter(|p| p.to_string_lossy().starts_with("cloud://"))
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
-            let cloud_msg = if cloud_paths.is_empty() {
-                None
-            } else {
+            if !device_paths.is_empty() || !cloud_paths.is_empty() {
                 let cfg = c.borrow().config.clone();
-                let mut ok = 0;
-                let mut err = String::new();
-                for cp in &cloud_paths {
-                    match fs::cloud::delete_cloud(cp, &cfg) {
-                        Ok(()) => ok += 1,
-                        Err(e) => err = e,
+                ui.global::<AppState>()
+                    .set_status_text("正在删除云存储/设备项目…".into());
+                let weak = ui.as_weak();
+                std::thread::spawn(move || {
+                    let mut msgs: Vec<String> = Vec::new();
+                    if !device_paths.is_empty() {
+                        msgs.push(match fs::devices::delete(&device_paths) {
+                            Ok(()) => format!("已从设备删除 {} 个项目", device_paths.len()),
+                            Err(e) => format!("设备删除失败：{}", e),
+                        });
                     }
-                }
-                Some(if err.is_empty() {
-                    format!("已从云存储删除 {} 个项目", ok)
-                } else {
-                    format!("云存储删除失败：{}", err)
-                })
-            };
+                    if !cloud_paths.is_empty() {
+                        let mut ok = 0;
+                        let mut err = String::new();
+                        for cp in &cloud_paths {
+                            match fs::cloud::delete_cloud(cp, &cfg) {
+                                Ok(()) => ok += 1,
+                                Err(e) => err = e,
+                            }
+                        }
+                        msgs.push(if err.is_empty() {
+                            format!("已从云存储删除 {} 个项目", ok)
+                        } else {
+                            format!("云存储删除失败：{}", err)
+                        });
+                    }
+                    let text = msgs.join("；");
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        ui.global::<AppState>().set_status_text(text.into());
+                        // 云端目录与设备内容已变化：刷新活动面板 + 侧栏/此电脑
+                        ui.global::<AppState>().invoke_refresh();
+                        ui.global::<AppState>().invoke_devices_changed();
+                    });
+                });
+            }
             let paths: Vec<PathBuf> = paths
                 .into_iter()
                 .filter(|p| !fs::devices::is_device_path(&p.to_string_lossy()) && !p.to_string_lossy().starts_with("cloud://"))
                 .collect();
             if paths.is_empty() {
-                let mut msgs: Vec<String> = Vec::new();
-                if let Some(m) = device_msg { msgs.push(m); }
-                if let Some(m) = cloud_msg { msgs.push(m); }
-                if !msgs.is_empty() {
-                    reload_active_pane(&ui, &c);
-                    schedule_pane_reloads(&ui, &c, &[600, 2000]);
-                    ui.global::<AppState>().set_status_text(msgs.join("；").into());
-                }
                 return;
             }
             // 记录撤销 + 索引移除（入队时即记，删除在后台执行）
@@ -4369,12 +4489,6 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
                 srcs: paths,
                 dst: PathBuf::new(),
             });
-            let mut msgs: Vec<String> = Vec::new();
-            if let Some(m) = device_msg { msgs.push(m); }
-            if let Some(m) = cloud_msg { msgs.push(m); }
-            if !msgs.is_empty() {
-                ui.global::<AppState>().set_status_text(msgs.join("；").into());
-            }
             start_next_job(&ui, &c);
         }
     });
@@ -4408,18 +4522,29 @@ fn bind_operations(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             if fs::cloud::is_cloud_path(&dst_str) {
                 let name = "新建文件夹".to_string();
                 let cfg = c.borrow().config.clone();
-                match fs::cloud::create_dir(&dst_str, &name, &cfg) {
-                    Ok(path) => {
-                        ui.global::<AppState>().set_status_text("已在云存储新建文件夹".into());
-                        queue_selection_after_load(right, vec![PathBuf::from(path)], true);
-                        reload_active_pane(&ui, &c);
-                        return;
-                    }
-                    Err(e) => {
-                        ui.global::<AppState>().set_status_text(format!("云存储新建失败：{}", e).into());
-                    }
-                }
-                reload_active_pane(&ui, &c);
+                // MKCOL 是网络同步调用（慢服务器单项可达 15s），转后台执行，
+                // 完成后回事件循环刷新目录并提示
+                ui.global::<AppState>()
+                    .set_status_text("正在云存储新建文件夹…".into());
+                let weak = ui.as_weak();
+                std::thread::spawn(move || {
+                    let res = fs::cloud::create_dir(&dst_str, &name, &cfg);
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        match res {
+                            Ok(path) => {
+                                ui.global::<AppState>()
+                                    .set_status_text("已在云存储新建文件夹".into());
+                                queue_selection_after_load(right, vec![PathBuf::from(path)], true);
+                                ui.global::<AppState>().invoke_refresh();
+                            }
+                            Err(e) => {
+                                ui.global::<AppState>()
+                                    .set_status_text(format!("云存储新建失败：{}", e).into());
+                                ui.global::<AppState>().invoke_refresh();
+                            }
+                        }
+                    });
+                });
                 return;
             }
             if fs::devices::is_device_path(&dst_str) {
@@ -5194,20 +5319,22 @@ fn bind_context_menu_ext(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
             }
             {
                 let mut core = c.borrow_mut();
-                if !fs::devices::is_device_path(&dst.to_string_lossy()) {
+                let dst_cloud = fs::cloud::is_cloud_path(&dst.to_string_lossy());
+                if !fs::devices::is_device_path(&dst.to_string_lossy())
+                    && !dst_cloud
+                    && !srcs
+                        .iter()
+                        .any(|s| fs::cloud::is_cloud_path(&s.to_string_lossy()))
+                {
                     let pairs: Vec<(PathBuf, PathBuf)> = srcs
                         .iter()
                         .filter_map(|s| s.file_name().map(|n| (s.clone(), dst.join(n))))
                         .collect();
                     core.record_undo(app::UndoAction::Move { pairs });
                 }
-                core.task_queue.push_back(fs::tasks::Job {
-                    kind: fs::tasks::TaskKind::Move,
-                    srcs,
-                    dst,
-                });
             }
-            start_next_job(&ui, &c);
+            // 云端/本地拆分入队并启动
+            enqueue_transfer_jobs(&ui, &c, fs::tasks::TaskKind::Move, srcs, dst);
         }
     });
 
@@ -7887,6 +8014,7 @@ fn restore_window_geometry(
     if applied {
         if maximized {
             ui.set_window_maximized(true);
+            ui.global::<Theme>().set_window_maximized(true);
         }
         // 恢复几何（尺寸/位置/最大化）都会触发 WM_NCCALCSIZE / FRAMECHANGED，
         // DWM 借此重算非客户区并丢弃边框延伸与亚克力策略。本函数的重试可能落在
@@ -7967,6 +8095,42 @@ fn schedule_window_effects(ui: &MainWindow, delays_ms: &[u64]) {
     }
 }
 
+thread_local! {
+    /// 最大化状态兜底监视定时器：必须常驻，drop 后监视即停止。
+    static MAXIMIZED_TIMER: std::cell::RefCell<Option<slint::Timer>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 兜底同步窗口最大化状态。自绘标题栏的最大化按钮会主动同步，但 Aero Snap、
+/// 双击标题栏、Win+↑ 等入口由系统直接最大化，不经过 `toggle-maximize` 回调；
+/// 若不同步，Slint 层会继续按半透明绘制，而最大化后的 FRAMECHANGED 已清掉 DWM
+/// 边框延伸，透明像素无处合成 → 整窗发黑。这里以 500ms 周期比对实际状态，仅在
+/// 变化时补同步并补刷窗口效果（不会周期性重设，避免自身造成闪烁）。
+#[cfg(windows)]
+fn watch_maximized_state(ui: &MainWindow) {
+    let last = Rc::new(std::cell::Cell::new(ui.window().is_maximized()));
+    let weak = ui.as_weak();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(500),
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let now = ui.window().is_maximized();
+            if now == last.get() {
+                return;
+            }
+            last.set(now);
+            ui.set_window_maximized(now);
+            ui.global::<Theme>().set_window_maximized(now);
+            schedule_window_effects(&ui, &[120, 400]);
+        },
+    );
+    MAXIMIZED_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
+}
+
 fn bind_window_chrome(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     // 最小化
     let w = ui.as_weak();
@@ -7981,11 +8145,17 @@ fn bind_window_chrome(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
     ui.on_toggle_maximize(move || {
         if let Some(ui) = w.upgrade() {
             let next = !ui.window().is_maximized();
-            ui.window().set_maximized(next);
+            // 先翻转「已最大化」状态再改窗口：Slint 层据此把根底色调成不透明，
+            // 避免 DWM 重算非客户区的那一帧里透出黑底。
             ui.set_window_maximized(next);
+            ui.global::<Theme>().set_window_maximized(next);
+            ui.window().set_maximized(next);
             // 最大化/还原会触发 FRAMECHANGED，DWM 可能重置非客户区与亚克力策略。
+            // 80ms 落在最大化动画途中，DWM 在动画结束后还会再发一次 FRAMECHANGED，
+            // 那次会把刚设好的边框延伸清掉，只剩半透明底色 → 整屏发黑。故推迟到
+            // 动画结束后补刷，并多补一轮兜底。
             #[cfg(windows)]
-            schedule_window_effects(&ui, &[80]);
+            schedule_window_effects(&ui, &[120, 400]);
         }
     });
 
@@ -8031,6 +8201,11 @@ fn bind_window_chrome(ui: &MainWindow, core: &Rc<RefCell<AppCore>>) {
         set_window_icon(ui);
         schedule_native_window_icon(ui, 20);
         schedule_window_effects(ui, &[60, 250, 800]);
+        watch_maximized_state(ui);
+        // 内存守护：空闲/最小化/超阈值时自动清缓存并收缩工作集。
+        // winit 窗口延迟创建，HWND 须按延迟在 UI 线程重试补获。
+        memguard::start(&ui);
+        memguard::capture_hwnd_with_retry(&ui, &[300, 1000, 3000]);
     }
 }
 
@@ -8049,6 +8224,10 @@ fn apply_acrylic_backdrop(ui: &MainWindow, translucent: bool) {
     const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
     const DWMSBT_NONE: i32 = 1;
 
+    // 最大化时不延伸边框（见下方 inset 说明）。在进入 winit 窗口借用之前取值，
+    // 避免在 with_winit_window 闭包内再次借用窗口状态造成重入。
+    let maximized = ui.global::<Theme>().get_window_maximized();
+
     ui.window().with_winit_window(|winit_window| {
         let Ok(handle) = winit_window.window_handle() else {
             return;
@@ -8060,7 +8239,11 @@ fn apply_acrylic_backdrop(ui: &MainWindow, translucent: bool) {
                 // 延伸到整个客户区（"sheet of glass"），DWM 才会在客户区透明像素后方
                 // 合成 SetWindowCompositionAttribute 绘制的亚克力磨砂；关闭时归零，
                 // 恢复纯色窗口。
-                let inset: i32 = if translucent { -1 } else { 0 };
+                //
+                // 最大化时不延伸：此时 Slint 层已强制不透明，客户区没有透明像素需要
+                // 垫底；而对最大化窗口做边框延伸会让 DWM 重算整屏玻璃区域，表现为
+                // 整窗发黑并周期闪烁（自绘的关闭按钮被黑色盖住，看起来「关不掉」）。
+                let inset: i32 = if translucent && !maximized { -1 } else { 0 };
                 let margins = MARGINS {
                     cxLeftWidth: inset,
                     cxRightWidth: inset,
@@ -8159,6 +8342,9 @@ fn apply_acrylic_blur_behind(ui: &MainWindow, translucent: bool, blur_level: f32
     }
 
     let theme = ui.global::<Theme>();
+    // 最大化时根层已不透明，磨砂不可能透出；且对最大化窗口应用亚克力会让 DWM
+    // 反复重算整屏合成（黑屏闪烁的来源之一），直接按关闭处理。
+    let maximized = theme.get_window_maximized();
     // 中性、偏暗灰调的 tint：刻意避开接近纯白/纯黑的取值，alpha 升高时混合结果
     // 趋向"雾蒙蒙的灰玻璃"而不是"刷白漆/刷黑漆"。
     let (r, g, b): (u32, u32, u32) = if theme.get_dark() {
@@ -8172,7 +8358,7 @@ fn apply_acrylic_blur_behind(ui: &MainWindow, translucent: bool, blur_level: f32
     // 留足透光度，避免糊成一面实色墙。
     const TIER_ALPHA: [u32; 6] = [0, 34, 62, 90, 118, 148];
 
-    let (state, alpha) = if !translucent {
+    let (state, alpha) = if !translucent || maximized {
         (ACCENT_DISABLED, 0u32)
     } else {
         let tier = ((blur_level / 6.0).round() as i32).clamp(0, 5) as usize;

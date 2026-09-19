@@ -1,7 +1,7 @@
 # FileFiles One - Rust + Slint 现代文件管理器
 [package]
 name = "filefiles-one"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 description = "现代化桌面文件管理器，Rust + Slint 实现"
 build = "build.rs"
@@ -74,8 +74,9 @@ base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 # Windows 磁盘剩余空间查询、驱动器类型、DWM 窗口圆角；
-# SystemInformation：GetTickCount 用于更新检查的用户空闲检测
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Globalization", "Win32_System_SystemInformation"] }
+# SystemInformation：GetTickCount 用于更新检查的用户空闲检测；
+# ProcessStatus：GetProcessMemoryInfo 供内存守护读取工作集/提交内存
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Globalization", "Win32_System_SystemInformation"] }
 # 高层 COM 封装：调用 IShellItemImageFactory::GetImage 提取系统图标 / 图片缩略图 / 视频首帧；
 # 以及 Shell IContextMenu + TrackPopupMenuEx 弹出原生右键菜单（含第三方注册项）；
 # Ole/SystemServices/Memory：#[implement]（windows-core 默认提供）实现 IDropSource/

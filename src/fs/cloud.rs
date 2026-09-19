@@ -4,11 +4,12 @@
 //! 列表通过对应协议客户端实时拉取，失败时返回错误提示条目而非崩溃。
 
 use super::metadata::{classify, Entry};
+use super::tasks::TaskControl;
 use crate::config::{AppConfig, NetworkLocation};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 是否为云存储虚拟路径
 pub fn is_cloud_path(path: &str) -> bool {
@@ -87,11 +88,57 @@ pub fn is_webdav_mounted(loc: &NetworkLocation) -> bool {
     if super::rclone::is_mounted_name(&loc.name).is_some() {
         return true;
     }
-    loc.drive
-        .as_deref()
-        .and_then(|d| d.trim_end_matches(':').chars().next())
-        .map(super::rclone::drive_in_use)
-        .unwrap_or(false)
+    // 盘符信号：记录盘符（上次成功挂载的回写值）或设定盘符（挂载设置的必填项）
+    // 任一在系统里真实存在即算已挂载。只看记录盘符会在回写丢失时误判为未挂载，
+    // 使同一账户在设置页显示「已挂载」而「此电脑」里却多出一个 WebDAV 位置条目。
+    [loc.drive.as_deref(), loc.mount_drive.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.trim_end_matches(':').chars().next())
+        .any(super::rclone::drive_in_use)
+}
+
+/// 用真实盘符校正 WebDAV 挂载记录，返回是否发生改动。
+///
+/// 挂载状态有三个来源：进程内挂载表、配置里的记录盘符、系统真实盘符。崩溃或
+/// 回写回调未执行会让配置与实际分叉，表现为设置页显示「已挂载」而「此电脑」
+/// 按未挂载渲染出 WebDAV 位置条目。此处以内存表与系统盘符为准回写配置：
+/// 盘符真实存在则补记，已消失则清空（保留 mount_drive 设定，便于下次重挂）。
+pub fn reconcile_webdav_mount_state(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+    for loc in config
+        .network_locations
+        .iter_mut()
+        .filter(|l| l.kind == "webdav")
+    {
+        // 内存表是权威值：本进程挂载成功即写入，实时反映真实盘符。
+        // 表外（重启后收养前）退化为探测记录盘符与设定盘符是否真实存在。
+        let live = super::rclone::is_mounted_name(&loc.name).or_else(|| {
+            [loc.drive.as_deref(), loc.mount_drive.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|d| {
+                    let letter = d.trim_end_matches(':').chars().next()?;
+                    super::rclone::drive_in_use(letter)
+                        .then(|| format!("{}:", letter.to_ascii_uppercase()))
+                })
+        });
+        match live {
+            Some(drive) => {
+                if loc.drive.as_deref() != Some(drive.as_str()) {
+                    loc.drive = Some(drive);
+                    changed = true;
+                }
+            }
+            None => {
+                if loc.drive.is_some() {
+                    loc.drive = None;
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// 在 This PC 与 network:// 中展示的云存储条目
@@ -697,9 +744,17 @@ fn parse_ftp_line(line: &str) -> Option<(String, bool, u64, i64)> {
 // ---------------- WebDAV ----------------
 
 /// 全进程复用连接池；各请求自行设置超时，避免每次进目录重复 TLS 握手。
+/// 连接级超时在 agent 上统一兜底：连接 10s、单次 socket 读/写 60s——
+/// 大文件 PUT/GET 不设整体超时（会掐断长传输），挂起由读写超时发现。
 fn webdav_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(60))
+            .timeout_write(Duration::from_secs(60))
+            .build()
+    })
 }
 
 /// 构造 WebDAV 完整 URL（主机栏误填完整 URL 时自动清洗合并）
@@ -1151,20 +1206,1015 @@ fn webdav_delete(loc: &NetworkLocation, sub: &str) -> Result<(), String> {
     let url = webdav_url(loc, sub)?;
     let (host, port, _) = split_host_port_base(loc)?;
     let use_tls = webdav_use_tls(loc);
-    let mut req = webdav_agent()
-        .request("DELETE", &url)
-        .timeout(Duration::from_secs(15))
-        .set("User-Agent", "FileFiles-One/WebDAV");
-    if !loc.username.is_empty() {
-        let cred = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{}:{}", loc.username, loc.password));
-        req = req.set("Authorization", &format!("Basic {}", cred));
+    let send_delete = |target: &str| -> Result<u16, String> {
+        let mut req = webdav_agent()
+            .request("DELETE", target)
+            .timeout(Duration::from_secs(15))
+            .set("User-Agent", "FileFiles-One/WebDAV");
+        if !loc.username.is_empty() {
+            let cred = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("{}:{}", loc.username, loc.password));
+            req = req.set("Authorization", &format!("Basic {}", cred));
+        }
+        let resp = req.call().map_err(|e| map_webdav_err(e, &host, port, use_tls))?;
+        Ok(resp.status())
+    };
+    let status = send_delete(&url)?;
+    // 部分服务器（坚果云）对集合 DELETE 无斜杠时返回 403：按集合形式重试
+    let status = if status >= 400 && !url.ends_with('/') {
+        send_delete(&format!("{}/", url))?
+    } else {
+        status
+    };
+    if status >= 400 {
+        return Err(format!("删除失败（DELETE {}）", status));
     }
-    let resp = req.call().map_err(|e| map_webdav_err(e, &host, port, use_tls))?;
-    if resp.status() >= 400 { return Err(format!("删除失败（DELETE {}）", resp.status())); }
     Ok(())
 }
 fn sftp_delete(_loc: &NetworkLocation, _sub: &str) -> Result<(), String> {
     Err("SFTP 删除暂不支持（rclone 列表为只读浏览），请用其它 SFTP 客户端删除".into())
+}
+
+// ──────────── 云端写入操作（上传 / 下载 / 复制 / 移动 / 建目录）────────────
+//
+// 所有函数均为同步阻塞实现，必须由任务系统在后台线程调用；粘贴/移动/复制
+// 到 cloud:// 的任务在 fs::tasks 的云端任务运行器中逐项调到这里。
+// 进度回调 progress(已传字节, 总字节) 内部按 100ms 节流；ctrl 取消时返回
+// Err(已取消)，任务层以 TaskControl::is_cancelled 区分「取消」与「失败」。
+//
+// 冲突策略：上传/下载/服务端复制一律覆盖同名（与资源管理器「覆盖」语义
+// 一致）；WebDAV COPY/MOVE 显式 Overwrite: T，PUT 天然覆盖，FTP STOR 覆盖。
+//
+// SFTP 无流式进度（rclone 子命令不回传字节），进度按整文件粒度上报。
+
+/// 进度回调：参数为 (已传输字节, 总字节)，总字节未知时为 0
+pub type CloudProgress<'a> = &'a mut (dyn FnMut(u64, u64) + 'a);
+
+/// 取消哨兵错误文案：任务层以 TaskControl::is_cancelled 判定
+pub const CLOUD_CANCELLED: &str = "已取消";
+
+/// 该云账号是否允许写入。WebDAV 与其虚拟磁盘共用「只读挂载」开关：
+/// 账号勾选只读后，原生浏览（cloud://）与虚拟磁盘口径一致，均禁止写入。
+/// FTP / SFTP 默认可写（服务端权限不足时由具体操作返回 5xx/权限错误）。
+pub fn cloud_writable(loc: &NetworkLocation) -> bool {
+    !(loc.kind == "webdav" && loc.mount_readonly)
+}
+
+/// 按完整 cloud:// 路径解析账号配置（kind+name 定位）
+fn account_of(cloud_path: &str, config: &AppConfig) -> Result<NetworkLocation, String> {
+    let (kind, name, _) = parse_cloud_path(cloud_path).ok_or("不是云存储路径")?;
+    config
+        .network_locations
+        .iter()
+        .find(|l| l.kind == kind && l.name == name)
+        .cloned()
+        .ok_or_else(|| "未找到云存储账号".to_string())
+}
+
+/// FTP 登录公共段：连接 + 匿名/凭据登录
+fn ftp_login(loc: &NetworkLocation) -> Result<FtpConn, String> {
+    let mut ftp = connect_ftp(loc)?;
+    let user = if loc.username.is_empty() {
+        "anonymous".to_string()
+    } else {
+        loc.username.clone()
+    };
+    ftp.login(&user, &loc.password)?;
+    Ok(ftp)
+}
+
+/// 上传进度节流状态
+struct UploadState {
+    sent: u64,
+    last_emit: Instant,
+}
+
+impl UploadState {
+    fn new() -> Self {
+        Self {
+            sent: 0,
+            last_emit: Instant::now() - Duration::from_secs(1),
+        }
+    }
+    fn tick(&mut self, delta: u64, total: u64, progress: &mut (dyn FnMut(u64, u64) + '_)) {
+        self.sent += delta;
+        let now = Instant::now();
+        if now.duration_since(self.last_emit) >= Duration::from_millis(100) {
+            self.last_emit = now;
+            (progress)(self.sent, total);
+        }
+    }
+    fn finish(&mut self, total: u64, progress: &mut (dyn FnMut(u64, u64) + '_)) {
+        (progress)(self.sent, if total > 0 { total } else { self.sent });
+    }
+}
+
+/// 包装本地文件读取：逐块响应暂停/取消并累计进度（WebDAV PUT 上传用）。
+struct CloudUpReader<'a> {
+    inner: std::fs::File,
+    ctrl: &'a TaskControl,
+    total: u64,
+    state: &'a mut UploadState,
+    progress: CloudProgress<'a>,
+}
+
+impl std::io::Read for CloudUpReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.ctrl.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                CLOUD_CANCELLED,
+            ));
+        }
+        self.ctrl.wait_if_paused();
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.state
+                .tick(n as u64, self.total, &mut *self.progress);
+        }
+        Ok(n)
+    }
+}
+
+/// 上传本地文件到云端目录 `dst_dir`（cloud:// 目录路径），同名覆盖。
+pub fn upload_to_cloud(
+    local: &Path,
+    dst_dir: &str,
+    config: &AppConfig,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    let loc = account_of(dst_dir, config)?;
+    if !cloud_writable(&loc) {
+        return Err("该账号设置为只读，不允许写入云端".into());
+    }
+    let (_, _, sub) = parse_cloud_path(dst_dir).ok_or("不是云存储路径")?;
+    let fname = local
+        .file_name()
+        .ok_or("本地路径缺少文件名")?
+        .to_string_lossy()
+        .to_string();
+    let target_sub = join_remote(&sub, &fname);
+    match loc.kind.as_str() {
+        "webdav" => webdav_upload_file(&loc, &target_sub, local, ctrl, progress),
+        "ftp" => ftp_upload_file(&loc, &target_sub, local, ctrl, progress),
+        "sftp" => {
+            let total = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
+            (progress)(0, total);
+            let r = super::rclone::run_sftp_command(
+                &loc,
+                &[
+                    "copyto",
+                    &local.to_string_lossy(),
+                    &super::rclone::sftp_remote(&loc, &target_sub),
+                    "--log-level",
+                    "ERROR",
+                    "--no-console",
+                ],
+                1800,
+                "SFTP 上传",
+            );
+            if r.is_ok() {
+                (progress)(total, total);
+            }
+            r.map(|_| ())
+        }
+        _ => Err("未知云存储类型".into()),
+    }
+}
+
+/// 下载云端文件 `src`（cloud:// 文件路径）到本地目录 `dst_dir`，同名覆盖。
+pub fn download_from_cloud(
+    src: &str,
+    dst_dir: &Path,
+    config: &AppConfig,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    let loc = account_of(src, config)?;
+    let (_, _, sub) = parse_cloud_path(src).ok_or("不是云存储路径")?;
+    let fname = sub
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if fname.is_empty() {
+        return Err("云端路径缺少文件名".into());
+    }
+    let local = dst_dir.join(&fname);
+    match loc.kind.as_str() {
+        "webdav" => webdav_download_file(&loc, &sub, &local, ctrl, progress),
+        "ftp" => ftp_download_file(&loc, &sub, &local, ctrl, progress),
+        "sftp" => {
+            // 总大小需另一次 lsjson 往返才能拿到，按完成粒度上报
+            (progress)(0, 0);
+            let r = super::rclone::run_sftp_command(
+                &loc,
+                &[
+                    "copyto",
+                    &super::rclone::sftp_remote(&loc, &sub),
+                    &local.to_string_lossy(),
+                    "--log-level",
+                    "ERROR",
+                    "--no-console",
+                ],
+                1800,
+                "SFTP 下载",
+            );
+            if r.is_ok() {
+                let sz = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+                (progress)(sz, sz);
+            }
+            r.map(|_| ())
+        }
+        _ => Err("未知云存储类型".into()),
+    }
+}
+
+/// 同账号云端复制：WebDAV 走服务端 COPY；SFTP 走 rclone copyto；
+/// FTP 无服务端复制语义，经本地临时文件中转（下载→上传）。
+pub fn cloud_copy_same(
+    src: &str,
+    dst_dir: &str,
+    config: &AppConfig,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    let src_loc = account_of(src, config)?;
+    let dst_loc = account_of(dst_dir, config)?;
+    if !cloud_writable(&dst_loc) {
+        return Err("目标账号设置为只读，不允许写入云端".into());
+    }
+    let (_, _, src_sub) = parse_cloud_path(src).ok_or("不是云存储路径")?;
+    let (_, _, dst_sub) = parse_cloud_path(dst_dir).ok_or("不是云存储路径")?;
+    let fname = src_sub
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if fname.is_empty() {
+        return Err("云端路径缺少文件名".into());
+    }
+    let target_sub = join_remote(&dst_sub, &fname);
+    match (src_loc.kind.as_str(), dst_loc.kind.as_str()) {
+        ("webdav", "webdav") if src_loc.name == dst_loc.name => {
+            webdav_copy_move(&src_loc, &src_sub, &target_sub, false)
+        }
+        ("sftp", "sftp") if src_loc.name == dst_loc.name => super::rclone::run_sftp_command(
+            &src_loc,
+            &[
+                "copyto",
+                &super::rclone::sftp_remote(&src_loc, &src_sub),
+                &super::rclone::sftp_remote(&dst_loc, &target_sub),
+                "--log-level",
+                "ERROR",
+                "--no-console",
+            ],
+            1800,
+            "SFTP 复制",
+        )
+        .map(|_| ()),
+        // 同一 FTP 账号：无服务端复制，目录递归 + 文件临时中转
+        ("ftp", "ftp") if src_loc.name == dst_loc.name => {
+            // 目录判定：CWD 成功即目录
+            let mut ftp = ftp_login(&src_loc)?;
+            let remote = join_remote(&remote_base(&src_loc), &src_sub);
+            let is_dir = ftp.cwd(&remote).is_ok();
+            let _ = ftp.quit();
+            if is_dir {
+                ftp_copy_tree(&src_loc, &src_sub, &target_sub, ctrl, progress)
+            } else {
+                ftp_copy_via_local(&src_loc, &src_sub, &target_sub, ctrl, progress)
+            }
+        }
+        _ => Err("跨账号复制暂不支持服务端直传".into()),
+    }
+}
+
+/// FTP 目录复制：逐级建目录 + 子项复制（文件走本地临时中转）。
+fn ftp_copy_tree(
+    loc: &NetworkLocation,
+    src_sub: &str,
+    dst_sub: &str,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    // 目标建目录（已存在容忍）
+    {
+        let mut ftp = ftp_login(loc)?;
+        let dst_remote = join_remote(&remote_base(loc), dst_sub);
+        let r: Result<(), String> = match ftp.mkdir(&dst_remote) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let ok = ftp.cwd(&dst_remote).is_ok();
+                if ok {
+                    Ok(())
+                } else {
+                    Err("FTP 新建文件夹失败".into())
+                }
+            }
+        };
+        let _ = ftp.quit();
+        r?;
+    }
+    let children = list_ftp(loc, src_sub)?;
+    for c in children {
+        if ctrl.is_cancelled() {
+            return Err(CLOUD_CANCELLED.to_string());
+        }
+        let (_, _, child_sub) = parse_cloud_path(&c.path).ok_or("不是云存储路径")?;
+        let child_dst = join_remote(dst_sub, &c.name);
+        if c.is_dir {
+            ftp_copy_tree(loc, &child_sub, &child_dst, ctrl, progress)?;
+        } else {
+            ftp_copy_via_local(loc, &child_sub, &child_dst, ctrl, progress)?;
+        }
+    }
+    Ok(())
+}
+
+/// 同账号云端移动/重命名：WebDAV MOVE；FTP RNFR+RNTO（支持跨目录）；
+/// SFTP rclone moveto。`new_name` 为 Some 时即重命名语义。
+pub fn cloud_move_same(
+    src: &str,
+    dst_dir: &str,
+    new_name: Option<&str>,
+    config: &AppConfig,
+) -> Result<(), String> {
+    let src_loc = account_of(src, config)?;
+    let dst_loc = account_of(dst_dir, config)?;
+    if !cloud_writable(&dst_loc) {
+        return Err("目标账号设置为只读，不允许写入云端".into());
+    }
+    let (_, _, src_sub) = parse_cloud_path(src).ok_or("不是云存储路径")?;
+    let (_, _, dst_sub) = parse_cloud_path(dst_dir).ok_or("不是云存储路径")?;
+    let src_name = src_sub
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if src_name.is_empty() {
+        return Err("云端路径缺少文件名".into());
+    }
+    let target_sub = join_remote(&dst_sub, new_name.unwrap_or(&src_name));
+    match (src_loc.kind.as_str(), dst_loc.kind.as_str()) {
+        ("webdav", "webdav") if src_loc.name == dst_loc.name => {
+            webdav_copy_move(&src_loc, &src_sub, &target_sub, true)
+        }
+        ("sftp", "sftp") if src_loc.name == dst_loc.name => super::rclone::run_sftp_command(
+            &src_loc,
+            &[
+                "moveto",
+                &super::rclone::sftp_remote(&src_loc, &src_sub),
+                &super::rclone::sftp_remote(&dst_loc, &target_sub),
+                "--log-level",
+                "ERROR",
+                "--no-console",
+            ],
+            1800,
+            "SFTP 移动",
+        )
+        .map(|_| ()),
+        ("ftp", "ftp") if src_loc.name == dst_loc.name => {
+            let mut ftp = ftp_login(&src_loc)?;
+            let from = join_remote(&remote_base(&src_loc), &src_sub);
+            let to = join_remote(&remote_base(&src_loc), &target_sub);
+            let r = ftp.rename(&from, &to);
+            let _ = ftp.quit();
+            r
+        }
+        _ => Err("跨账号移动暂不支持服务端直传".into()),
+    }
+}
+
+/// 按完整 cloud:// 目录路径创建目录（账号根目录天然存在，直接成功）。
+/// 目录已存在视为成功（WebDAV 405 / FTP 550-exists / rclone mkdir 幂等）。
+pub fn cloud_mkdir_full(cloud_dir: &str, config: &AppConfig) -> Result<(), String> {
+    let loc = account_of(cloud_dir, config)?;
+    if !cloud_writable(&loc) {
+        return Err("该账号设置为只读，不允许写入云端".into());
+    }
+    let (_, _, sub) = parse_cloud_path(cloud_dir).ok_or("不是云存储路径")?;
+    if sub.trim_matches('/').is_empty() {
+        return Ok(());
+    }
+    match loc.kind.as_str() {
+        "webdav" => {
+            let url = webdav_url(&loc, &sub)?;
+            let (host, port, _) = split_host_port_base(&loc)?;
+            let use_tls = webdav_use_tls(&loc);
+            let mut req = webdav_agent()
+                .request("MKCOL", &url)
+                .timeout(Duration::from_secs(15))
+                .set("User-Agent", "FileFiles-One/WebDAV");
+            if !loc.username.is_empty() {
+                let cred = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    format!("{}:{}", loc.username, loc.password),
+                );
+                req = req.set("Authorization", &format!("Basic {}", cred));
+            }
+            let resp = req
+                .call()
+                .map_err(|e| map_webdav_err(e, &host, port, use_tls))?;
+            // 405 = 集合已存在（MKCOL 对已存在资源返回 405 Method Not Allowed）
+            if resp.status() >= 400 && resp.status() != 405 {
+                return Err(format!("新建云端文件夹失败（MKCOL {}）", resp.status()));
+            }
+            Ok(())
+        }
+        "ftp" => {
+            let mut ftp = ftp_login(&loc)?;
+            let remote = join_remote(&remote_base(&loc), &sub);
+            match ftp.mkdir(&remote) {
+                Ok(()) => {
+                    let _ = ftp.quit();
+                    Ok(())
+                }
+                Err(_) => {
+                    // 已存在时 MKD 报 550：尝试进入验证
+                    let ok = ftp.cwd(&remote).is_ok();
+                    let _ = ftp.quit();
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err("FTP 新建文件夹失败".into())
+                    }
+                }
+            }
+        }
+        "sftp" => super::rclone::run_sftp_command(
+            &loc,
+            &[
+                "mkdir",
+                &super::rclone::sftp_remote(&loc, &sub),
+                "--log-level",
+                "ERROR",
+                "--no-console",
+            ],
+            60,
+            "SFTP 新建文件夹",
+        )
+        .map(|_| ()),
+        _ => Err("未知云存储类型".into()),
+    }
+}
+
+// ── WebDAV 传输原语 ──
+
+/// WebDAV PUT 上传（带 Content-Length，避免服务器拒绝 chunked PUT）。
+fn webdav_upload_file(
+    loc: &NetworkLocation,
+    sub: &str,
+    local: &Path,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    let url = webdav_url(loc, sub)?;
+    let (host, port, _) = split_host_port_base(loc)?;
+    let use_tls = webdav_use_tls(loc);
+    let size = std::fs::metadata(local)
+        .map_err(|e| format!("读取本地文件失败：{}", e))?
+        .len();
+    let file = std::fs::File::open(local).map_err(|e| format!("打开本地文件失败：{}", e))?;
+    let mut state = UploadState::new();
+    (progress)(0, size);
+    let mut req = webdav_agent()
+        .put(&url)
+        // 大文件上传不能设整体超时；连接超时由 agent 级 timeout_connect 兜底
+        .set("Content-Length", &size.to_string())
+        .set("User-Agent", "FileFiles-One/WebDAV");
+    if !loc.username.is_empty() {
+        let cred = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{}:{}", loc.username, loc.password),
+        );
+        req = req.set("Authorization", &format!("Basic {}", cred));
+    }
+    // reborrow：reader 只借用本次调用，send 返回后 progress 仍可上报终值
+    let reader = CloudUpReader {
+        inner: file,
+        ctrl,
+        total: size,
+        state: &mut state,
+        progress: &mut *progress,
+    };
+    let resp = req.send(reader).map_err(|e| {
+        if ctrl.is_cancelled() {
+            CLOUD_CANCELLED.to_string()
+        } else {
+            map_webdav_err(e, &host, port, use_tls)
+        }
+    })?;
+    if resp.status() >= 400 {
+        return Err(format!("上传失败（PUT {}）", resp.status()));
+    }
+    state.finish(size, &mut *progress);
+    Ok(())
+}
+
+/// WebDAV GET 下载（流式分块落盘，逐块响应暂停/取消并上报进度）。
+fn webdav_download_file(
+    loc: &NetworkLocation,
+    sub: &str,
+    local: &Path,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    use std::io::Read;
+    let url = webdav_url(loc, sub)?;
+    let (host, port, _) = split_host_port_base(loc)?;
+    let use_tls = webdav_use_tls(loc);
+    let mut req = webdav_agent()
+        .get(&url)
+        // 大文件下载不设整体超时；单次 socket 读由 agent 级 timeout_read 兜底
+        .set("User-Agent", "FileFiles-One/WebDAV");
+    if !loc.username.is_empty() {
+        let cred = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{}:{}", loc.username, loc.password),
+        );
+        req = req.set("Authorization", &format!("Basic {}", cred));
+    }
+    let resp = req
+        .call()
+        .map_err(|e| map_webdav_err(e, &host, port, use_tls))?;
+    if resp.status() >= 400 {
+        return Err(format!("下载失败（GET {}）", resp.status()));
+    }
+    let total = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let tmp = local.with_extension("part");
+    let mut out =
+        std::fs::File::create(&tmp).map_err(|e| format!("创建本地文件失败：{}", e))?;
+    let mut reader = resp.into_reader();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut done: u64 = 0;
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    loop {
+        if ctrl.is_cancelled() {
+            drop(out);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CLOUD_CANCELLED.to_string());
+        }
+        ctrl.wait_if_paused();
+        let n = reader.read(&mut buf).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("下载中断：{}", e)
+        })?;
+        if n == 0 {
+            break;
+        }
+        use std::io::Write;
+        out.write_all(&buf[..n]).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("写入本地文件失败：{}", e)
+        })?;
+        done += n as u64;
+        let now = Instant::now();
+        if now.duration_since(last_emit) >= Duration::from_millis(100) {
+            last_emit = now;
+            (progress)(done, total);
+        }
+    }
+    drop(out);
+    std::fs::rename(&tmp, local).map_err(|e| format!("落盘失败：{}", e))?;
+    (progress)(done, if total > 0 { total } else { done });
+    Ok(())
+}
+
+/// WebDAV COPY / MOVE（服务端操作，Overwrite: T 覆盖同名目标）。
+fn webdav_copy_move(
+    loc: &NetworkLocation,
+    src_sub: &str,
+    dst_sub: &str,
+    is_move: bool,
+) -> Result<(), String> {
+    let src_url = webdav_url(loc, src_sub)?;
+    let dst_url = webdav_url(loc, dst_sub)?;
+    let (host, port, _) = split_host_port_base(loc)?;
+    let use_tls = webdav_use_tls(loc);
+    let method = if is_move { "MOVE" } else { "COPY" };
+    let mut req = webdav_agent()
+        .request(method, &src_url)
+        .timeout(Duration::from_secs(60))
+        .set("Destination", &dst_url)
+        .set("Overwrite", "T")
+        .set("User-Agent", "FileFiles-One/WebDAV");
+    if !loc.username.is_empty() {
+        let cred = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            format!("{}:{}", loc.username, loc.password),
+        );
+        req = req.set("Authorization", &format!("Basic {}", cred));
+    }
+    let resp = req
+        .call()
+        .map_err(|e| map_webdav_err(e, &host, port, use_tls))?;
+    if resp.status() >= 400 {
+        let op = if is_move { "移动" } else { "复制" };
+        return Err(format!("云端{}失败（{} {}）", op, method, resp.status()));
+    }
+    Ok(())
+}
+
+// ── FTP 传输原语 ──
+
+impl FtpConn {
+    /// 流式上传：把 DataStream（impl Write）交给回调写完再 finalize。
+    /// 写入中途出错时放弃流（连接脏化），由调用方整体失败。
+    fn upload_stream(
+        &mut self,
+        remote: &str,
+        write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        match self {
+            FtpConn::Plain(f) => {
+                let mut ds = f.put_with_stream(remote).map_err(|e| map_ftp_err(&e))?;
+                match write(&mut ds) {
+                    Ok(()) => f.finalize_put_stream(ds).map_err(|e| map_ftp_err(&e)),
+                    Err(e) => {
+                        drop(ds);
+                        Err(e.to_string())
+                    }
+                }
+            }
+            FtpConn::Secure(f) => {
+                let mut ds = f.put_with_stream(remote).map_err(|e| map_ftp_err(&e))?;
+                match write(&mut ds) {
+                    Ok(()) => f.finalize_put_stream(ds).map_err(|e| map_ftp_err(&e)),
+                    Err(e) => {
+                        drop(ds);
+                        Err(e.to_string())
+                    }
+                }
+            }
+        }
+    }
+
+    /// 流式下载：把 DataStream（impl Read）交给回调读完再 finalize。
+    /// 读中途出错时 abort 数据连接（发送 ABOR 复位控制连接状态）。
+    fn download_stream(
+        &mut self,
+        remote: &str,
+        read: impl FnOnce(&mut dyn std::io::Read) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        match self {
+            FtpConn::Plain(f) => {
+                let mut ds = f.retr_as_stream(remote).map_err(|e| map_ftp_err(&e))?;
+                match read(&mut ds) {
+                    Ok(()) => f.finalize_retr_stream(ds).map_err(|e| map_ftp_err(&e)),
+                    Err(e) => {
+                        let _ = f.abort(ds);
+                        Err(e.to_string())
+                    }
+                }
+            }
+            FtpConn::Secure(f) => {
+                let mut ds = f.retr_as_stream(remote).map_err(|e| map_ftp_err(&e))?;
+                match read(&mut ds) {
+                    Ok(()) => f.finalize_retr_stream(ds).map_err(|e| map_ftp_err(&e)),
+                    Err(e) => {
+                        let _ = f.abort(ds);
+                        Err(e.to_string())
+                    }
+                }
+            }
+        }
+    }
+
+    /// 服务端重命名/移动（RNFR + RNTO，支持跨目录，取决于服务器实现）
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+        match self {
+            FtpConn::Plain(f) => f.rename(from, to).map_err(|e| map_ftp_err(&e)),
+            FtpConn::Secure(f) => f.rename(from, to).map_err(|e| map_ftp_err(&e)),
+        }
+    }
+
+    /// 远端文件大小（SIZE 命令，失败返回 0 = 总量未知）
+    fn size(&mut self, remote: &str) -> u64 {
+        match self {
+            FtpConn::Plain(f) => f.size(remote).unwrap_or(0) as u64,
+            FtpConn::Secure(f) => f.size(remote).unwrap_or(0) as u64,
+        }
+    }
+}
+
+fn ftp_upload_file(
+    loc: &NetworkLocation,
+    sub: &str,
+    local: &Path,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let size = std::fs::metadata(local)
+        .map_err(|e| format!("读取本地文件失败：{}", e))?
+        .len();
+    let mut file = std::fs::File::open(local).map_err(|e| format!("打开本地文件失败：{}", e))?;
+    let mut ftp = ftp_login(loc)?;
+    let remote = join_remote(&remote_base(loc), sub);
+    let mut state = UploadState::new();
+    (progress)(0, size);
+    let mut buf = vec![0u8; 64 * 1024];
+    let res = ftp.upload_stream(&remote, |w| {
+        loop {
+            if ctrl.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    CLOUD_CANCELLED,
+                ));
+            }
+            ctrl.wait_if_paused();
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            w.write_all(&buf[..n])?;
+            state.tick(n as u64, size, &mut *progress);
+        }
+        Ok(())
+    });
+    let _ = ftp.quit();
+    res?;
+    state.finish(size, &mut *progress);
+    Ok(())
+}
+
+fn ftp_download_file(
+    loc: &NetworkLocation,
+    sub: &str,
+    local: &Path,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    use std::io::Read;
+    let mut ftp = ftp_login(loc)?;
+    let remote = join_remote(&remote_base(loc), sub);
+    let total = ftp.size(&remote);
+    let tmp = local.with_extension("part");
+    let mut out =
+        std::fs::File::create(&tmp).map_err(|e| format!("创建本地文件失败：{}", e))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut done: u64 = 0;
+    let mut last_emit = Instant::now() - Duration::from_secs(1);
+    let res = ftp.download_stream(&remote, |ds| {
+        loop {
+            if ctrl.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    CLOUD_CANCELLED,
+                ));
+            }
+            ctrl.wait_if_paused();
+            let n = ds.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            use std::io::Write;
+            out.write_all(&buf[..n])?;
+            done += n as u64;
+            let now = Instant::now();
+            if now.duration_since(last_emit) >= Duration::from_millis(100) {
+                last_emit = now;
+                (progress)(done, total);
+            }
+        }
+        Ok(())
+    });
+    let _ = ftp.quit();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        if ctrl.is_cancelled() {
+            return Err(CLOUD_CANCELLED.to_string());
+        }
+        return Err(e);
+    }
+    drop(out);
+    std::fs::rename(&tmp, local).map_err(|e| format!("落盘失败：{}", e))?;
+    (progress)(done, if total > 0 { total } else { done });
+    Ok(())
+}
+
+/// 云端条目元信息（文件/目录判定 + 大小），供任务层决定递归或直传
+pub struct CloudStat {
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// 判定云端路径是文件还是目录并取大小（单次往返）。
+/// 任务层据此展开递归；错误返回 Err（路径不可达）。
+pub fn cloud_stat(path: &str, config: &AppConfig) -> Result<CloudStat, String> {
+    let loc = account_of(path, config)?;
+    let (_, _, sub) = parse_cloud_path(path).ok_or("不是云存储路径")?;
+    if sub.trim_matches('/').is_empty() {
+        return Ok(CloudStat { is_dir: true, size: 0 });
+    }
+    match loc.kind.as_str() {
+        "webdav" => webdav_stat(&loc, &sub),
+        "ftp" => {
+            let mut ftp = ftp_login(&loc)?;
+            let remote = join_remote(&remote_base(&loc), &sub);
+            // 目录判定：CWD 成功即目录；否则 SIZE 取文件大小
+            if ftp.cwd(&remote).is_ok() {
+                let _ = ftp.quit();
+                return Ok(CloudStat { is_dir: true, size: 0 });
+            }
+            let size = ftp.size(&remote);
+            let _ = ftp.quit();
+            Ok(CloudStat { is_dir: false, size })
+        }
+        "sftp" => {
+            let out = super::rclone::run_sftp_command(
+                &loc,
+                &["lsjson", &super::rclone::sftp_remote(&loc, &sub)],
+                30,
+                "SFTP 元信息",
+            )?;
+            let v: serde_json::Value =
+                serde_json::from_str(&out).map_err(|e| format!("解析元信息失败：{}", e))?;
+            let first = v
+                .as_array()
+                .and_then(|a| a.first())
+                .ok_or("远端路径不存在")?;
+            Ok(CloudStat {
+                is_dir: first.get("IsDir").and_then(|b| b.as_bool()).unwrap_or(false),
+                size: first
+                    .get("Size")
+                    .and_then(|s| s.as_u64())
+                    .unwrap_or(0),
+            })
+        }
+        _ => Err("未知云存储类型".into()),
+    }
+}
+
+/// WebDAV Depth:0 PROPFIND：解析自身条目的 collection 标记与大小。
+fn webdav_stat(loc: &NetworkLocation, sub: &str) -> Result<CloudStat, String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+    let (host, port, _) = split_host_port_base(loc)?;
+    let use_tls = webdav_use_tls(loc);
+    const BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/></d:prop></d:propfind>"#;
+    let send_propfind = |url: &str| -> Result<(u16, String), String> {
+        let mut req = webdav_agent()
+            .request("PROPFIND", url)
+            .timeout(Duration::from_secs(15))
+            .set("Depth", "0")
+            .set("Content-Type", "application/xml; charset=utf-8")
+            .set("User-Agent", "FileFiles-One/WebDAV");
+        if !loc.username.is_empty() {
+            let cred = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("{}:{}", loc.username, loc.password),
+            );
+            req = req.set("Authorization", &format!("Basic {}", cred));
+        }
+        let resp = req
+            .send_string(BODY)
+            .map_err(|e| map_webdav_err(e, &host, port, use_tls))?;
+        let status = resp.status();
+        let body = resp.into_string().unwrap_or_default();
+        Ok((status, body))
+    };
+    // 文件路径不能带尾斜杠、集合路径部分实现要求尾斜杠：先按原始路径，
+    // 404/400 时按集合形式（加斜杠）重试一次
+    let url_plain = webdav_url(loc, sub)?;
+    let (status, xml) = send_propfind(&url_plain)?;
+    let (status, xml) = if (status == 404 || status == 400) && !url_plain.ends_with('/') {
+        let url_dir = format!("{}/", url_plain);
+        let r = send_propfind(&url_dir)?;
+        (r.0, r.1)
+    } else {
+        (status, xml)
+    };
+    if status >= 400 && status != 404 {
+        return Err(format!("读取云端元信息失败（PROPFIND {}）", status));
+    }
+    if status == 404 {
+        // 坚果云等实现只支持对集合 PROPFIND（对文件返回 404）：
+        // 回退到父目录 Depth:1 列表，按名称查找自身条目
+        let name = sub.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        if name.is_empty() {
+            return Err("云端路径不存在".into());
+        }
+        let trimmed = sub.trim_end_matches('/');
+        let parent_sub = match trimmed.rfind('/') {
+            Some(i) => &trimmed[..i],
+            None => "",
+        };
+        let mut url_parent = webdav_url(loc, parent_sub)?;
+        if !url_parent.ends_with('/') {
+            url_parent.push('/');
+        }
+        let mut req = webdav_agent()
+            .request("PROPFIND", &url_parent)
+            .timeout(Duration::from_secs(15))
+            .set("Depth", "1")
+            .set("Content-Type", "application/xml; charset=utf-8")
+            .set("User-Agent", "FileFiles-One/WebDAV");
+        if !loc.username.is_empty() {
+            let cred = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("{}:{}", loc.username, loc.password),
+            );
+            req = req.set("Authorization", &format!("Basic {}", cred));
+        }
+        let resp = req
+            .send_string(BODY)
+            .map_err(|e| map_webdav_err(e, &host, port, use_tls))?;
+        if resp.status() >= 400 {
+            return Err("云端路径不存在".into());
+        }
+        let parent_xml = resp
+            .into_string()
+            .map_err(|e| format!("读取元信息失败：{}", e))?;
+        let entries = parse_webdav_propfind(&parent_xml, &url_parent, loc, parent_sub)?;
+        let hit = entries
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or("云端路径不存在")?;
+        return Ok(CloudStat {
+            is_dir: hit.is_dir,
+            size: hit.size_bytes,
+        });
+    }
+    let mut reader = Reader::from_str(&xml);
+    reader.config_mut().trim_text(true);
+    let mut is_dir = false;
+    let mut size: u64 = 0;
+    let mut in_length = false;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = xml_local_lower(e.name().as_ref());
+                match name.as_str() {
+                    "collection" => is_dir = true,
+                    "getcontentlength" => in_length = true,
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_length {
+                    size = t.unescape().unwrap_or_default().trim().parse().unwrap_or(0);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if xml_local_lower(e.name().as_ref()) == "getcontentlength" {
+                    in_length = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("解析元信息失败：{}", e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(CloudStat { is_dir, size })
+}
+
+/// FTP 无服务端复制：经本地临时文件中转（下载 → 上传），结束清理临时文件。
+/// 总进度按两段折算：下载占前半（0~50%），上传占后半（50%~100%）。
+fn ftp_copy_via_local(
+    loc: &NetworkLocation,
+    src_sub: &str,
+    dst_sub: &str,
+    ctrl: &TaskControl,
+    progress: CloudProgress,
+) -> Result<(), String> {
+    let dir = std::env::temp_dir()
+        .join("FileFiles One")
+        .join("cloud_tmp");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{}", e))?;
+    let fname = src_sub
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("file");
+    let tmp = dir.join(format!("copy_{}_{}", std::process::id(), fname));
+    let r = (|| -> Result<(), String> {
+        // 前半段：下载（进度折半计入总进度）
+        {
+            let half: CloudProgress = &mut |done: u64, total: u64| {
+                (progress)(done / 2, total.saturating_mul(2));
+            };
+            ftp_download_file(loc, src_sub, &tmp, ctrl, half)?;
+        }
+        // 后半段：上传（进度从 50% 起计入）
+        let base = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        let second: CloudProgress = &mut |done: u64, total: u64| {
+            (progress)(base + done, base.saturating_add(total));
+        };
+        ftp_upload_file(loc, dst_sub, &tmp, ctrl, second)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    r
 }
 
 #[cfg(test)]
@@ -1255,5 +2305,131 @@ mod tests {
         let file = entries.iter().find(|e| e.name == "report.pdf").expect("应解析出文件");
         assert!(!file.is_dir);
         assert_eq!(file.size_bytes, 1234);
+    }
+
+    /// 诊断：坚果云 PROPFIND 行为探测（真实网络）
+    #[test]
+    #[ignore]
+    fn diag_jianguoyun_propfind() {
+        use super::{cloud_stat, list_cloud_dir_result};
+        let config = crate::config::AppConfig::load();
+        let loc = config
+            .network_locations
+            .iter()
+            .find(|l| l.kind == "webdav" && l.host.contains("jianguoyun"))
+            .expect("无坚果云账号");
+        let root = loc.cloud_path();
+        let dir = format!("{}/FileFilesOne自测", root.trim_end_matches('/'));
+        let file = format!("{}/upload-me.txt", dir);
+        for p in [&root, &dir, &file] {
+            match list_cloud_dir_result(p, &config.network_locations) {
+                Ok(v) => println!(
+                    "list {:?} -> {} 项: {:?}",
+                    p,
+                    v.len(),
+                    v.iter().map(|e| (e.name.clone(), e.is_dir)).take(8).collect::<Vec<_>>()
+                ),
+                Err(e) => println!("list {:?} -> ERR {}", p, e),
+            }
+        }
+        match cloud_stat(&file, &config) {
+            Ok(s) => println!("stat file -> is_dir={} size={}", s.is_dir, s.size),
+            Err(e) => println!("stat file -> ERR {}", e),
+        }
+    }
+
+    /// 坚果云 WebDAV 写操作全链路自测（真实网络，需已配置坚果云账号）。
+    /// 默认忽略，显式运行：cargo test cloud_write_roundtrip -- --ignored --nocapture
+    /// 流程：建目录 → 上传 → 元信息 → 下载比对 → 复制 → 重命名 → 列目录 → 清理。
+    #[test]
+    #[ignore]
+    fn cloud_write_roundtrip_on_jianguoyun() {
+        use super::super::tasks::TaskControl;
+        use super::{
+            cloud_copy_same, cloud_mkdir_full, cloud_move_same, cloud_stat, delete_cloud,
+            download_from_cloud, list_cloud_dir_result, upload_to_cloud, CloudProgress,
+        };
+        use std::sync::Arc;
+
+        let config = crate::config::AppConfig::load();
+        let loc = config
+            .network_locations
+            .iter()
+            .find(|l| l.kind == "webdav" && l.host.contains("jianguoyun"))
+            .expect("配置中未找到坚果云账号（host 含 jianguoyun 的 webdav）");
+        let root = loc.cloud_path();
+        let test_dir = format!("{}/FileFilesOne自测", root.trim_end_matches('/'));
+        let ctrl = Arc::new(TaskControl::new());
+
+        // 0) 清理上次残留（失败忽略：可能本就不存在）
+        let _ = delete_cloud(&format!("{}/sub", test_dir), &config);
+        let _ = delete_cloud(&format!("{}/upload-me.txt", test_dir), &config);
+        let _ = delete_cloud(&test_dir, &config);
+
+        // 1) 建目录
+        cloud_mkdir_full(&test_dir, &config).expect("MKCOL 失败");
+        println!("✓ MKCOL {}", test_dir);
+
+        // 2) 本地构造文件并上传：本地文件名即云端文件名（upload-me.txt）
+        let local = std::env::temp_dir().join("upload-me.txt");
+        std::fs::write(&local, b"FileFiles One jianguoyun write test\r\n").unwrap();
+        let quiet2: CloudProgress = &mut |_, _| {};
+        upload_to_cloud(&local, &test_dir, &config, &ctrl, quiet2).expect("PUT 上传失败");
+        println!("✓ PUT upload-me.txt");
+
+        // 3) 元信息：应为文件且大小一致
+        let file_cloud = format!("{}/upload-me.txt", test_dir);
+        let st = cloud_stat(&file_cloud, &config).expect("PROPFIND 元信息失败");
+        assert!(!st.is_dir, "upload-me.txt 应判定为文件");
+        assert_eq!(st.size, 37, "上传后大小应一致");
+        println!("✓ PROPFIND is_dir={} size={}", st.is_dir, st.size);
+
+        // 4) 下载并比对内容
+        let dl_dir = std::env::temp_dir().join("ffone_jianguoyun_dl");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+        let quiet3: CloudProgress = &mut |_, _| {};
+        download_from_cloud(&file_cloud, &dl_dir, &config, &ctrl, quiet3)
+            .expect("GET 下载失败");
+        let got = std::fs::read(dl_dir.join("upload-me.txt")).unwrap();
+        assert_eq!(got, b"FileFiles One jianguoyun write test\r\n", "下载内容应一致");
+        println!("✓ GET 内容比对一致");
+
+        // 5) 云内复制到子目录（COPY 保留原名）
+        let sub = format!("{}/sub", test_dir);
+        cloud_mkdir_full(&sub, &config).expect("MKCOL sub 失败");
+        let cp: CloudProgress = &mut |_, _| {};
+        cloud_copy_same(&file_cloud, &sub, &config, &ctrl, cp)
+            .expect("COPY 失败（坚果云应支持服务端 COPY）");
+        assert!(
+            cloud_stat(&format!("{}/upload-me.txt", sub), &config).is_ok(),
+            "复制后 sub/upload-me.txt 应存在"
+        );
+        println!("✓ COPY 服务端复制");
+
+        // 6) 重命名（MOVE）
+        let src_in_sub = format!("{}/upload-me.txt", sub);
+        cloud_move_same(&src_in_sub, &sub, Some("renamed.txt"), &config)
+            .expect("MOVE 重命名失败");
+        assert!(cloud_stat(&format!("{}/renamed.txt", sub), &config).is_ok());
+        println!("✓ MOVE 重命名");
+
+        // 7) 列目录
+        let entries = list_cloud_dir_result(&sub, &config.network_locations)
+            .expect("PROPFIND 列目录失败");
+        assert!(
+            entries.iter().any(|e| e.name == "renamed.txt"),
+            "列目录应看到 renamed.txt"
+        );
+        println!("✓ PROPFIND 列目录 {} 项", entries.len());
+
+        // 8) 清理（坚果云服务端策略：一级目录 DELETE 返回 403，
+        // 二级以下正常——测试目录属一级，残留可手动在坚果云客户端删除）
+        delete_cloud(&sub, &config).expect("清理 sub 失败");
+        if let Err(e) = delete_cloud(&test_dir, &config) {
+            println!("⚠ 顶层测试目录删除被拒（坚果云一级目录 403，属服务端策略）：{}", e);
+        }
+        let _ = std::fs::remove_file(&local);
+        let _ = std::fs::remove_dir_all(&dl_dir);
+        println!("✓ 清理完成——坚果云写操作全链路通过");
     }
 }

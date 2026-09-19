@@ -18,38 +18,136 @@ pub struct IconPixels {
     pub h: u32,
 }
 
+/// 简易 LRU 缓存：逻辑时钟打点，超限时从最旧开始逐条淘汰。
+/// 相比旧的「满则整体清空」，逐条淘汰让最近仍在浏览的图标保持命中，
+/// 清理后回到上一目录不再需要整批重新提取；字节上限把大图标
+/// （256px≈256KiB）与普通图标（128px≈64KiB）统一纳入同一预算。
+struct LruMap<V> {
+    map: HashMap<String, Slot<V>>,
+    tick: u64,
+    bytes: usize,
+    cap_entries: usize,
+    cap_bytes: usize,
+}
+
+struct Slot<V> {
+    v: V,
+    tick: u64,
+    bytes: usize,
+}
+
+impl<V> LruMap<V> {
+    fn new(cap_entries: usize, cap_bytes: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            tick: 0,
+            bytes: 0,
+            cap_entries,
+            cap_bytes,
+        }
+    }
+
+    /// 命中并刷新访问序号。
+    fn get(&mut self, key: &str) -> Option<&V> {
+        if let Some(slot) = self.map.get_mut(key) {
+            self.tick += 1;
+            slot.tick = self.tick;
+            Some(&slot.v)
+        } else {
+            None
+        }
+    }
+
+    fn get_cloned(&mut self, key: &str) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.get(key).cloned()
+    }
+
+    /// 插入（同键替换时按字节差量记账并视为最新），随后按需淘汰。
+    fn insert(&mut self, key: String, v: V, bytes: usize) {
+        match self.map.get_mut(&key) {
+            Some(slot) => {
+                self.bytes = self.bytes + bytes - slot.bytes;
+                self.tick += 1;
+                slot.bytes = bytes;
+                slot.tick = self.tick;
+                slot.v = v;
+            }
+            None => {
+                self.tick += 1;
+                self.map.insert(key, Slot { v, tick: self.tick, bytes });
+                self.bytes += bytes;
+            }
+        }
+        self.evict();
+    }
+
+    /// 超出条数或字节预算时，按访问序号从最旧删除到预算的 3/4（摊销）。
+    fn evict(&mut self) {
+        if self.map.len() <= self.cap_entries && self.bytes <= self.cap_bytes {
+            return;
+        }
+        // saturating：测试/极端配置可能传 usize::MAX 关闭某一维预算
+        let target_entries = self.cap_entries.saturating_mul(3) / 4;
+        let target_bytes = self.cap_bytes.saturating_mul(3) / 4;
+        let mut by_age: Vec<(u64, String)> = self
+            .map
+            .iter()
+            .map(|(k, s)| (s.tick, k.clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(t, _)| *t);
+        for (_, k) in by_age {
+            if self.map.len() <= target_entries && self.bytes <= target_bytes {
+                break;
+            }
+            if let Some(slot) = self.map.remove(&k) {
+                self.bytes -= slot.bytes;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+}
+
 /// 按"文件类型"（扩展名 / 文件夹）共享的图标缓存。
 /// 系统图标对绝大多数文件只取决于扩展名，故同扩展名的所有文件共用一张图，
 /// 把"目录里 N 个文件 N 次 Shell 调用"降到"每种类型一次"，是提速的核心。
-fn type_cache() -> &'static Mutex<HashMap<String, Arc<IconPixels>>> {
-    static C: OnceLock<Mutex<HashMap<String, Arc<IconPixels>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+fn type_cache() -> &'static Mutex<LruMap<Arc<IconPixels>>> {
+    static C: OnceLock<Mutex<LruMap<Arc<IconPixels>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(LruMap::new(256, 16 * 1024 * 1024)))
 }
 
 /// 按"具体文件"缓存的图标（真实缩略图 / exe 自带图标等，随文件内容变化）。
 /// 键含修改时间戳，文件更新后旧键自然失效。
-fn path_cache() -> &'static Mutex<HashMap<String, Arc<IconPixels>>> {
-    static C: OnceLock<Mutex<HashMap<String, Arc<IconPixels>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+fn path_cache() -> &'static Mutex<LruMap<Arc<IconPixels>>> {
+    static C: OnceLock<Mutex<LruMap<Arc<IconPixels>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(LruMap::new(512, 32 * 1024 * 1024)))
 }
 
-/// 侧栏专用图标缓存（按真实路径/特殊键），**永不淘汰**。
-/// 侧栏条目少（~几十个），独立于会被清空的 type/path 缓存，
-/// 保证系统图标模式下侧栏图标不随主缓存清理而回退为内置图标。
-fn sidebar_cache() -> &'static Mutex<HashMap<String, Arc<IconPixels>>> {
-    static C: OnceLock<Mutex<HashMap<String, Arc<IconPixels>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+/// 侧栏专用图标缓存（按真实路径/特殊键）。侧栏条目少（~几十个），
+/// 独立于会被内存守护清理的 type/path 缓存，保证系统图标模式下侧栏
+/// 图标不随主缓存清理而回退为内置图标；同样给出上限兜底。
+fn sidebar_cache() -> &'static Mutex<LruMap<Arc<IconPixels>>> {
+    static C: OnceLock<Mutex<LruMap<Arc<IconPixels>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(LruMap::new(128, 8 * 1024 * 1024)))
 }
 
 /// 读侧栏专用缓存（不触发提取）
 pub fn sidebar_icon_get(key: &str) -> Option<Arc<IconPixels>> {
-    sidebar_cache().lock().ok()?.get(key).cloned()
+    let mut c = sidebar_cache().lock().ok()?;
+    c.get_cloned(key)
 }
 
 /// 写侧栏专用缓存（后台预热线程提取成功后调用）
 pub fn sidebar_icon_set(key: &str, icon: Arc<IconPixels>) {
+    let bytes = icon.pixels.len();
     if let Ok(mut c) = sidebar_cache().lock() {
-        c.insert(key.to_string(), icon);
+        c.insert(key.to_string(), icon, bytes);
     }
 }
 
@@ -164,8 +262,14 @@ fn request_kind(request: &IconRequest) -> Kind {
 /// 仅查询请求对应的缓存，不访问磁盘或 Windows Shell。
 pub fn cached_request(request: &IconRequest) -> Option<Arc<IconPixels>> {
     match request_kind(request) {
-        Kind::Type(k) => type_cache().lock().ok()?.get(&k).cloned(),
-        Kind::Path(k) => path_cache().lock().ok()?.get(&k).cloned(),
+        Kind::Type(k) => {
+            let mut c = type_cache().lock().ok()?;
+            c.get_cloned(&k)
+        }
+        Kind::Path(k) => {
+            let mut c = path_cache().lock().ok()?;
+            c.get_cloned(&k)
+        }
     }
 }
 
@@ -180,8 +284,14 @@ pub fn request_is_shared_type(request: &IconRequest) -> bool {
 /// 命中即首帧显示系统图标，彻底消除"先内置图标后异步替换"的闪烁。
 pub fn cached(path: &str, is_dir: bool, mtime: i64) -> Option<Arc<IconPixels>> {
     match kind_of(path, is_dir, mtime) {
-        Kind::Type(k) => type_cache().lock().ok()?.get(&k).cloned(),
-        Kind::Path(k) => path_cache().lock().ok()?.get(&k).cloned(),
+        Kind::Type(k) => {
+            let mut c = type_cache().lock().ok()?;
+            c.get_cloned(&k)
+        }
+        Kind::Path(k) => {
+            let mut c = path_cache().lock().ok()?;
+            c.get_cloned(&k)
+        }
     }
 }
 
@@ -220,6 +330,11 @@ pub fn load_cached_request(request: &IconRequest, size: u32) -> Option<Arc<IconP
             // HKCR 经典 ProgID，HKCR\.txt 无默认值且 AppX 图标不在经典注册表
             // 可读范围内，会错误回退到「通用文档」图标（与资源管理器不一致）。
             if key == DIR_KEY || key == FILE_KEY {
+                // 普通文件夹共用一张通用图标（DIR_KEY 按类型共享）：这里必须用伪文件名
+                // 走类型提取，不能按真实路径取图——否则第一个带 desktop.ini 自定义图标的
+                // 文件夹会污染整个共享键，使目录内所有文件夹都显示成它的那张图标。
+                // 桌面/下载/文档等已知特殊目录的专属图标由 special_dir_icon_cached
+                // 按路径单独提取，不经过此分支。
                 extract_type_icon(&dotted, key == DIR_KEY, size).or_else(|| extract(path, size))
             } else {
                 extract_icon_only(path, size)
@@ -273,25 +388,21 @@ pub fn load_cached_request(request: &IconRequest, size: u32) -> Option<Arc<IconP
         }
     };
     let (pixels, w, h) = valid_icon(raw)?;
+    let bytes = pixels.len();
     let arc = Arc::new(IconPixels { pixels, w, h });
     match kind {
         Kind::Type(k) => {
             if let Ok(mut c) = type_cache().lock() {
-                // 类型键空间有界（扩展名/特殊键），上限兜底防异常膨胀
-                if c.len() >= 256 {
-                    c.clear();
-                }
-                c.insert(k, arc.clone());
+                // 类型键空间有界（扩展名/特殊键），LRU 逐条淘汰兜底防异常膨胀
+                c.insert(k, arc.clone(), bytes);
             }
         }
         Kind::Path(k) => {
             if let Ok(mut c) = path_cache().lock() {
-                // 128px RGBA 图标约 64 KiB；限制具体路径缓存规模，避免浏览大量
-                // 图片/视频后常驻内存持续增长（上限约 8MB）。类型图标仍由独立缓存共享。
-                if c.len() >= 128 {
-                    c.clear();
-                }
-                c.insert(k, arc.clone());
+                // 128px RGBA 图标约 64 KiB；按字节 LRU 限制具体路径缓存规模，
+                // 避免浏览大量图片/视频后常驻内存持续增长（上限 32MB）。
+                // 类型图标仍由独立缓存共享。
+                c.insert(k, arc.clone(), bytes);
             }
         }
     }
@@ -340,16 +451,20 @@ fn stock_fallback(is_dir: bool, size: u32) -> Option<(Vec<u8>, u32, u32)> {
 #[cfg(windows)]
 pub fn special_dir_icon_cached(path: &str, size: u32) -> Option<Arc<IconPixels>> {
     let key = format!("{}|specialdir", path);
-    if let Some(c) = path_cache().lock().ok()?.get(&key).cloned() {
-        return Some(c);
+    {
+        let mut c = path_cache().lock().ok()?;
+        if let Some(hit) = c.get_cloned(&key) {
+            return Some(hit);
+        }
     }
     // 主路径：真实路径图标（专属图标，如桌面的显示器、下载的箭头）
     // 回退：缩略图工厂（通用文件夹，至少不为空）
     let raw = extract_path_icon(path, size).or_else(|| extract(path, size));
     let (pixels, w, h) = valid_icon(raw)?;
+    let bytes = pixels.len();
     let arc = Arc::new(IconPixels { pixels, w, h });
     if let Ok(mut c) = path_cache().lock() {
-        c.insert(key, arc.clone());
+        c.insert(key, arc.clone(), bytes);
     }
     Some(arc)
 }
@@ -364,7 +479,8 @@ pub fn special_dir_icon_cached(_path: &str, _size: u32) -> Option<Arc<IconPixels
 #[cfg(windows)]
 pub fn special_dir_icon_cache_only(path: &str) -> Option<Arc<IconPixels>> {
     let key = format!("{}|specialdir", path);
-    path_cache().lock().ok()?.get(&key).cloned()
+    let mut c = path_cache().lock().ok()?;
+    c.get_cloned(&key)
 }
 
 #[cfg(not(windows))]
@@ -895,13 +1011,17 @@ pub fn stock_icon_cached(which: StockIcon, size: u32) -> Option<Arc<IconPixels>>
         StockIcon::RecyclerFull => ("\u{0}<stock:recycler-full>", SIID_RECYCLERFULL),
         StockIcon::Network => ("\u{0}<stock:network>", SIID_MYNETWORK),
     };
-    if let Some(c) = type_cache().lock().ok()?.get(key).cloned() {
-        return Some(c);
+    {
+        let mut c = type_cache().lock().ok()?;
+        if let Some(hit) = c.get_cloned(key) {
+            return Some(hit);
+        }
     }
     let (pixels, w, h) = extract_stock(siid, size)?;
+    let bytes = pixels.len();
     let arc = Arc::new(IconPixels { pixels, w, h });
     if let Ok(mut c) = type_cache().lock() {
-        c.insert(key.to_string(), arc.clone());
+        c.insert(key.to_string(), arc.clone(), bytes);
     }
     Some(arc)
 }
@@ -1238,6 +1358,50 @@ pub fn extract_type_icon(_ext: &str, _is_dir: bool, _size: u32) -> Option<(Vec<u
 mod tests {
     use super::*;
 
+    /// LRU 基本行为：容量内保留全部；超限时从最旧访问的条目开始
+    /// 淘汰到预算的 3/4，最近访问的条目存活（整体清空策略做不到）。
+    #[test]
+    fn lru_evicts_oldest_and_keeps_recent() {
+        let mut lru: LruMap<u32> = LruMap::new(8, usize::MAX);
+        for (i, k) in ["a", "b", "c", "d", "e", "f", "g", "h"].iter().enumerate() {
+            lru.insert(k.to_string(), i as u32, 10);
+        }
+        // 访问 a：a 成为最新
+        assert_eq!(lru.get_cloned("a"), Some(0));
+        lru.insert("i".into(), 9, 10);
+        assert_eq!(lru.get_cloned("a"), Some(0), "最近访问的 a 必须存活");
+        assert_eq!(lru.get_cloned("b"), None, "最旧的 b 应被淘汰");
+        assert_eq!(lru.get_cloned("c"), None, "摊销淘汰到 3/4，次旧一并淘汰");
+        assert_eq!(lru.get_cloned("i"), Some(9));
+        assert_eq!(lru.get_cloned("h"), Some(7));
+    }
+
+    /// 字节预算同样触发淘汰（大图标不应把普通图标全部挤掉后仍超限）。
+    #[test]
+    fn lru_respects_byte_budget() {
+        let mut lru: LruMap<u32> = LruMap::new(usize::MAX, 100);
+        lru.insert("a".into(), 1, 40);
+        lru.insert("b".into(), 2, 40);
+        assert_eq!(lru.bytes, 80);
+        lru.insert("c".into(), 3, 40);
+        assert!(
+            lru.bytes <= 75,
+            "超预算后应淘汰到 3/4 目标以下，实际 {}",
+            lru.bytes
+        );
+        assert_eq!(lru.get_cloned("c"), Some(3), "最新条目必须存活");
+    }
+
+    /// 同键替换按字节差量记账，避免重复键导致预算虚增。
+    #[test]
+    fn lru_replace_accounts_byte_delta() {
+        let mut lru: LruMap<u32> = LruMap::new(10, usize::MAX);
+        lru.insert("a".into(), 1, 40);
+        lru.insert("a".into(), 2, 60);
+        assert_eq!(lru.bytes, 60);
+        assert_eq!(lru.map.len(), 1);
+    }
+
     fn kind_key(request: &IconRequest) -> (bool, String) {
         match request_kind(request) {
             Kind::Type(key) => (true, key),
@@ -1314,5 +1478,74 @@ mod tests {
             mtime: 1,
         }));
         assert!(request_is_shared_type(&IconRequest::Device));
+    }
+
+    /// 文件夹必须能通过公开入口拿到系统图标。
+    /// 回归背景：图标来源设为「系统图标」时，文件夹若提取失败就会回退到内置
+    /// 蓝色 Finder 矢量图，与资源管理器不一致。
+    #[cfg(windows)]
+    #[test]
+    fn folder_icon_resolves_through_public_entry() {
+        let dir = std::env::temp_dir();
+        let req = IconRequest::RealPath {
+            path: dir.to_string_lossy().to_string(),
+            is_dir: true,
+            mtime: 0,
+        };
+        assert_eq!(kind_key(&req), (true, DIR_KEY.into()), "文件夹应走共享类型缓存");
+        let icon = load_cached_request(&req, 128).expect("文件夹应能取到系统图标");
+        assert!(icon.w > 0 && icon.h > 0);
+    }
+
+    /// 诊断：后台线程中提取文件夹图标（复现 spawn_thumbnails 的运行环境）。
+    /// 主线程能取到黄色图标、GUI 却渲染内置蓝色矢量，差异只可能来自线程环境
+    /// （COM 初始化模式不同）或缓存中的旧图。
+    #[cfg(windows)]
+    #[test]
+    fn diag_folder_icon_in_background_thread() {
+        fn dominant(pixels: &[u8]) -> (u64, u64, u64, usize) {
+            let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0usize);
+            let mut i = 0;
+            while i < pixels.len() {
+                if pixels[i + 3] > 128 {
+                    r += pixels[i] as u64;
+                    g += pixels[i + 1] as u64;
+                    b += pixels[i + 2] as u64;
+                    n += 1;
+                }
+                i += 4;
+            }
+            if n == 0 {
+                (0, 0, 0, 0)
+            } else {
+                (r / n as u64, g / n as u64, b / n as u64, n)
+            }
+        }
+        // 清掉共享类型缓存，保证后台线程真的走到提取路径而非命中他测试写入的旧图
+        clear_type_cache();
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        let handle = std::thread::spawn(move || {
+            let req = IconRequest::RealPath {
+                path: dir,
+                is_dir: true,
+                mtime: 0,
+            };
+            load_cached_request(&req, 128).map(|ic| (dominant(&ic.pixels), ic.w, ic.h))
+        });
+        let got = handle.join().expect("后台线程不应 panic");
+        println!("DIAG background folder={:?}", got);
+        if let Some(((r, g, b, n), w, h)) = got {
+            println!(
+                "DIAG background size={}x{} pixels={} rgb=({},{},{}) is_yellowish={}",
+                w,
+                h,
+                n,
+                r,
+                g,
+                b,
+                r > b && g > b
+            );
+        }
+        assert!(got.is_some(), "后台线程必须能取到文件夹图标");
     }
 }

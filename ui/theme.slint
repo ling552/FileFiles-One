@@ -15,6 +15,9 @@ export global Theme {
     in-out property <float> opacity-level: 0.85;    // 0.30..1.0
     in-out property <float> blur-level: 0.0;        // 0..30，磨砂模糊强度
     in-out property <bool> compact: false;
+    // 窗口是否处于最大化：由 Rust 在切换最大化/还原时同步（Slint 侧无法自行感知）。
+    // 最大化时根层必须绘制不透明底色，见下方 shell-alpha 的说明。
+    in-out property <bool> window-maximized: false;
 
     // 跟随系统暂按亮色处理
     out property <bool> dark: theme-mode == "dark";
@@ -25,7 +28,11 @@ export global Theme {
     // 分 6 档阶梯调节（系统本身不提供可调的模糊半径，无法做到真连续），且 tint 用
     // 中性灰而非近白色、alpha 上限也做了收敛，与此处的 opacity-level 完全解耦——
     // 两者互不影响，才不会出现「模糊度越拖越白」的旧问题。
-    out property <float> shell-alpha: translucent
+    // 最大化时强制不透明：最大化会触发 FRAMECHANGED，DWM 会清掉边框延伸与亚克力
+    // 策略；此时若根层仍按半透明绘制，透明像素后方没有任何合成层，整窗会合成成
+    // 黑色（表现为「最大化后黑屏」，自绘的关闭按钮也被盖住，看起来关不掉）。
+    // 非最大化时维持原有半透明，透出 DWM 的磨砂。
+    out property <float> shell-alpha: (translucent && !window-maximized)
         ? clamp(opacity-level, 0.30, 1.0)
         : 1.0;
     // 各面板"实心表面"的不透明度：半透明时归零（仅保留统一的根底层毛玻璃），否则不透明

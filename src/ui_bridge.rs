@@ -227,27 +227,79 @@ pub(crate) fn image_from(ic: &crate::fs::thumbnail::IconPixels) -> Image {
 // 同一图标（同类型/同路径/同 Stock）在全目录只保留一份像素缓冲，
 // N 行共享 1 份 Image，避免大目录下每行复制 64KB 缓冲导致内存暴涨
 // （500 项目录从 ~32MB 降到 ~几 MB）。Image Clone 共享底层缓冲，零拷贝。
+// 逐条 LRU（字节预算 32MB）：缓存持有 Arc，缩略图缓存淘汰后像素仍被
+// 本缓存钉住，故必须字节受限；满则整体清空会让正在浏览的图标整批
+// 重建像素缓冲，改为按访问时间从最旧逐条淘汰。
+const ICON_IMAGE_CACHE_MAX: usize = 256;
+const ICON_IMAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 thread_local! {
-    static ICON_IMAGE_CACHE: RefCell<HashMap<usize, (Arc<crate::fs::thumbnail::IconPixels>, Image)>> =
-        RefCell::new(HashMap::new());
+    static ICON_IMAGE_CACHE: RefCell<IconImageLru> = RefCell::new(IconImageLru::default());
+}
+
+#[derive(Default)]
+struct IconImageLru {
+    map: HashMap<usize, (Arc<crate::fs::thumbnail::IconPixels>, Image, u64)>,
+    tick: u64,
+    bytes: usize,
+}
+
+impl IconImageLru {
+    fn get(&mut self, key: usize) -> Option<Image> {
+        if let Some(entry) = self.map.get_mut(&key) {
+            self.tick += 1;
+            entry.2 = self.tick;
+            return Some(entry.1.clone());
+        }
+        None
+    }
+    fn insert(&mut self, key: usize, ic: Arc<crate::fs::thumbnail::IconPixels>, img: Image) {
+        let bytes = ic.pixels.len();
+        match self.map.get_mut(&key) {
+            Some(entry) => {
+                self.bytes = self.bytes + bytes - entry.0.pixels.len();
+                self.tick += 1;
+                *entry = (ic, img, self.tick);
+            }
+            None => {
+                self.tick += 1;
+                self.map.insert(key, (ic, img, self.tick));
+                self.bytes += bytes;
+            }
+        }
+        // 超出条数/字节预算：从最旧逐条淘汰到预算的 3/4（摊销）
+        if self.map.len() > ICON_IMAGE_CACHE_MAX || self.bytes > ICON_IMAGE_CACHE_BYTES {
+            let (te, tb) = (
+                ICON_IMAGE_CACHE_MAX * 3 / 4,
+                ICON_IMAGE_CACHE_BYTES * 3 / 4,
+            );
+            let mut by_age: Vec<(u64, usize)> =
+                self.map.iter().map(|(k, e)| (e.2, *k)).collect();
+            by_age.sort_unstable_by_key(|(t, _)| *t);
+            for (_, k) in by_age {
+                if self.map.len() <= te && self.bytes <= tb {
+                    break;
+                }
+                if let Some(entry) = self.map.remove(&k) {
+                    self.bytes -= entry.0.pixels.len();
+                }
+            }
+        }
+    }
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
 }
 
 /// 取共享的 Slint 图像（同一 IconPixels 实例全进程共享一份缓冲）。
 /// 必须在 UI 线程调用；缓存持有对应 Arc 防止地址复用误命中。
 pub(crate) fn image_cached(ic: &Arc<crate::fs::thumbnail::IconPixels>) -> Image {
     let key = Arc::as_ptr(ic) as usize;
-    if let Some(img) = ICON_IMAGE_CACHE.with(|c| c.borrow().get(&key).map(|(_, i)| i.clone())) {
+    if let Some(img) = ICON_IMAGE_CACHE.with(|c| c.borrow_mut().get(key)) {
         return img;
     }
     let img = image_from(ic);
-    ICON_IMAGE_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        // 上限防无限增长：达 128 项整体清空重建，图标种类通常远小于该值
-        if c.len() >= 128 {
-            c.clear();
-        }
-        c.insert(key, (ic.clone(), img.clone()));
-    });
+    ICON_IMAGE_CACHE.with(|c| c.borrow_mut().insert(key, ic.clone(), img.clone()));
     img
 }
 
@@ -770,7 +822,8 @@ fn spawn_thumbnails(ui: &MainWindow, jobs: Vec<IconJob>, generation: u64, side: 
                 return;
             }
             // 走带缓存的入口：命中同类型缓存即零提取
-            match crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE) {
+            let r = crate::fs::thumbnail::load_cached_request(&request, THUMB_SIZE);
+            match r {
                 Some(icon) => {
                     batch.push((row, icon));
                     if batch.len() >= 16 {

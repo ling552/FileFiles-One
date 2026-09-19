@@ -322,6 +322,17 @@ pub fn drive_in_use(_letter: char) -> bool {
     false
 }
 
+/// 取盘符字符串的首字母（大写）。配置存单字母（"Z"）、挂载表存 "Z:"、
+/// rclone 命令行也写 "Z:"，比较前统一经此归一；空串或非字母返回 None。
+pub fn drive_letter_of(s: &str) -> Option<char> {
+    let c = s.trim().trim_end_matches(':').chars().next()?;
+    if c.is_ascii_alphabetic() {
+        Some(c.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
 // ── WebDAV 挂载为虚拟磁盘 ──
 
 /// 组装 `rclone mount` 完整参数（含子命令本身），纯函数便于单测。
@@ -800,14 +811,19 @@ pub fn adopt_orphan_mounts(locations: &[crate::config::NetworkLocation]) {
             if table.contains_key(&name) {
                 continue;
             }
-            let owned = locations.iter().any(|l| {
-                l.kind == "webdav"
-                    && l.name == name
-                    && l.drive
-                        .as_deref()
-                        .map(|d| d.eq_ignore_ascii_case(&drive))
-                        .unwrap_or(false)
-            });
+            // 认领口径：记录盘符（上次成功挂载的回写值）或设定盘符（挂载设置必填项）
+            // 与命令行盘符一致即算本应用的挂载。只看 l.drive 会在回写丢失
+            // （崩溃 / 回写回调未执行）时把仍在挂载的进程误判为陈旧孤儿强杀，
+            // 随后重挂又常因 WinFsp 尚未释放盘符而失败，最终表现为
+            // “没有取消挂载，此电脑里却只剩 WebDAV 位置”。
+            let cmd_letter = drive_letter_of(&drive);
+            let owned = cmd_letter.is_some()
+                && locations.iter().any(|l| {
+                    l.kind == "webdav"
+                        && l.name == name
+                        && (l.drive.as_deref().and_then(drive_letter_of) == cmd_letter
+                            || l.mount_drive.as_deref().and_then(drive_letter_of) == cmd_letter)
+                });
             if owned && drive_in_use(db[0] as char) {
                 // 收养：登记挂载记录，使「取消挂载」此后可用
                 table.insert(
@@ -855,17 +871,28 @@ fn kill_pid(_pid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-// ── SFTP 真机列表（rclone lsjson，无终端）──
+// ── SFTP 真机传输（rclone 子命令，无终端）──
 
-/// 经 rclone 拉取 SFTP 目录（JSON），转为应用 Entry。
-/// 必须在后台线程调用（spawn rclone 子进程并等待，最长 30 秒）。
-pub fn list_sftp_via_rclone(loc: &NetworkLocation, sub: &str) -> Result<Vec<Entry>, String> {
-    let rclone = rclone_exe().ok_or_else(|| {
-        "未找到 rclone，SFTP 需由 rclone 提供传输（原生为占位）。请联网后重试，后台将自动下载 rclone".to_string()
-    })?;
-    let sub = sub.trim_matches('/');
-    // 环境变量传参，避免密码出现在命令行；PASS 必须为 obscured，见 obscure_password
-    let mut cmd = hidden_command(&rclone);
+/// 组装 SFTP rclone 远端引用：`:sftp:<base>/<sub>`
+/// （base 为账号远程根路径，sub 为虚拟子路径；均允许为空）。
+pub fn sftp_remote(loc: &NetworkLocation, sub: &str) -> String {
+    let base = super::cloud::remote_base_pub(loc);
+    let full = if sub.trim_matches('/').is_empty() {
+        base.trim_end_matches('/').to_string()
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), sub.trim_matches('/'))
+    };
+    if full.is_empty() || full == "/" {
+        ":sftp:".to_string()
+    } else {
+        format!(":sftp:{}", full.trim_start_matches('/'))
+    }
+}
+
+/// 构造携带 SFTP 凭据环境变量的 rclone 命令。密码经 obscure 后注入环境变量，
+/// 避免出现在命令行（ps 可见）。
+fn sftp_cmd(rclone: &Path, loc: &NetworkLocation) -> Result<std::process::Command, String> {
+    let mut cmd = hidden_command(rclone);
     cmd.env("RCLONE_SFTP_HOST", super::cloud::clean_host(&loc.host));
     let port = super::cloud::effective_port_pub(loc);
     cmd.env("RCLONE_SFTP_PORT", port.to_string());
@@ -873,47 +900,50 @@ pub fn list_sftp_via_rclone(loc: &NetworkLocation, sub: &str) -> Result<Vec<Entr
         cmd.env("RCLONE_SFTP_USER", &loc.username);
     }
     if !loc.password.is_empty() {
-        let obscured = obscure_password(&rclone, &loc.password)?;
+        let obscured = obscure_password(rclone, &loc.password)?;
         cmd.env("RCLONE_SFTP_PASS", obscured);
     }
-    // 首次连接免交互：沿用系统 known_hosts，缺失时 rclone 会报错并指引，
-    // 不静默跳过主机密钥校验（防中间人）。
-    let base = super::cloud::remote_base_pub(loc);
-    let full = if sub.is_empty() {
-        base.trim_end_matches('/').to_string()
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), sub)
-    };
-    let remote = if full.is_empty() || full == "/" {
-        ":sftp:".to_string()
-    } else {
-        format!(":sftp:{}", full.trim_start_matches('/'))
-    };
-    cmd.args(["lsjson", &remote, "--log-level", "ERROR", "--no-console"]);
+    Ok(cmd)
+}
+
+/// 执行一条 rclone SFTP 子命令并返回 stdout（UTF-8）。
+/// 必须在后台线程调用。`timeout_secs`：列表类 30；传输/删除类给足
+/// 数百秒（大文件走完整网络传输）。`op_label` 用于错误提示前缀。
+pub fn run_sftp_command(
+    loc: &NetworkLocation,
+    args: &[&str],
+    timeout_secs: u64,
+    op_label: &str,
+) -> Result<String, String> {
+    let rclone = rclone_exe().ok_or_else(|| {
+        "未找到 rclone，SFTP 传输由 rclone 提供。请联网后重试，后台将自动下载 rclone".to_string()
+    })?;
+    let mut cmd = sftp_cmd(&rclone, loc)?;
+    cmd.args(args);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = cmd
         .spawn()
         .map_err(|e| format!("启动 rclone 失败：{}", e))?;
     let pid = child.id();
-    // 真实超时（最长 30 秒）：网络挂起时 lsjson 可能无限阻塞，须 kill 收尾。
+    // 真实超时 + kill 收尾：网络挂起时子进程可能无限阻塞。
     // wait_with_output 移入回收线程（读空管道防缓冲区写满死锁），主线程限时等待
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let out = loop {
         let now = Instant::now();
         if now >= deadline {
             let _ = kill_pid(pid);
-            return Err("SFTP 列表超时（30s 无响应），已终止 rclone".to_string());
+            return Err(format!("{}超时（{}s 无响应），已终止 rclone", op_label, timeout_secs));
         }
         match rx.recv_timeout(deadline - now) {
             Ok(Ok(out)) => break out,
             Ok(Err(e)) => return Err(format!("等待 rclone 失败：{}", e)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("rclone 列表线程异常退出".to_string());
+                return Err("rclone 线程异常退出".to_string());
             }
         }
     };
@@ -923,12 +953,25 @@ pub fn list_sftp_via_rclone(loc: &NetworkLocation, sub: &str) -> Result<Vec<Entr
         let short = err.lines().next().unwrap_or("rclone 返回错误").to_string();
         let short = short.chars().take(220).collect::<String>();
         return Err(if short.is_empty() {
-            format!("SFTP 连接失败（{}:{}）", loc.host, port)
+            format!("{}失败（{}）", op_label, loc.host)
         } else {
-            format!("SFTP 连接失败：{}", short)
+            format!("{}失败：{}", op_label, short)
         });
     }
-    parse_lsjson(&out.stdout, loc, sub)
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// 经 rclone 拉取 SFTP 目录（JSON），转为应用 Entry。
+/// 必须在后台线程调用（spawn rclone 子进程并等待，最长 30 秒）。
+pub fn list_sftp_via_rclone(loc: &NetworkLocation, sub: &str) -> Result<Vec<Entry>, String> {
+    let remote = sftp_remote(loc, sub);
+    let out = run_sftp_command(
+        loc,
+        &["lsjson", &remote, "--log-level", "ERROR", "--no-console"],
+        30,
+        "SFTP 列表",
+    )?;
+    parse_lsjson(out.as_bytes(), loc, sub)
 }
 
 /// 解析 `rclone lsjson` 数组为 Entry（目录优先交由调用方排序）。
